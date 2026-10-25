@@ -1,13 +1,93 @@
 :root {
-  --app-bg: #f3f5f9;
-  --app-sidebar: #1e2433;
-  --app-sidebar-soft: #2a3245;
-  --app-accent: #4c6ef5;
-  --app-text: #1f2937;
-  --app-muted: #7b8494;
-  --app-border: #e4e8f0;
-  font-family:
+  /* 蓝白橙设计令牌：深蓝侧栏、白色内容、蓝色主操作、橙色强调。 */
+  --app-bg: #f4f7fd;
+  --app-surface: #ffffff;
+  --app-surface-soft: #f7faff;
+  --app-sidebar: #0b2a5b;
+  --app-sidebar-deep: #071a38;
+  --app-sidebar-soft: #123c7a;
+  --app-sidebar-text: #cfe0ff;
+  --app-accent: #2563eb;
+  --app-accent-strong: #1d4ed8;
+  --app-accent-soft: #eaf1ff;
+  --app-orange: #f97316;
+  --app-orange-strong: #ea580c;
+  --app-orange-soft: #fff4e8;
+  --app-text: #172033;
+  --app-muted: #64748b;
+  --app-border: #dbe5f3;
+  --app-border-soft: #eaf0fa;
+  --app-success: #15803d;
+  --app-success-soft: #ecfdf3;
+  --app-danger: #b91c1c;
+  --app-danger-soft: #fef2f2;
+  --app-warning: #b45309;
+  --app-warning-soft: #fff7ed;
+  --app-mono: 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
+  --app-radius: 14px;
+  --app-shadow: 0 10px 30px rgba(16, 45, 95, 0.06);
+
+  /* Element Plus 主题覆盖；success/danger 保留语义色，warning 使用品牌橙。 */
+  --el-color-primary: #2563eb;
+  --el-color-primary-light-3: #6692f1;
+  --el-color-primary-light-5: #92b1f5;
+  --el-color-primary-light-7: #bed0f9;
+  --el-color-primary-light-8: #d3e0fb;
+  --el-color-primary-light-9: #e9f0fd;
+  --el-color-primary-dark-2: #1e4fbc;
+  --el-color-warning: #f97316;
+  --el-color-warning-light-3: #fb9a55;
+  --el-color-warning-light-5: #fcc08b;
+  --el-color-warning-light-7: #fdd5b1;
+  --el-color-warning-light-8: #fee1c4;
+  --el-color-warning-light-9: #fff1e3;
+  --el-color-warning-dark-2: #c75c12;
+  --el-color-success: #16a34a;
+  --el-color-success-light-3: #5cbe7d;
+  --el-color-success-light-5: #8bd2a5;
+  --el-color-success-light-7: #b9e3c9;
+  --el-color-success-light-8: #cbebd7;
+  --el-color-success-light-9: #e8f6ed;
+  --el-color-success-dark-2: #12823b;
+  --el-color-danger: #dc2626;
+  --el-color-danger-light-3: #e66767;
+  --el-color-danger-light-5: #ee9393;
+  --el-color-danger-light-7: #f5bfbf;
+  --el-color-danger-light-8: #f8d4d4;
+  --el-color-danger-light-9: #fce9e9;
+  --el-color-danger-dark-2: #b01e1e;
+  --el-color-error: #dc2626;
+  --el-color-info: #64748b;
+  --el-color-info-light-3: #939eaf;
+  --el-color-info-light-5: #b1b9c5;
+  --el-color-info-light-7: #cfd5dc;
+  --el-color-info-light-8: #dde1e6;
+  --el-color-info-light-9: #f0f2f4;
+  --el-color-info-dark-2: #505d6f;
+  --el-font-family:
     'Inter', 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --el-border-radius-base: 9px;
+  --el-border-radius-small: 7px;
+  --el-border-color: var(--app-border);
+  --el-border-color-light: #e6eefb;
+  --el-border-color-lighter: #edf3fc;
+  --el-fill-color: #f4f8ff;
+  --el-fill-color-light: #f7faff;
+  --el-fill-color-lighter: #fafcff;
+  --el-fill-color-blank: #ffffff;
+  --el-bg-color: #ffffff;
+  --el-bg-color-page: var(--app-bg);
+  --el-text-color-primary: var(--app-text);
+  --el-text-color-regular: #3f4c63;
+  --el-text-color-secondary: var(--app-muted);
+  --el-text-color-placeholder: #94a3b8;
+  --el-table-header-bg-color: #f4f8ff;
+  --el-table-header-text-color: #33415c;
+  --el-table-row-hover-bg-color: #f5f9ff;
+  --el-table-border-color: #e6eefb;
+  --el-box-shadow-light: 0 10px 30px rgba(16, 45, 95, 0.08);
+
+  font-family: var(--el-font-family);
   color: var(--app-text);
   background: var(--app-bg);
 }
@@ -30,6 +110,37 @@ body {
 a {
   color: var(--app-accent);
   text-decoration: none;
+}
+
+a:hover {
+  color: var(--app-accent-strong);
+}
+
+::selection {
+  background: #cfe0ff;
+  color: var(--app-text);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #c8d6ea;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #a9bfdd;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .page {
@@ -73,11 +184,19 @@ a {
 }
 
 .card {
-  border-radius: 12px;
+  border-radius: var(--app-radius);
   border: 1px solid var(--app-border);
-  background: #fff;
-  padding: 18px 20px;
-  box-shadow: 0 4px 14px rgba(24, 39, 75, 0.04);
+  background: var(--app-surface);
+  padding: 20px 22px;
+  box-shadow: var(--app-shadow);
+  transition:
+    border-color 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.card:hover {
+  border-color: #c9d9f2;
+  box-shadow: 0 14px 34px rgba(16, 45, 95, 0.08);
 }
 
 .card-title {
@@ -85,9 +204,22 @@ a {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin: 0 0 12px;
+  margin: 0 0 14px;
+  padding-left: 11px;
+  position: relative;
   font-size: 15px;
-  font-weight: 600;
+  font-weight: 650;
+}
+
+.card-title::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 2px;
+  bottom: 2px;
+  width: 3px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, var(--app-accent), var(--app-orange));
 }
 
 .metric {
@@ -97,8 +229,9 @@ a {
 }
 
 .metric-value {
+  color: var(--app-accent-strong);
   font-size: 28px;
-  font-weight: 650;
+  font-weight: 700;
   letter-spacing: -0.02em;
 }
 
@@ -113,7 +246,7 @@ a {
 }
 
 .mono {
-  font-family: 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
+  font-family: var(--app-mono);
   font-size: 12px;
 }
 
@@ -135,4 +268,107 @@ a {
 
 .el-menu {
   border-right: none;
+}
+
+/* Element Plus 细节统一：浅蓝表头、白底卡片、橙色警告。 */
+.el-table {
+  --el-table-header-bg-color: #f4f8ff;
+  border-radius: 10px;
+}
+
+.el-table th.el-table__cell {
+  font-weight: 650;
+}
+
+.el-table .el-table__row:last-child td.el-table__cell {
+  border-bottom: none;
+}
+
+.el-tabs__item.is-active {
+  color: var(--app-accent-strong);
+  font-weight: 650;
+}
+
+.el-tabs__active-bar {
+  height: 3px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--app-accent), var(--app-orange));
+}
+
+.el-tabs__nav-wrap::after {
+  height: 1px;
+  background: var(--app-border);
+}
+
+.el-button--primary {
+  --el-button-hover-bg-color: var(--app-accent-strong);
+  --el-button-hover-border-color: var(--app-accent-strong);
+}
+
+.el-button--primary:not(.is-plain):not(.is-text):not(.is-link) {
+  background: linear-gradient(135deg, var(--app-accent), var(--app-accent-strong));
+  border-color: transparent;
+  box-shadow: 0 6px 16px rgba(37, 99, 235, 0.18);
+}
+
+.el-button--primary:not(.is-plain):not(.is-text):not(.is-link):hover {
+  background: linear-gradient(135deg, #2f6ff0, #1a46c0);
+}
+
+.el-dialog,
+.el-drawer {
+  border-radius: var(--app-radius);
+}
+
+.el-dialog__header {
+  margin-right: 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--app-border-soft);
+}
+
+.el-dialog__title,
+.el-drawer__title {
+  font-weight: 650;
+}
+
+.el-alert {
+  border-radius: 10px;
+}
+
+.el-tag {
+  border-radius: 999px;
+}
+
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select__wrapper {
+  box-shadow: 0 0 0 1px var(--app-border) inset;
+}
+
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused {
+  box-shadow: 0 0 0 1px var(--app-accent) inset;
+}
+
+.el-pagination {
+  --el-pagination-button-bg-color: #ffffff;
+}
+
+.el-card {
+  --el-card-border-radius: var(--app-radius);
+  border-color: var(--app-border);
+}
+
+.el-descriptions__label.el-descriptions__cell.is-bordered-label {
+  background: var(--app-surface-soft);
+  color: #465671;
+  font-weight: 600;
+}
+
+.el-empty__description p {
+  color: var(--app-muted);
+}
+
+.el-tab-pane > .card {
+  margin-top: 16px;
 }

@@ -1057,7 +1057,7 @@ onMounted(loadAll)
 }
 
 .schema-pre {
-  background: #f7f8fb;
+  background: var(--app-surface-soft);
   border-radius: 6px;
   padding: 10px;
   font-size: 12px;
@@ -1131,7 +1131,7 @@ onMounted(loadAll)
   width: 100%;
   height: 10px;
   border-radius: 5px;
-  background: #eef0f5;
+  background: var(--app-border-soft);
   overflow: hidden;
 }
 

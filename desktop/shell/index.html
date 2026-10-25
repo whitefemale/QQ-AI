@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI 群友 · 启动</title>
+    <link rel="stylesheet" href="./shell.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="brand-panel">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 64 64" role="img">
+              <rect x="4" y="4" width="56" height="56" rx="16" fill="#ffffff" opacity="0.12" />
+              <path
+                d="M18 21h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H31l-9 7v-7h-4a6 6 0 0 1-6-6V27a6 6 0 0 1 6-6Z"
+                fill="#ffffff"
+              />
+              <circle cx="25" cy="33" r="3.2" fill="#f97316" />
+              <circle cx="32" cy="33" r="3.2" fill="#f97316" />
+              <circle cx="39" cy="33" r="3.2" fill="#f97316" />
+            </svg>
+          </div>
+          <div>
+            <div class="brand-name">AI 群友</div>
+            <div class="brand-sub">QQ 群聊管理平台</div>
+          </div>
+        </div>
+
+        <div class="hero">
+          <span class="eyebrow light">本地优先 · 桌面版</span>
+          <h1>一键启动你的<br />AI 群友控制台</h1>
+          <p>
+            自动检查依赖、启动本地后端并打开管理界面。消息、人格与用量数据只保存在这台电脑上。
+          </p>
+        </div>
+
+        <ul class="highlights">
+          <li><span class="dot blue"></span>不收集 QQ 密码，登录由连接器完成</li>
+          <li><span class="dot orange"></span>默认本机访问，凭证加密存储</li>
+          <li><span class="dot blue"></span>全局紧急暂停随时可用</li>
+        </ul>
+
+        <div class="brand-footer">
+          <span>桌面版 v<span id="desktop-version">—</span></span>
+          <span class="sep">·</span>
+          <span>本地运行</span>
+        </div>
+      </aside>
+
+      <main class="panel">
+        <header class="panel-header">
+          <div>
+            <span class="eyebrow">启动向导</span>
+            <h2 id="title">正在准备桌面版</h2>
+            <p id="subtitle" class="subtitle">首次启动会检查运行环境与本地数据目录。</p>
+          </div>
+          <span id="status-badge" class="badge pending">检查中</span>
+        </header>
+
+        <div id="notice" class="notice" hidden>
+          <div id="notice-text"></div>
+          <button id="notice-action" class="link-button" hidden>进入控制台</button>
+        </div>
+
+        <section class="steps-card" aria-live="polite">
+          <div class="section-title">
+            <h3>启动检查</h3>
+            <span id="data-dir" class="muted mono"></span>
+          </div>
+          <ol id="steps" class="steps"></ol>
+        </section>
+
+        <section class="actions">
+          <label id="demo-wrap" class="demo-toggle">
+            <input id="demo" type="checkbox" />
+            <span>
+              初始化 Mock 演示环境
+              <small>仅使用 Mock 连接器与模型，不会连接真实 QQ。</small>
+            </span>
+          </label>
+          <div class="button-row">
+            <button id="primary" class="primary">启动 AI 群友</button>
+            <button id="open-log" class="secondary">打开日志</button>
+            <button id="open-data" class="secondary">数据目录</button>
+            <button id="quit" class="ghost">退出</button>
+          </div>
+        </section>
+
+        <section class="log-card">
+          <div class="section-title">
+            <h3>运行日志</h3>
+            <button id="clear-log" class="link-button">清空显示</button>
+          </div>
+          <pre id="log" class="log" aria-live="polite">等待启动…</pre>
+        </section>
+      </main>
+    </div>
+    <script src="./shell.js"></script>
+  </body>
+</html>

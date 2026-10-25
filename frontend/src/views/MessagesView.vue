@@ -508,7 +508,7 @@ onMounted(async () => {
 }
 
 .detail-pre {
-  background: #f7f8fb;
+  background: var(--app-surface-soft);
   border-radius: 6px;
   padding: 10px;
   font-size: 12px;

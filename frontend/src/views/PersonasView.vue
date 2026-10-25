@@ -1073,7 +1073,7 @@ onMounted(loadBasics)
   align-items: center;
   flex-wrap: wrap;
   margin-top: 10px;
-  background: #f7f9ff;
+  background: var(--app-accent-soft);
   border-radius: 8px;
   padding: 10px 12px;
 }
@@ -1094,7 +1094,7 @@ onMounted(loadBasics)
 }
 
 .proposal-pre {
-  background: #f7f8fb;
+  background: var(--app-surface-soft);
   border-radius: 6px;
   padding: 10px;
   font-size: 12px;
@@ -1122,11 +1122,11 @@ onMounted(loadBasics)
 }
 
 .danger-zone {
-  border-color: #f3c7c7;
+  border-color: #fecaca;
 }
 
 .reply-box {
-  background: #f6f9f7;
+  background: var(--app-success-soft);
   border-radius: 8px;
   padding: 10px 12px;
   margin: 10px 0;
@@ -1148,7 +1148,7 @@ onMounted(loadBasics)
 }
 
 .prompt-pre {
-  background: #f7f8fb;
+  background: var(--app-surface-soft);
   border-radius: 6px;
   padding: 10px;
   font-size: 12px;

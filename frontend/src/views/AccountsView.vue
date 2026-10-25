@@ -674,7 +674,7 @@ onMounted(load)
 <style scoped>
 .instance-panel {
   padding: 12px 18px 18px;
-  background: #fafbfe;
+  background: var(--app-surface-soft);
 }
 
 .instance-head {
@@ -698,7 +698,7 @@ onMounted(load)
 .status-pre {
   max-height: 420px;
   overflow: auto;
-  background: #f7f8fb;
+  background: var(--app-surface-soft);
   border-radius: 8px;
   padding: 12px;
   font-size: 12px;

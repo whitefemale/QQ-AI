@@ -2,14 +2,24 @@
   <el-container class="layout">
     <el-aside width="232px" class="sidebar">
       <div class="brand">
-        <div class="brand-mark">AI</div>
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 64 64">
+            <path
+              d="M18 21h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H31l-9 7v-7h-4a6 6 0 0 1-6-6V27a6 6 0 0 1 6-6Z"
+              fill="#ffffff"
+            />
+            <circle cx="25" cy="33" r="3.2" fill="#f97316" />
+            <circle cx="32" cy="33" r="3.2" fill="#f97316" />
+            <circle cx="39" cy="33" r="3.2" fill="#f97316" />
+          </svg>
+        </div>
         <div>
           <div class="brand-name">AI 群友</div>
           <div class="brand-sub">QQ 管理控制台</div>
         </div>
       </div>
 
-      <el-menu :default-active="activePath" router class="nav" background-color="transparent" text-color="#c4ccdd" active-text-color="#ffffff">
+      <el-menu :default-active="activePath" router class="nav" background-color="transparent" text-color="#cfe0ff" active-text-color="#ffffff">
         <el-menu-item v-for="item in navItems" :key="item.path" :index="item.path">
           <el-icon><component :is="item.icon" /></el-icon>
           <span>{{ item.title }}</span>
@@ -17,7 +27,10 @@
       </el-menu>
 
       <div class="sidebar-footer">
-        <div>v{{ appStore.appVersion }}</div>
+        <div class="sidebar-version">
+          <span>v{{ appStore.appVersion }}</span>
+          <span v-if="desktopMode" class="desktop-badge">桌面版</span>
+        </div>
         <div class="sidebar-note">本地优先 · 不收集 QQ 密码</div>
       </div>
     </el-aside>
@@ -61,6 +74,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { errorMessage } from '@/api/client'
+import { isDesktop } from '@/api/desktop'
 import { useAppStore } from '@/stores/app'
 import { useEventsStore } from '@/stores/events'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -73,6 +87,7 @@ const eventsStore = useEventsStore()
 const pauseDialog = ref(false)
 const pauseReason = ref('管理员手动暂停')
 const acting = ref(false)
+const desktopMode = isDesktop()
 
 const navItems = [
   { path: '/', title: '仪表盘', icon: 'Odometer' },
@@ -167,72 +182,119 @@ onBeforeUnmount(() => {
 .sidebar {
   display: flex;
   flex-direction: column;
-  background: var(--app-sidebar);
-  color: #e8ecf5;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(249, 115, 22, 0.16), transparent 32%),
+    linear-gradient(180deg, var(--app-sidebar), var(--app-sidebar-deep));
+  color: var(--app-sidebar-text);
   position: sticky;
   top: 0;
   height: 100vh;
+  box-shadow: 6px 0 24px rgba(11, 42, 91, 0.08);
 }
 
 .brand {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 20px 18px 14px;
+  padding: 22px 18px 16px;
 }
 
 .brand-mark {
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
   display: grid;
   place-items: center;
-  font-weight: 700;
-  background: linear-gradient(135deg, #5b7cfa, #8b5cf6);
-  color: #fff;
+  background: linear-gradient(135deg, var(--app-accent), var(--app-orange));
+  box-shadow: 0 8px 18px rgba(3, 18, 43, 0.35);
+}
+
+.brand-mark svg {
+  width: 30px;
+  height: 30px;
+  display: block;
 }
 
 .brand-name {
-  font-weight: 650;
+  font-weight: 700;
   font-size: 16px;
+  letter-spacing: 0.01em;
 }
 
 .brand-sub {
+  margin-top: 2px;
   font-size: 11px;
-  color: #95a0b5;
+  color: #9fbde8;
 }
 
 .nav {
   flex: 1;
-  padding: 4px 8px;
+  padding: 6px 10px;
   overflow-y: auto;
 }
 
 .nav :deep(.el-menu-item) {
+  position: relative;
   height: 42px;
-  border-radius: 8px;
-  margin: 2px 0;
-}
-
-.nav :deep(.el-menu-item.is-active) {
-  background: var(--app-sidebar-soft);
+  border-radius: 9px;
+  margin: 3px 0;
+  color: var(--app-sidebar-text);
 }
 
 .nav :deep(.el-menu-item:hover) {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.nav :deep(.el-menu-item.is-active) {
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.08));
+  color: #fff;
+  font-weight: 600;
+}
+
+.nav :deep(.el-menu-item.is-active::before) {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--app-orange);
+}
+
+.nav :deep(.el-menu-item.is-active .el-icon) {
+  color: var(--app-orange);
 }
 
 .sidebar-footer {
   padding: 14px 18px 18px;
   font-size: 12px;
-  color: #95a0b5;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  color: #9fbde8;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.sidebar-version {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.desktop-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(249, 115, 22, 0.5);
+  background: rgba(249, 115, 22, 0.14);
+  color: #ffc28f;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
 }
 
 .sidebar-note {
-  margin-top: 4px;
+  margin-top: 5px;
   font-size: 11px;
-  color: #6d778c;
+  color: #7f9cc8;
 }
 
 .topbar {
@@ -240,14 +302,29 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  background: #fff;
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--app-border);
-  padding: 0 22px;
+  padding: 0 24px;
 }
 
 .topbar-title {
+  position: relative;
+  padding-left: 12px;
   font-size: 15px;
-  font-weight: 600;
+  font-weight: 650;
+}
+
+.topbar-title::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 4px;
+  height: 16px;
+  border-radius: 2px;
+  transform: translateY(-50%);
+  background: linear-gradient(180deg, var(--app-accent), var(--app-orange));
 }
 
 .top-actions {
@@ -258,7 +335,9 @@ onBeforeUnmount(() => {
 }
 
 .main {
-  padding: 20px 22px 36px;
-  background: var(--app-bg);
+  padding: 22px 24px 40px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(37, 99, 235, 0.06), transparent 340px),
+    var(--app-bg);
 }
 </style>

@@ -19,12 +19,17 @@ npm run type-check
 npm run test
 npm run build
 
+# 桌面壳（独立 desktop/ 包）
+cd desktop
+npm test                            # node:test 单元测试
+npm run smoke                       # 真实 uvicorn + 截图冒烟（不接触真实 QQ/模型）
+
 # 全量
-./scripts/check.ps1                 # Windows
+./scripts/check.ps1                 # Windows（后端 + 前端 + 桌面壳单元测试）
 backend/.venv/Scripts/python.exe scripts/smoke_test.py   # 真实 uvicorn 端到端 Mock 冒烟
 ```
 
-启动开发环境：`./scripts/dev.ps1`（Windows）或 `./scripts/dev.sh`。API 文档：`http://127.0.0.1:8000/api/docs`。
+一键启动：双击 `start-desktop.cmd`。开发启动：`./scripts/dev.ps1`（Windows）或 `./scripts/dev.sh`。API 文档：`http://127.0.0.1:8000/api/docs`。桌面版说明：`docs/DESKTOP.md`。
 
 补充文档：`README.md`、`docs/SOFTWARE_DESIGN.md`、`docs/API.md`、`docs/SECURITY.md`、`docs/ROADMAP.md`。
 
@@ -37,6 +42,7 @@ backend/.venv/Scripts/python.exe scripts/smoke_test.py   # 真实 uvicorn 端到
 - `backend/app/services/`：账号、群、Provider、人格、备份、审计、查询、演示环境。
 - `backend/app/runtime.py`：依赖装配与生命周期。
 - `frontend/src/views/`：十一个管理页面；`frontend/src/api/client.ts` 统一请求与错误处理。
+- `desktop/`：Electron 桌面壳（主进程、preload 白名单桥、启动向导、设置/日志/后端进程管理）；窗口只加载本机控制页或 `http://127.0.0.1:<port>`。
 
 数据库变更必须同步修改 SQLAlchemy 模型与 Alembic 迁移，并在干净库上验证 `upgrade head`。测试使用临时文件 SQLite，不依赖本机已有数据或前端构建产物。
 

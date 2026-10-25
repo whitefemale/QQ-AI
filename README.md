@@ -4,6 +4,8 @@
 
 > **P0 完整 MVP**：Mock 闭环、OneBot 11 接入、基础人格治理、本群范围内的长期记忆检索、手动触发或群内可选开启的后台增量 AI 记忆候选提取与人工审核、群级主/备用模型绑定与受控故障回退，以及全部管理 API/页面已实现。后台提取默认关闭，只生成待审核候选；真实多模态、语义检索、定时话题、官方 QQ 机器人等属于规划能力，界面会明确标注「未配置 / 规划中 / Mock」，不会假装可用。
 
+> **桌面版（本机一键启动）**：双击根目录 `start-desktop.cmd`，由本机桌面窗口自动完成缺失的依赖安装、前端构建、密钥生成并启动后端。仍需本机安装 Python 3.12+ 与 Node.js 20+；当前不提供独立安装包、代码签名或自动更新。详见 [docs/DESKTOP.md](docs/DESKTOP.md)。
+
 ---
 
 ## 重要声明
@@ -36,15 +38,17 @@
 | 用量趋势、预算告警与 CSV | ✅ 可用 | 按配置时区聚合小时/自然日真实用量；接近上限/超限去重生成告警并写审计、推送 SSE；CSV 仅含调用元数据，不含消息正文、提示词或凭证，导出动作写审计 |
 | 备份 / 校验 / 恢复预览 / 恢复 | ✅ 可用 | 仅数据库，不含媒体、日志与加密密钥 |
 | 长期记忆（本群范围） | ✅ 可用 | 手动管理 + 手动或群级后台增量 AI 候选提取；后台默认关闭、只生成待审核候选，批准前不保存、不注入；语义检索仍规划中 |
-| 评测回放、插件市场、MCP、多账号、桌面壳 | ⏳ 规划中 | 仅数据骨架或接口占位 |
+| Electron 桌面版（本机一键启动） | ✅ 已交付，需本机 Python/Node | 启动向导、托盘、后端进程管理、维护入口；复用本仓库 `.venv`，不是独立安装包，不含自动更新 |
+| 评测回放、插件市场、MCP、多账号 | ⏳ 规划中 | 仅数据骨架或接口占位 |
 
 ## 技术栈
 
 - **后端**：Python 3.12+（本仓库已在 Python 3.14.5 上验证）、FastAPI、Pydantic v2、SQLAlchemy 2 async、SQLite + aiosqlite、Alembic
 - **前端**：Vue 3 + TypeScript + Vite + Element Plus + Pinia + Vue Router
+- **桌面壳**：Electron 45（独立 `desktop/` 包；窗口加载本机 `http://127.0.0.1:<port>`，保持 API/SSE 同源）
 - **实时**：SSE（`/api/events/stream`）
-- **安全**：Fernet 应用层加密、API 密钥掩码、日志脱敏、本机优先的管理边界
-- **质量**：pytest、ruff、mypy、vue-tsc、Vitest
+- **安全**：Fernet 应用层加密、API 密钥掩码、日志脱敏、本机优先的管理边界、sandbox + contextIsolation + 最小 IPC
+- **质量**：pytest、ruff、mypy、vue-tsc、Vitest、`node:test`、Electron 截图冒烟
 
 ## 架构概览
 
@@ -69,13 +73,21 @@ Mock 事件 ──────────────────┘
 
 ```text
 QQ-AI/
+├─ start-desktop.cmd        # 双击启动桌面版（Windows）
 ├─ README.md / CLAUDE.md / .env.example / .gitignore
 ├─ docs/
+│  ├─ DESKTOP.md            # 桌面版架构、向导、托盘、数据目录与排错
 │  ├─ SOFTWARE_DESIGN.md    # 架构、数据模型、流水线与失败模式
 │  ├─ API.md                # REST/SSE 接口与示例
 │  ├─ SECURITY.md           # 安全边界、威胁模型与运维检查
 │  └─ ROADMAP.md            # 范围、验收清单与后续规划
+├─ desktop/                 # Electron 桌面壳（独立 npm 包）
+│  ├─ main.js / preload.js  # 主进程、最小 IPC 桥
+│  ├─ lib/                  # 设置、端口、后端进程、向导、日志
+│  ├─ shell/                # 启动向导/控制页
+│  └─ tests/                # node:test 单元测试
 ├─ scripts/
+│  ├─ launch_desktop.ps1    # 桌面版引导（首次安装 Electron）
 │  ├─ dev.ps1 / dev.sh      # 开发启动
 │  ├─ check.ps1             # 全量质量检查
 │  ├─ backup.ps1            # 命令行备份（API 优先，离线回退）
@@ -93,16 +105,31 @@ QQ-AI/
 
 ## 快速开始（Windows 11）
 
-### 0. 前置条件
+### 前置条件
 
 - Python **3.12+**（已验证 3.14.5）
 - Node.js **20+** 与 npm（已验证 Node 24.19 / npm 12.0.2）
 - Windows PowerShell；Git Bash 可选
 
-### 1. 安装后端
+桌面版不会代替你安装 Python/Node，也不会绕过系统权限；缺少时会在向导中给出明确提示。
+
+### 方式 A：桌面版（推荐，一键启动）
+
+1. 双击仓库根目录的 **`start-desktop.cmd`**（或在 PowerShell 中执行 `.\start-desktop.cmd`）。
+2. 首次启动会安装 `desktop/` 的 Electron 依赖（约数百 MB，需要网络），随后打开蓝白橙启动向导。
+3. 向导按顺序检查 Python/Node，补齐 `.venv`、后端依赖、`.env` 密钥与前端构建，然后启动本地后端并进入管理台；已在运行的本项目后端会被直接接管（外部模式），不会启动第二个进程。
+4. 关闭窗口默认最小化到托盘；从托盘可恢复窗口、启停/重启后端或彻底退出。所有行为都可在「系统设置 → 桌面版」中调整。
+
+> 桌面版复用本仓库的 `backend/.venv` 与 `frontend/dist`，**不是**免 Python/Node 的独立安装包，也**不包含自动更新**。升级代码后重新启动即可；如改动前端，需重新构建。详见 [docs/DESKTOP.md](docs/DESKTOP.md)。
+
+### 方式 B：开发者手工启动
+
+以下命令均以仓库根目录为起点。
+
+#### 1. 安装后端
 
 ```powershell
-cd D:\download\work\claude\QQ-AI\backend
+cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -115,17 +142,17 @@ pip install -e ".[dev]"
 Set-ExecutionPolicy -Scope Process Bypass
 ```
 
-### 2. 安装前端
+#### 2. 安装前端
 
 ```powershell
-cd D:\download\work\claude\QQ-AI\frontend
+cd frontend
 npm install
 npm run build
 ```
 
 开发模式可不构建；生产预览需要 `npm run build`，构建产物由 FastAPI 托管。
 
-### 3. 生成本地密钥
+#### 3. 生成本地密钥
 
 在项目根目录执行：
 
@@ -137,12 +164,11 @@ backend\.venv\Scripts\python.exe scripts\gen_keys.py --write
 
 > **必须妥善保管 `CREDENTIAL_ENCRYPTION_KEY`。** 它不在数据库中，也不在备份中；更换或丢失后，已保存的 OneBot Token 与 API Key 将无法解密。`.env` 已被 `.gitignore` 忽略，不要提交或分享。
 
-### 4. 启动
+#### 4. 启动
 
 开发模式（后端热重载 + Vite 前端）：
 
 ```powershell
-cd D:\download\work\claude\QQ-AI
 .\scripts\dev.ps1
 ```
 
@@ -172,7 +198,7 @@ cd ..\backend
 
 打开 <http://127.0.0.1:8000>，由 FastAPI 托管 `frontend/dist`。
 
-### 5. 首次验收（不需要真实 QQ 或模型）
+### 首次验收（不需要真实 QQ 或模型）
 
 1. 打开控制台，在「仪表盘」点击 **一键初始化 Mock 演示环境**。
 2. 进入「模拟测试」，选择演示账号与 Mock 演示群，勾选 **@ 机器人**，点击 **注入 Mock 事件并发送**。
@@ -286,11 +312,11 @@ cd ..\backend
 
 ## 质量检查与冒烟测试
 
-全量检查（ruff format/check、mypy、pytest、vue-tsc、Vitest、生产构建）：
+全量检查（ruff format/check、mypy、pytest、vue-tsc、Vitest、生产构建、桌面壳 `node:test`）：
 
 ```powershell
 .\scripts\check.ps1
-# 只检查后端或前端
+# 只检查后端或前端（-FrontendOnly 不包含桌面壳测试）
 .\scripts\check.ps1 -BackendOnly
 .\scripts\check.ps1 -FrontendOnly
 ```
@@ -299,6 +325,14 @@ cd ..\backend
 
 ```powershell
 backend\.venv\Scripts\python.exe scripts\smoke_test.py
+```
+
+桌面壳测试与截图冒烟（会真实启动临时后端并截图到 `desktop/.smoke/`）：
+
+```powershell
+cd desktop
+npm test
+npm run smoke
 ```
 
 它会验证演示环境、@ 回复闭环、非 @ 忽略、dry-run 不落库、全局暂停、群级模型绑定与删除保护、密钥脱敏与落盘加密、备份校验、错误确认短语、暂停前置条件、真实恢复、审计与恢复后重连。失败时返回非零并保留诊断日志（加 `--keep` 可保留临时目录）。
@@ -317,6 +351,8 @@ backend\.venv\Scripts\python.exe scripts\smoke_test.py
 | 备份恢复后连接器离线 | 这是预期行为；确认配置后重新连接。旧凭证还需要原加密密钥 |
 | Windows 中文乱码 | 使用 Windows Terminal；脚本已设置 `PYTHONUTF8=1`，Python 输出显式使用 UTF-8 |
 | 前端构建提示 chunk 过大 | Element Plus 整体打包导致，仅警告，不影响功能 |
+| 桌面版提示 Electron 下载失败 | 设置 `ELECTRON_MIRROR` 镜像后重试，或检查网络/代理；详见 [DESKTOP.md](docs/DESKTOP.md) |
+| 桌面版启动向导失败 | 查看控制页日志；常见原因是 Python/Node 版本、网络、`.env` 密钥无效或端口占用。已完成步骤可安全重试 |
 
 ## 安全与隐私
 
@@ -336,13 +372,15 @@ backend\.venv\Scripts\python.exe scripts\smoke_test.py
 - 模型路由目前只支持按群绑定主/备用 Provider，不支持按功能拆分模型，也没有基于成本、延迟或健康度的自动路由；回退仅在显式配置备用模型时发生。
 - 费用是本地估算：只有你填写 Provider 单价、且服务返回完整 Token 用量后才会计算，且不是服务商账单；未配置单价或用量缺失的调用标记为不可计价，不会显示为 0。费用预算启用时，未配置单价的非 Mock Provider 会被阻断。若 Provider 不返回 Token 用量，该次调用无法计入费用上限，请改用会返回 `usage` 的接口。
 - 用量趋势按配置时区（默认 `Asia/Shanghai`）在应用层分桶，不是服务商账单；未知费用保持为空。预算告警基于已记录的本地用量，同一策略、同一统计周期、同一级别最多记录一次；告警不会自动解除或执行额外动作，达到上限时仍由预算检查阻断调用。CSV 只导出模型调用元数据（时间、Provider、模型、Token、估算费用、状态等），不含消息正文、提示词、API Key 或任何凭证。
-- 定时话题、评测回放、插件执行、多账号、MCP、桌面壳等仍为规划能力。
+- Electron 桌面版提供本机一键启动、向导、托盘与维护入口，但**仍需本机 Python 3.12+ / Node.js 20+**；没有独立安装包、代码签名或自动更新，升级前端代码后需重新构建。桌面壳不会绕过既有安全边界，外部启动的本项目后端只会被连接、不会被桌面版停止。
+- 定时话题、评测回放、插件执行、多账号、MCP 等仍为规划能力。
 - 数据保留策略目前需人工触发清理；自动清理任务未实现。
 - SQLite 适合单机小规模使用；高并发或多实例部署不在当前范围。
 - 非官方连接器的兼容性与账号风险由用户自行评估。
 
 ## 文档
 
+- [桌面版说明](docs/DESKTOP.md)
 - [架构与实现设计](docs/SOFTWARE_DESIGN.md)
 - [HTTP / SSE API](docs/API.md)
 - [安全边界与事件响应](docs/SECURITY.md)

@@ -63,6 +63,113 @@
           </div>
         </div>
 
+        <div class="card desktop-card">
+          <div class="card-title">
+            <span>桌面版</span>
+            <StateTag v-if="desktopMode" :state="desktopState" :label="desktopStateLabel" />
+            <StateTag v-else state="disabled" label="未在桌面版中运行" />
+          </div>
+
+          <template v-if="desktopMode">
+            <p class="muted desktop-intro">
+              桌面版负责启动与停止本机后端、系统托盘与本地数据入口。这些设置只保存在此电脑的桌面应用配置中，不会上传，也不会改变后端或群策略。
+            </p>
+            <el-alert v-if="!desktopInfo" type="info" :closable="false" show-icon title="正在读取桌面版状态…" />
+            <template v-else>
+              <el-alert
+                v-if="desktopBackend.status === 'external'"
+                type="info"
+                :closable="false"
+                show-icon
+                title="当前连接的是外部后端"
+                description="该进程不是由桌面版启动的，桌面版不会停止或重启它。"
+              />
+              <el-alert
+                v-else-if="desktopBackend.status === 'error'"
+                type="error"
+                :closable="false"
+                show-icon
+                :title="desktopBackend.error || '后端异常'"
+              />
+
+              <el-descriptions :column="2" border size="small" class="desktop-desc">
+                <el-descriptions-item label="桌面版本">{{ desktopInfo.desktopVersion || '—' }}</el-descriptions-item>
+                <el-descriptions-item label="后端版本">{{ desktopBackend.version || '—' }}</el-descriptions-item>
+                <el-descriptions-item label="服务地址">
+                  <span class="mono">{{ desktopBackend.port ? `http://127.0.0.1:${desktopBackend.port}` : '未启动' }}</span>
+                </el-descriptions-item>
+                <el-descriptions-item label="进程模式">
+                  {{ desktopBackend.managed ? '桌面版管理' : '外部后端（不管理）' }}
+                </el-descriptions-item>
+                <el-descriptions-item label="数据目录" :span="2">
+                  <span class="mono desktop-path">{{ desktopInfo.dataDir }}</span>
+                </el-descriptions-item>
+                <el-descriptions-item label="桌面日志" :span="2">
+                  <span class="mono desktop-path">{{ desktopInfo.desktopLogPath }}</span>
+                </el-descriptions-item>
+              </el-descriptions>
+
+              <div class="desktop-options">
+                <div class="desktop-option">
+                  <div>
+                    <div class="option-label">启动时自动启动后端</div>
+                    <div class="option-hint">关闭后，桌面窗口会停在启动页，由你手动启动。</div>
+                  </div>
+                  <el-switch :model-value="desktopAutoStart" @change="onAutoStartChange" />
+                </div>
+                <div class="desktop-option">
+                  <div>
+                    <div class="option-label">关闭窗口时最小化到托盘</div>
+                    <div class="option-hint">关闭窗口不退出应用；可从托盘菜单彻底退出并停止后端。</div>
+                  </div>
+                  <el-switch :model-value="desktopCloseToTray" @change="onCloseToTrayChange" />
+                </div>
+                <div class="desktop-option">
+                  <div>
+                    <div class="option-label">启动时显示主窗口</div>
+                    <div class="option-hint">关闭后桌面版在后台启动，可从托盘恢复窗口。</div>
+                  </div>
+                  <el-switch :model-value="desktopShowWindow" @change="onShowWindowChange" />
+                </div>
+              </div>
+
+              <div class="desktop-data-dir">
+                <div class="option-label">数据目录</div>
+                <div class="filter-line">
+                  <el-input v-model="desktopDataDir" placeholder="留空使用默认 data 目录" maxlength="1000" />
+                  <el-button :loading="savingDesktopDir" @click="saveDesktopDataDir">保存目录</el-button>
+                </div>
+                <p class="form-tip">
+                  更改后需要重启后端才会使用新的 SQLite 数据库；桌面版不会自动迁移现有数据。
+                </p>
+              </div>
+
+              <div class="row-actions desktop-actions">
+                <el-button
+                  type="primary"
+                  plain
+                  :loading="desktopBusy"
+                  :disabled="desktopBackend.status === 'external' || !desktopBackend.port"
+                  @click="restartDesktop"
+                >
+                  重启后端
+                </el-button>
+                <el-button @click="openDesktopFolderAction('data')">打开数据目录</el-button>
+                <el-button @click="openDesktopFolderAction('logs')">打开日志</el-button>
+                <el-button @click="openDesktopFolderAction('backups')">打开备份目录</el-button>
+                <el-button @click="openDesktopReleasesAction">打开发布页</el-button>
+              </div>
+              <p class="form-tip">
+                桌面版不包含自动更新，请从 GitHub Releases 手动下载新版本。运行桌面版仍需本机安装 Python 3.12+ 与 Node 20+；退出桌面版会停止由它启动的后端。
+              </p>
+            </template>
+          </template>
+          <p v-else class="muted desktop-intro">
+            当前通过浏览器访问，桌面版的启动向导、系统托盘与后端进程管理不可用。若要一键启动，请在仓库根目录双击
+            <span class="mono">start-desktop.cmd</span>。
+          </p>
+        </div>
+
         <div class="card">
           <div class="card-title">
             <span>全局紧急暂停</span>
@@ -286,9 +393,23 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 
 import { api, errorMessage, getAdminToken } from '@/api/client'
+import {
+  desktopErrorMessage,
+  getDesktopInfo,
+  isDesktop,
+  type DesktopSettings,
+  openDesktopFolder as openDesktopFolderViaBridge,
+  openDesktopReleases,
+  restartDesktopBackend,
+  subscribeDesktopState,
+  updateDesktopSettings,
+  type DesktopBackendInfo,
+  type DesktopFolderKind,
+  type DesktopInfo,
+} from '@/api/desktop'
 import type { AppSettings, BackupRecord } from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
@@ -338,6 +459,44 @@ const appStore = useAppStore()
 const activeTab = ref('general')
 const loading = ref(false)
 const error = ref<string | null>(null)
+
+const desktopMode = isDesktop()
+const desktopInfo = ref<DesktopInfo | null>(null)
+const desktopAutoStart = ref(true)
+const desktopCloseToTray = ref(true)
+const desktopShowWindow = ref(true)
+const desktopDataDir = ref('')
+const desktopBusy = ref(false)
+const savingDesktopDir = ref(false)
+let unsubscribeDesktop: (() => void) | null = null
+
+const EMPTY_BACKEND: DesktopBackendInfo = {
+  status: 'stopped',
+  port: null,
+  pid: null,
+  managed: true,
+  version: '',
+  error: '',
+}
+const desktopBackend = computed(() => desktopInfo.value?.backend ?? EMPTY_BACKEND)
+const desktopState = computed(() => {
+  const status = desktopBackend.value.status
+  if (status === 'error') return 'error'
+  if (status === 'running' || status === 'external') return 'available'
+  if (status === 'starting' || status === 'stopping') return 'running'
+  return 'disabled'
+})
+const desktopStateLabel = computed(() => {
+  const labels: Record<string, string> = {
+    stopped: '已停止',
+    starting: '启动中',
+    running: '运行中',
+    stopping: '停止中',
+    external: '外部后端',
+    error: '异常',
+  }
+  return labels[desktopBackend.value.status] ?? '未知状态'
+})
 
 const settings = ref<AppSettings | null>(null)
 const retention = reactive({
@@ -402,6 +561,123 @@ async function loadBackups(): Promise<void> {
   backups.value = data.items
 }
 
+function applyDesktopInfo(info: DesktopInfo): void {
+  desktopInfo.value = info
+  desktopAutoStart.value = info.settings.autoStartBackend
+  desktopCloseToTray.value = info.settings.closeToTray
+  desktopShowWindow.value = info.settings.showWindowOnStart
+  desktopDataDir.value = info.settings.dataDir
+}
+
+async function loadDesktopInfo(): Promise<void> {
+  if (!desktopMode) return
+  applyDesktopInfo(await getDesktopInfo())
+}
+
+type DesktopToggleKey = 'autoStartBackend' | 'closeToTray' | 'showWindowOnStart'
+
+function desktopToggleRef(key: DesktopToggleKey) {
+  if (key === 'autoStartBackend') return desktopAutoStart
+  if (key === 'closeToTray') return desktopCloseToTray
+  return desktopShowWindow
+}
+
+async function changeDesktopSetting(key: DesktopToggleKey, value: boolean): Promise<void> {
+  const target = desktopToggleRef(key)
+  const previous = target.value
+  target.value = value
+  try {
+    const result = await updateDesktopSettings({ [key]: value } as Partial<DesktopSettings>)
+    if (desktopInfo.value) {
+      desktopInfo.value = { ...desktopInfo.value, settings: result.settings }
+    }
+  } catch (err) {
+    target.value = previous
+    ElMessage.error(desktopErrorMessage(err))
+  }
+}
+
+function onAutoStartChange(value: string | number | boolean): void {
+  void changeDesktopSetting('autoStartBackend', Boolean(value))
+}
+
+function onCloseToTrayChange(value: string | number | boolean): void {
+  void changeDesktopSetting('closeToTray', Boolean(value))
+}
+
+function onShowWindowChange(value: string | number | boolean): void {
+  void changeDesktopSetting('showWindowOnStart', Boolean(value))
+}
+
+async function saveDesktopDataDir(): Promise<void> {
+  if (!desktopInfo.value) return
+  const next = desktopDataDir.value.trim()
+  if (next === desktopInfo.value.settings.dataDir) {
+    ElMessage.info('数据目录没有变化。')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      '更改数据目录不会迁移现有数据。保存后需要重启后端，才会使用新目录下的 SQLite 数据库。继续保存？',
+      '更改数据目录',
+      { type: 'warning', confirmButtonText: '保存', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  savingDesktopDir.value = true
+  try {
+    const result = await updateDesktopSettings({ dataDir: next })
+    applyDesktopInfo(await getDesktopInfo())
+    ElMessage.success(result.restartRequired ? '数据目录已保存，重启后端后生效。' : '数据目录已保存。')
+  } catch (err) {
+    ElMessage.error(desktopErrorMessage(err))
+  } finally {
+    savingDesktopDir.value = false
+  }
+}
+
+async function restartDesktop(): Promise<void> {
+  if (desktopBackend.value.status === 'external') {
+    ElMessage.warning('当前连接的是外部后端，桌面版不能重启它。')
+    return
+  }
+  try {
+    await ElMessageBox.confirm('重启后端会短暂中断管理界面与消息处理。确定继续？', '重启后端', {
+      type: 'warning',
+      confirmButtonText: '重启',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  desktopBusy.value = true
+  try {
+    applyDesktopInfo(await restartDesktopBackend())
+    ElMessage.success('后端已重启。')
+  } catch (err) {
+    ElMessage.error(desktopErrorMessage(err))
+  } finally {
+    desktopBusy.value = false
+  }
+}
+
+async function openDesktopFolderAction(kind: DesktopFolderKind): Promise<void> {
+  try {
+    await openDesktopFolderViaBridge(kind)
+  } catch (err) {
+    ElMessage.error(desktopErrorMessage(err))
+  }
+}
+
+async function openDesktopReleasesAction(): Promise<void> {
+  try {
+    await openDesktopReleases()
+  } catch (err) {
+    ElMessage.error(desktopErrorMessage(err))
+  }
+}
+
 async function loadAudit(targetPage?: number): Promise<void> {
   if (targetPage) auditPage.value = targetPage
   auditLoading.value = true
@@ -426,7 +702,7 @@ async function loadAll(): Promise<void> {
   loading.value = true
   error.value = null
   try {
-    await Promise.all([loadSettings(), loadBackups(), loadAudit()])
+    await Promise.all([loadSettings(), loadBackups(), loadAudit(), loadDesktopInfo()])
   } catch (err) {
     error.value = errorMessage(err)
   } finally {
@@ -614,7 +890,17 @@ async function deleteBackup(backup: BackupView): Promise<void> {
   }
 }
 
-onMounted(loadAll)
+onMounted(() => {
+  if (desktopMode) {
+    unsubscribeDesktop = subscribeDesktopState((info) => applyDesktopInfo(info))
+  }
+  void loadAll()
+})
+
+onBeforeUnmount(() => {
+  unsubscribeDesktop?.()
+  unsubscribeDesktop = null
+})
 </script>
 
 <style scoped>
@@ -627,7 +913,7 @@ onMounted(loadAll)
   flex-direction: column;
   gap: 6px;
   align-items: flex-start;
-  background: #fff5f5;
+  background: var(--app-danger-soft);
   border-radius: 8px;
   padding: 12px;
 }
@@ -650,7 +936,7 @@ onMounted(loadAll)
 }
 
 .warning-block {
-  background: #fff8ec;
+  background: var(--app-warning-soft);
   border-radius: 8px;
   padding: 10px 12px;
   margin-top: 12px;
@@ -671,7 +957,7 @@ onMounted(loadAll)
 }
 
 .audit-pre {
-  background: #f7f8fb;
+  background: var(--app-surface-soft);
   border-radius: 6px;
   padding: 10px;
   font-size: 12px;
@@ -684,5 +970,69 @@ onMounted(loadAll)
   display: flex;
   justify-content: flex-end;
   margin-top: 12px;
+}
+
+.desktop-intro {
+  margin: 0 0 14px;
+  line-height: 1.7;
+  max-width: 940px;
+}
+
+.desktop-desc {
+  margin-top: 12px;
+}
+
+.desktop-path {
+  word-break: break-all;
+}
+
+.desktop-options {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.desktop-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--app-border-soft);
+  border-radius: 10px;
+  background: var(--app-surface-soft);
+}
+
+.option-label {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.option-hint {
+  margin-top: 3px;
+  color: var(--app-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.desktop-data-dir {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.desktop-data-dir .filter-line {
+  flex-wrap: wrap;
+}
+
+.desktop-data-dir .el-input {
+  flex: 1;
+  min-width: 260px;
+  max-width: 620px;
+}
+
+.desktop-actions {
+  margin-top: 16px;
 }
 </style>

@@ -423,7 +423,7 @@ onMounted(loadOptions)
 
 .reply-preview {
   margin-top: 12px;
-  background: #f6f9f7;
+  background: var(--app-accent-soft);
   border-radius: 8px;
   padding: 12px;
   display: flex;
@@ -445,7 +445,7 @@ onMounted(loadOptions)
 }
 
 .prompt-pre {
-  background: #f7f8fb;
+  background: var(--app-surface-soft);
   border-radius: 6px;
   padding: 10px;
   font-size: 12px;

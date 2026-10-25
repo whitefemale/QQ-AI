@@ -16,6 +16,8 @@
 - [x] 请求 ID、结构化日志、健康检查与就绪检查
 - [x] pytest / ruff / mypy / vue-tsc / Vitest / 构建脚本
 - [x] `.env.example`、`.gitignore`、开发/检查/备份/密钥/冒烟脚本
+- [x] Electron 桌面版本机一键启动：双击 `start-desktop.cmd`、幂等首次向导、后端进程管理、托盘、桌面设置与维护入口；不含独立安装包、代码签名或自动更新
+- [x] 蓝白橙全站主题：设计令牌、Element Plus 主题覆盖、深蓝侧栏与橙色强调，保留成功/危险语义色
 
 ### 连接器与 Provider
 
@@ -77,6 +79,7 @@
 - [x] 加载/空/错误/保存状态；破坏性操作二次确认；密钥掩码
 - [x] 管理 Token 仅存 `sessionStorage`
 - [x] 能力状态诚实展示；Mock / 规划中不被当作真实能力
+- [x] 系统设置中的桌面版卡片：后端状态、数据目录、日志、自动启动/托盘开关、重启与白名单目录入口；浏览器模式诚实显示不可用
 
 ### 备份与治理
 
@@ -100,7 +103,8 @@
 - 评测实验室、批量回放
 - 定时话题、主动私聊、主动发言调度
 - 官方 QQ 机器人
-- 多账号运营、Tauri 桌面壳
+- 多账号运营
+- Tauri/Rust 桌面壳、签名安装包、自动更新（当前已交付的是复用本机 Python/Node 的 Electron 本机启动器，不是独立安装包）
 - 自动数据清理调度
 
 ## 4. 后续路线
@@ -120,7 +124,7 @@
 2. 插件沙箱/签名与插件市场（不在无沙箱情况下执行任意代码）。
 3. 评测实验室与回放数据集。
 4. 多账号与团队权限（仍需本机优先与最小权限）。
-5. 桌面壳与更完善的运维面板。
+5. 桌面版增强：签名安装包、自动更新、系统级开机启动与更完善的运维面板（当前仅提供本机一键启动与手动更新）。
 6. 数据保留与删除任务的可靠调度与可观测性。
 
 ### 路线图原则
@@ -148,6 +152,13 @@ npm run type-check
 npm run test
 npm run build
 
+# 桌面壳单元测试
+cd ..\desktop
+npm test
+
+# 桌面壳真实截图冒烟（临时数据目录；不接触真实 QQ/模型）
+.\node_modules\.bin\electron.cmd . --smoke
+
 # 真实进程冒烟（项目根目录）
 cd ..
 backend\.venv\Scripts\python.exe scripts\smoke_test.py
@@ -168,6 +179,18 @@ backend\.venv\Scripts\python.exe scripts\smoke_test.py
 | 恢复可靠性修订 | 恢复改为“同目录暂存副本 + 原子替换”，WAL/SHM 清理与替换对 Windows 短暂文件占用做有限重试；实测冒烟恢复通过 |
 
 `scripts/dev.ps1` 仅做 PowerShell 语法解析验证，未自动打开开发窗口；`scripts/dev.sh` 通过 `bash -n` 语法检查。
+
+### 桌面版与主题交付实测记录（2026-10-25）
+
+| 检查 | 实测结果 |
+| --- | --- |
+| `powershell -File scripts/check.ps1` | 通过：ruff format（110 files）/ ruff check / mypy（99 files）/ pytest（117 passed, 1 条 TestClient 弃用警告） / vue-tsc / Vitest（16 passed） / vite build / 桌面壳 node:test（23 passed）；构建仍只有 Element Plus chunk 体积警告 |
+| 桌面壳单元测试 | 23 项通过：设置原子写入与校验、损坏 JSON 回退、端口占用与回退、绝对路径环境、健康检查/超时/取消、外部后端不 spawn 且不可重启、向导幂等与 `.env` 不覆盖、Windows 启动脚本编码、主进程/preload/shell/lib 语法解析、npm 经 `cmd.exe` 执行且拒绝 shell 元字符 |
+| 安装命令边界 | Windows 向导通过 `cmd.exe /d /s /c` 执行固定的 npm `.cmd` 包装，参数逐项白名单校验并断开 `shell` 选项；消除了 Node 的 DEP0190 警告，渲染进程仍无法传入命令或参数 |
+| `desktop: npm run smoke` | 通过：真实 Electron + 独立临时 userData + 临时数据目录 + 随机密钥 + 非 8000 端口 + 真实 uvicorn + Alembic 全量迁移；截图后重新执行真实启动路径（向导检查 → 后端启动 → 导航），输出 `DESKTOP_STARTUP_OK` 与 `DESKTOP_SMOKE_OK`，生成 `shell.png` / `dashboard.png` / `settings.png` / `startup.png` |
+| 启动器 | `start-desktop.cmd --smoke` 与 `launch_desktop.ps1 --smoke` 均真实通过，输出相同 `DESKTOP_SMOKE_OK`；修复了启动脚本缺少 UTF-8 BOM（PowerShell 5.1 把中文按 ANSI 解析并报语法错误）与 `.cmd` 使用 LF 行尾（CMD 解析错乱）的问题；4 个 `.ps1` 均通过 PowerShell 语法解析，编码要求已加入桌面单元测试 |
+| 视觉检查 | 截图确认深蓝侧栏、白底/浅蓝内容、橙色强调、桌面版徽章与设置卡片；启动页空提示条已消失，1440×920 下无异常滚动 |
+| 未自动验证 | 托盘单击/双击、关闭到托盘、从托盘彻底退出、设置开关的鼠标交互仍需人工双击 `start-desktop.cmd` 验证；`--smoke` 已覆盖启动路径本身，但不能替代托盘与窗口交互验收 |
 
 ### 功能验收清单
 
@@ -232,3 +255,5 @@ backend\.venv\Scripts\python.exe scripts\smoke_test.py
 - 后续增量：新增群级主/备用模型绑定与受控故障回退。备用模型仅在主 Provider 发生可回退的调用错误时尝试一次；预算、全局暂停、Provider 禁用/缺失、配置与凭证错误不回退，也不会静默改用 Mock 或默认模型。被群绑定的 Provider 禁止直接删除。按功能拆分模型与自动成本/延迟路由仍为规划中。
 - 后续增量：新增基于 `llm_usage` 的 Provider / 群维度用量汇总与仪表盘真实用量展示；费用按用户填写的单价本地估算，Mock 记为无外部费用，未配置单价的调用标记为不可计价（`cost` 为 `null`），绝不伪造 0 成本。费用预算在 Provider 无单价时以 `cost_unavailable` 阻断调用，防止绕过上限。
 - 后续增量：新增用量趋势、预算告警与 CSV 导出。趋势按配置时区聚合真实 `llm_usage`，空桶补 0、未知成本保持为空；告警在达到阈值/上限时按策略、周期、级别去重写入 `budget_alerts`，写审计并推送 SSE，但不会替代预算阻断；CSV 仅导出调用元数据，不含消息正文、提示词或凭证，导出动作写审计。
+- 后续增量：新增 Electron 桌面版（独立 `desktop/` 包）：双击启动、幂等首次向导（补齐 venv/依赖/.env/前端构建）、后端进程与健康检查、外部后端接管、托盘、桌面设置、日志与白名单目录入口。窗口只加载本地控制页或当前本机后端源，启用 sandbox/contextIsolation 与最小 IPC。当前不提供独立安装包或自动更新，仍需本机 Python/Node。
+- 后续增量：全站改用蓝白橙主题（深蓝侧栏、白底、浅蓝内容、橙色强调），状态语义色保持成功绿/危险红；新增桌面版设置卡片与启动控制页。

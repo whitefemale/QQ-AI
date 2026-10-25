@@ -1,9 +1,9 @@
 ﻿# AI 群友质量检查（Windows PowerShell）
 # 用法：
-#   .\scripts\check.ps1                 # 后端 + 前端全量检查（含构建）
+#   .\scripts\check.ps1                 # 后端 + 前端 + 桌面壳单元测试（含前端构建）
 #   .\scripts\check.ps1 -BackendOnly
-#   .\scripts\check.ps1 -FrontendOnly
-# 任一步失败立即以非零状态退出。
+#   .\scripts\check.ps1 -FrontendOnly   # 仅前端；不包含桌面壳测试
+# 任一步失败立即以非零状态退出。GUI 截图冒烟需单独执行 electron . --smoke。
 
 param(
     [switch]$BackendOnly,
@@ -11,9 +11,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# 兼容 PowerShell 5.1：确保中文步骤名与子进程输出在 Windows Terminal / Git Bash 中按 UTF-8 显示。
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+}
+catch {
+    # 某些宿主机不支持修改控制台编码；不影响检查本身。
+}
 $root = Split-Path -Parent $PSScriptRoot
 $backend = Join-Path $root "backend"
 $frontend = Join-Path $root "frontend"
+$desktop = Join-Path $root "desktop"
 $python = Join-Path $backend ".venv\Scripts\python.exe"
 $env:PYTHONUTF8 = "1"
 
@@ -63,6 +72,21 @@ if (-not $BackendOnly) {
     finally {
         Pop-Location
     }
+}
+
+# 桌面壳测试只在全量检查中运行；-FrontendOnly 保持仅前端范围。
+if (-not $BackendOnly -and -not $FrontendOnly) {
+    if (-not (Test-Path -LiteralPath (Join-Path $desktop "node_modules"))) {
+        Write-Error "未找到 desktop/node_modules。请先运行：cd desktop; npm install"
+    }
+    Push-Location $desktop
+    try {
+        Invoke-Step "桌面壳单元测试 (node:test)" { & npm test }
+    }
+    finally {
+        Pop-Location
+    }
+    Write-Host "提示：GUI 截图冒烟未在 check.ps1 中运行；可在 desktop/ 执行 npm run smoke。" -ForegroundColor Yellow
 }
 
 Write-Host ""

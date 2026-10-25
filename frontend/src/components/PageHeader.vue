@@ -24,14 +24,27 @@ defineProps<{ title: string; description?: string }>()
 }
 
 .page-header-title {
+  position: relative;
   margin: 0;
-  font-size: 21px;
-  font-weight: 650;
+  padding-left: 13px;
+  font-size: 22px;
+  font-weight: 700;
   letter-spacing: -0.01em;
 }
 
+.page-header-title::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 3px;
+  bottom: 3px;
+  width: 4px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, var(--app-accent), var(--app-orange));
+}
+
 .page-header-desc {
-  margin: 6px 0 0;
+  margin: 7px 0 0 13px;
   color: var(--app-muted);
   font-size: 13px;
   line-height: 1.6;
