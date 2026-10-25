@@ -1,0 +1,138 @@
+:root {
+  --app-bg: #f3f5f9;
+  --app-sidebar: #1e2433;
+  --app-sidebar-soft: #2a3245;
+  --app-accent: #4c6ef5;
+  --app-text: #1f2937;
+  --app-muted: #7b8494;
+  --app-border: #e4e8f0;
+  font-family:
+    'Inter', 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  color: var(--app-text);
+  background: var(--app-bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-height: 100vh;
+}
+
+body {
+  background: var(--app-bg);
+}
+
+a {
+  color: var(--app-accent);
+  text-decoration: none;
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.grid {
+  display: grid;
+  gap: 16px;
+}
+
+.grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.grid-4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+@media (max-width: 1100px) {
+  .grid-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .grid-3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .grid-2,
+  .grid-3,
+  .grid-4 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.card {
+  border-radius: 12px;
+  border: 1px solid var(--app-border);
+  background: #fff;
+  padding: 18px 20px;
+  box-shadow: 0 4px 14px rgba(24, 39, 75, 0.04);
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.metric-value {
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.metric-label {
+  color: var(--app-muted);
+  font-size: 13px;
+}
+
+.muted {
+  color: var(--app-muted);
+  font-size: 13px;
+}
+
+.mono {
+  font-family: 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+}
+
+.row-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.form-tip {
+  color: var(--app-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.el-table .cell {
+  word-break: break-word;
+}
+
+.el-menu {
+  border-right: none;
+}

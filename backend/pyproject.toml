@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-group-friend"
+version = "0.1.0"
+description = "本地优先的 AI 群友 QQ 管理平台"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "AI 群友项目" }]
+dependencies = [
+  "fastapi>=0.118",
+  "uvicorn[standard]>=0.35",
+  "pydantic>=2.11",
+  "pydantic-settings>=2.7",
+  "sqlalchemy[asyncio]>=2.0.50",
+  "greenlet>=3.3",
+  "aiosqlite>=0.21",
+  "alembic>=1.16",
+  "httpx>=0.28",
+  "websockets>=15",
+  "cryptography>=44",
+  "tzdata>=2025.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "pytest-cov>=6.0",
+  "asgi-lifespan>=2.1",
+  "ruff>=0.11",
+  "mypy>=1.15",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["B008", "B904"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+ignore_missing_imports = true
+warn_unused_ignores = false
+no_implicit_optional = true
+plugins = ["pydantic.mypy"]
+exclude = ["alembic", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["app.models.*", "app.schemas.*"]
+disable_error_code = ["assignment"]

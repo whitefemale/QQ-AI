@@ -1,0 +1,46 @@
+# 环境与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# 数据
+data/
+!data/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# 前端
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+npm-debug.log*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# 备份包
+backups/
+*.zip
