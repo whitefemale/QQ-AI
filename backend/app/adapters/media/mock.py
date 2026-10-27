@@ -3,19 +3,35 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 
-from app.adapters.media.base import ASRProvider, EmbeddingProvider, OCRProvider, TTSProvider, VisionProvider
+from app.adapters.media.base import (
+    ASRProvider,
+    EmbeddingProvider,
+    MediaProcessor,
+    OCRProvider,
+    RerankerProvider,
+    TTSProvider,
+    VideoProcessor,
+    VisionProvider,
+)
 from app.schemas.llm import ConnectionTestResult
 from app.schemas.media import (
     AudioTranscriptionRequest,
     GeneratedAudio,
     ImageUnderstandRequest,
+    MediaInspectRequest,
+    MediaInspectResult,
     MediaUnderstandingResult,
     OCRRequest,
     OCRResult,
+    RerankItem,
+    RerankRequest,
+    RerankResult,
     SpeechSynthesisRequest,
     TranscriptResult,
+    VideoUnderstandRequest,
 )
 
 
@@ -154,3 +170,101 @@ class MockEmbeddingProvider(EmbeddingProvider):
 
     async def test_connection(self) -> ConnectionTestResult:
         return ConnectionTestResult(ok=True, message="Mock Embedding Provider 已就绪（仅模拟）。")
+
+
+def _tokens(text: str) -> set[str]:
+    """稳定、无外部依赖的分词：英文/数字按词，中文按字符。"""
+    lowered = text.lower()
+    words = set(re.findall(r"[a-z0-9]+", lowered))
+    words.update(char for char in lowered if "一" <= char <= "鿿")
+    return words
+
+
+class MockMediaProcessor(MediaProcessor):
+    is_mock = True
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.pop("provider_id", None)
+        super().__init__(provider_id="mock.media_processor", name="Mock 媒体检查（模拟）", **kwargs)
+
+    def capabilities(self) -> list[str]:
+        return ["media.inspect"]
+
+    async def inspect(self, request: MediaInspectRequest) -> MediaInspectResult:
+        digest = hashlib.sha256(request.media_ref.encode("utf-8")).hexdigest()
+        return MediaInspectResult(
+            media_ref=request.media_ref,
+            mime=request.mime,
+            size_bytes=None,
+            sha256=digest,
+            media_type=None,
+            recognized=False,
+            provider_id=self.provider_id,
+            confidence=0.0,
+            is_mock=True,
+            warnings=["Mock 媒体检查未读取真实文件，不产生真实元数据或内容判断。"],
+        )
+
+    async def test_connection(self) -> ConnectionTestResult:
+        return ConnectionTestResult(
+            ok=True, message="Mock 媒体检查 Provider 已就绪（仅模拟）。", details={"mock": True}
+        )
+
+
+class MockRerankerProvider(RerankerProvider):
+    is_mock = True
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.pop("provider_id", None)
+        super().__init__(provider_id="mock.reranker", name="Mock 文本重排（模拟）", **kwargs)
+
+    def capabilities(self) -> list[str]:
+        return ["text.rerank"]
+
+    async def rerank(self, request: RerankRequest) -> RerankResult:
+        query_tokens = _tokens(request.query)
+        scored: list[RerankItem] = []
+        for index, document in enumerate(request.documents):
+            document_tokens = _tokens(document)
+            overlap = len(query_tokens & document_tokens)
+            score = round(overlap / len(query_tokens), 6) if query_tokens else 0.0
+            scored.append(RerankItem(index=index, document=document, score=score))
+        # 稳定排序：分数降序，原始顺序升序；不引入随机性。
+        scored.sort(key=lambda item: (-item.score, item.index))
+        top_n = len(scored) if request.top_n is None else max(0, min(request.top_n, len(scored)))
+        return RerankResult(
+            items=scored[:top_n],
+            provider_id=self.provider_id,
+            is_mock=True,
+            warnings=["Mock 重排只按词重叠打分，不是语义重排；仅用于流程测试。"],
+        )
+
+    async def test_connection(self) -> ConnectionTestResult:
+        return ConnectionTestResult(
+            ok=True, message="Mock 文本重排 Provider 已就绪（仅模拟）。", details={"mock": True}
+        )
+
+
+class MockVideoProcessor(VideoProcessor):
+    is_mock = True
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.pop("provider_id", None)
+        super().__init__(provider_id="mock.video", name="Mock 视频理解（模拟）", **kwargs)
+
+    def capabilities(self) -> list[str]:
+        return ["video.describe"]
+
+    async def describe_video(self, request: VideoUnderstandRequest) -> MediaUnderstandingResult:
+        return MediaUnderstandingResult(
+            summary="这是一段模拟视频。当前使用的是 Mock 视频 Provider，未下载、解码或识别任何真实视频内容。",
+            provider_id=self.provider_id,
+            confidence=0.0,
+            is_mock=True,
+            warnings=["Mock 结果仅用于流程测试，不得作为真实视频内容依据。"],
+        )
+
+    async def test_connection(self) -> ConnectionTestResult:
+        return ConnectionTestResult(
+            ok=True, message="Mock 视频理解 Provider 已就绪（仅模拟）。", details={"mock": True}
+        )

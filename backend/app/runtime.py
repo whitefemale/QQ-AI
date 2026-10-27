@@ -15,6 +15,8 @@ from app.db.session import Database
 from app.media.capability_router import CapabilityRouter
 from app.media.jobs import MediaJobService
 from app.media.service import MediaService
+from app.media.usage import MediaUsageService
+from app.media.worker import MediaWorker
 from app.pipeline.context import ContextBuilder
 from app.pipeline.events import EventBus
 from app.pipeline.llm_gateway import LLMGateway
@@ -38,6 +40,7 @@ from app.services.persona_store import PersonaStore
 from app.services.playground_service import PlaygroundService
 from app.services.provider_service import ProviderService
 from app.services.query_service import DashboardService, MessageQueryService
+from app.services.retention import RetentionScheduler, RetentionService
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +73,20 @@ class AppRuntime:
         )
         self.media_service = MediaService(self.database, self.media_store, settings)
         self.capability_router = CapabilityRouter(self.provider_registry)
+        self.budgets = BudgetService(self.database, settings, events=self.events)
+        self.media_usage = MediaUsageService(self.database)
         self.media_jobs = MediaJobService(
             self.database,
             self.capability_router,
             self.media_service,
+            budgets=self.budgets,
+            usage=self.media_usage,
         )
-        self.budgets = BudgetService(self.database, settings, events=self.events)
+        self.media_worker = MediaWorker(
+            self.media_jobs,
+            interval_seconds=settings.media_worker_interval_seconds,
+            batch_size=settings.media_worker_batch_size,
+        )
         self.llm_gateway = LLMGateway(
             self.database,
             settings,
@@ -117,6 +128,14 @@ class AppRuntime:
         )
 
         self.personas = PersonaStore(self.database)
+        self.retention = RetentionService(
+            self.database,
+            settings,
+            self.media_service,
+            self.personas,
+            self.memories,
+        )
+        self.retention_scheduler = RetentionScheduler(self.retention)
         self.growth = PersonaGrowthService(
             self.database,
             settings,
@@ -177,9 +196,13 @@ class AppRuntime:
         try:
             await self.plugins.sync()
             await sync_tool_records(self.database, self.tool_registry)
+            await self.providers.load_media_provider_state()
             await self.manager.start()
             await self.worker.start()
             await self.memory_auto.start()
+            await self.retention_scheduler.start()
+            if self.settings.media_worker_enabled:
+                await self.media_worker.start()
             self.events.publish(
                 "system.started",
                 {
@@ -199,6 +222,8 @@ class AppRuntime:
             return
         self.started = False
         self._stop_event.set()
+        await self.media_worker.stop()
+        await self.retention_scheduler.stop()
         await self.memory_auto.stop()
         await self.worker.stop()
         await self.manager.stop()

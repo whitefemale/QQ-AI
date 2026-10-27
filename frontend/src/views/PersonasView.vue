@@ -268,6 +268,7 @@
                   <span>{{ lastOutcome.message }}</span>
                   <span v-if="lastOutcome.version_no" class="muted">· 已生成 v{{ lastOutcome.version_no }}</span>
                   <span class="muted">· 证据 {{ lastOutcome.evidence_count }} 条 / 会话 {{ lastOutcome.conversation_count }} 个</span>
+                  <p v-if="lastOutcome.diff_summary" class="diff-summary">{{ lastOutcome.diff_summary }}</p>
                 </div>
               </div>
 
@@ -283,6 +284,7 @@
                     <span class="muted">置信度 {{ event.confidence }} · {{ formatTime(event.created_at) }}</span>
                   </div>
                   <div class="muted">{{ event.evidence_summary }}</div>
+                  <p v-if="event.diff_summary" class="diff-summary">变化摘要：{{ event.diff_summary }}</p>
                   <pre class="proposal-pre">{{ JSON.stringify(event.proposal, null, 2) }}</pre>
                   <div class="row-actions">
                     <el-button size="small" type="success" @click="review(event, true)">批准并应用</el-button>
@@ -324,7 +326,8 @@
                         <StateTag :state="event.result === 'applied' ? 'available' : event.result" :label="event.result" />
                         <span>{{ event.summary }}</span>
                       </div>
-                      <div class="muted">{{ event.trigger_type }} · 证据 {{ event.evidence_summary }}</div>
+                      <div class="muted">{{ triggerLabel(event.trigger_type) }} · 证据 {{ event.evidence_summary }}</div>
+                      <p v-if="event.diff_summary" class="diff-summary">{{ event.diff_summary }}</p>
                     </el-timeline-item>
                   </el-timeline>
                 </div>
@@ -486,6 +489,7 @@ interface GrowthOutcome {
   evidence_count?: number
   conversation_count?: number
   summary?: string
+  diff_summary?: string
 }
 
 interface DryRunPayload {
@@ -582,6 +586,17 @@ const filteredTraits = computed(() => {
   return traitFilter.value ? traits.filter((trait) => trait.status === traitFilter.value) : traits
 })
 const testGroups = computed(() => groups.value.filter((group) => group.account_id === testForm.account_id))
+
+const TRIGGER_LABELS: Record<string, string> = {
+  auto: '自动成长',
+  self_inquiry: '用户询问自我认知',
+  manual: '管理员手动分析',
+  review: '审核后应用',
+}
+
+function triggerLabel(value: string): string {
+  return TRIGGER_LABELS[value] ?? value
+}
 
 function fillForm(persona: PersonaDetail): void {
   editForm.name = persona.name
@@ -1076,6 +1091,14 @@ onMounted(loadBasics)
   background: var(--app-accent-soft);
   border-radius: 8px;
   padding: 10px 12px;
+}
+
+.diff-summary {
+  flex-basis: 100%;
+  margin: 4px 0 0;
+  color: var(--app-text-muted, #6b7280);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .pending-item {

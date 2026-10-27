@@ -80,6 +80,33 @@ def test_capabilities_are_honest(client: TestClient) -> None:
         assert item["state"] in {"mock_only", "available", "unconfigured", "planned"}
 
 
+def test_media_usage_and_provider_toggle_are_honest(client: TestClient) -> None:
+    usage = _data(client.get("/api/media/usage", params={"hours": 24}))
+    assert usage["calls"] == 0
+    assert usage["cost_status"] == "no_calls"
+    assert usage["external_cost"] is None
+    assert usage["by_provider"] == []
+    assert usage["by_capability"] == []
+    assert "不含" in usage["note"]
+
+    providers = _data(client.get("/api/media/providers"))["items"]
+    mock_vision = next(item for item in providers if item["provider_id"] == "mock.vision")
+    assert mock_vision["is_mock"] is True
+    assert mock_vision["enabled"] is False
+
+    enabled = _data(client.post("/api/media/providers/mock.vision/enable", json={"enabled": True}))
+    assert enabled["enabled"] is True
+    assert enabled["is_mock"] is True
+    assert enabled["health_status"] == "healthy"
+
+    caps = {item["capability"]: item for item in _data(client.get("/api/media/capabilities"))["items"]}
+    assert caps["image.describe"]["state"] == "mock_only"
+    assert caps["video.describe"]["state"] == "planned"
+
+    disabled = _data(client.post("/api/media/providers/mock.vision/enable", json={"enabled": False}))
+    assert disabled["enabled"] is False
+
+
 def test_demo_bootstrap_and_mock_closed_loop(client: TestClient) -> None:
     demo = _data(client.post("/api/demo/bootstrap", json={}))
     account = demo["account"]

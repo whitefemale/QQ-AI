@@ -58,6 +58,7 @@ class PluginService:
                 permissions_json=list(manifest.permissions),
                 config_schema_json=manifest.config_schema,
                 dependencies_json=list(manifest.dependencies),
+                healthcheck_json=manifest.healthcheck.model_dump() if manifest.healthcheck else None,
                 min_app_version=manifest.min_app_version,
                 enabled=manifest.plugin_type == "builtin" and compatible,
                 permission_approved=not manifest.requires_approval(),
@@ -81,6 +82,7 @@ class PluginService:
             record.permissions_json = list(manifest.permissions)
             record.config_schema_json = manifest.config_schema
             record.dependencies_json = list(manifest.dependencies)
+            record.healthcheck_json = manifest.healthcheck.model_dump() if manifest.healthcheck else None
             record.min_app_version = manifest.min_app_version
             record.is_builtin = manifest.plugin_type == "builtin"
             if manifest.requires_approval():
@@ -131,6 +133,8 @@ class PluginService:
             "min_app_version": record.min_app_version,
             "enabled": record.enabled,
             "permission_approved": record.permission_approved,
+            "healthcheck": record.healthcheck_json,
+            "healthcheck_note": "健康检查仅为清单声明；本版本不执行第三方健康检查或任意网络请求。",
             "health_status": record.health_status,
             "runtime_status": self._runtime_status(record),
             "runtime_note": (

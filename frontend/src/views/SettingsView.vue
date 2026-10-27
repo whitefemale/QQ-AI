@@ -190,8 +190,61 @@
         </div>
 
         <div class="card">
-          <div class="card-title">数据保留</div>
-          <el-form label-width="190px" class="retention-form">
+          <div class="card-title">
+            <span>数据保留与本地清理</span>
+            <StateTag
+              :state="retentionRunning ? 'running' : retentionEnabled ? 'available' : 'disabled'"
+              :label="retentionRunning ? '清理中' : retentionEnabled ? '自动清理已开启' : '自动清理已关闭'"
+            />
+          </div>
+          <el-alert
+            type="warning"
+            :closable="false"
+            show-icon
+            title="自动清理默认关闭，清理不可恢复。"
+            description="开启后，调度器会按下方保留天数永久删除本地旧数据；手动清理始终可用。清理不会发送消息、调用模型或处理媒体任务，全局暂停也不会阻止本地删除。"
+          />
+          <div class="retention-auto">
+            <div>
+              <div class="option-label">自动清理</div>
+              <div class="option-hint">
+                开启后约每 {{ retentionIntervalMinutes }} 分钟检查一次；仅删除超过保留期限的数据。
+              </div>
+            </div>
+            <el-switch
+              :model-value="retentionEnabled"
+              :loading="savingRetentionAuto"
+              @change="onAutoRetentionChange"
+            />
+          </div>
+          <el-descriptions :column="2" border size="small" class="mt">
+            <el-descriptions-item label="调度器">
+              <StateTag
+                :state="retentionStatus?.scheduler?.running ? 'available' : 'disabled'"
+                :label="retentionStatus?.scheduler?.running ? '运行中' : '未运行'"
+              />
+            </el-descriptions-item>
+            <el-descriptions-item label="下次自动运行">
+              {{ formatTime(retentionStatus?.scheduler?.next_run_at ?? null) || '—' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="上次运行">
+              {{ formatTime(retentionStatus?.last_run?.finished_at ?? null) || '尚未运行' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="上次结果">
+              <StateTag
+                :state="retentionLastState"
+                :label="retentionLastLabel"
+              />
+            </el-descriptions-item>
+            <el-descriptions-item label="上次清理" :span="2">{{ retentionCountsLabel }}</el-descriptions-item>
+            <el-descriptions-item v-if="retentionStatus?.last_run?.truncated" label="批次上限" :span="2">
+              已达单次批次上限，仍有超期消息等待下次运行。
+            </el-descriptions-item>
+            <el-descriptions-item v-if="retentionStatus?.last_run?.error" label="错误" :span="2">
+              <span class="muted">{{ retentionStatus.last_run.error }}</span>
+            </el-descriptions-item>
+          </el-descriptions>
+          <el-form label-width="190px" class="retention-form mt">
             <el-form-item label="消息保留天数">
               <el-input-number v-model="retention.message_retention_days" :min="1" :max="3650" />
             </el-form-item>
@@ -203,9 +256,13 @@
             </el-form-item>
             <el-form-item>
               <el-button type="primary" :loading="savingRetention" @click="saveRetention">保存保留策略</el-button>
-              <span class="form-tip" style="margin-left: 10px">当前版本保存策略配置；自动清理任务会在后台按策略执行已实现的清理项。</span>
+              <el-button type="danger" plain :loading="retentionRunBusy" @click="runRetentionNow">立即清理一次</el-button>
             </el-form-item>
           </el-form>
+          <p class="form-tip">
+            日志清理只处理 logs 目录下的 app.log.* 轮转文件，当前 app.log 始终保留。人格证据与记忆来源会先被擦除再删除消息；
+            记忆正文本身不会被改写。所有清理动作写入本地审计。
+          </p>
         </div>
       </el-tab-pane>
 
@@ -505,6 +562,40 @@ const retention = reactive({
   media_retention_days: 30,
 })
 const savingRetention = ref(false)
+const savingRetentionAuto = ref(false)
+const retentionRunBusy = ref(false)
+const retentionStatus = computed(() => settings.value?.retention_status ?? null)
+const retentionEnabled = computed(() => Boolean(retentionStatus.value?.auto.enabled))
+const retentionRunning = computed(() => Boolean(retentionStatus.value?.running))
+const retentionIntervalMinutes = computed(() =>
+  Math.max(1, Math.round((retentionStatus.value?.interval_seconds ?? 3600) / 60)),
+)
+const retentionLastState = computed(() => {
+  const status = retentionStatus.value?.last_run?.status
+  if (status === 'completed') return 'available'
+  if (status === 'partial') return 'warning'
+  if (status === 'failed') return 'error'
+  return 'disabled'
+})
+const retentionLastLabel = computed(() => {
+  const status = retentionStatus.value?.last_run?.status
+  if (status === 'completed') return '已完成'
+  if (status === 'partial') return '部分完成'
+  if (status === 'failed') return '失败'
+  return '尚未运行'
+})
+const retentionCountsLabel = computed(() => {
+  const counts = retentionStatus.value?.last_run?.counts
+  if (!counts) return '尚未运行过清理'
+  const media = Number(counts.media_from_messages ?? 0) + Number(counts.media_expired ?? 0)
+  return [
+    `消息 ${Number(counts.messages ?? 0)} 条`,
+    `媒体 ${media} 个`,
+    `日志 ${Number(counts.logs ?? 0)} 个文件`,
+    `人格证据 ${Number(counts.persona_traits_updated ?? 0)} 项`,
+    `记忆来源 ${Number(counts.memories_scrubbed ?? 0)} 条`,
+  ].join(' · ')
+})
 const pauseReason = ref('管理员手动暂停')
 const pausing = ref(false)
 
@@ -779,6 +870,64 @@ async function saveRetention(): Promise<void> {
   }
 }
 
+async function onAutoRetentionChange(value: string | number | boolean): Promise<void> {
+  const enabled = Boolean(value)
+  if (enabled) {
+    try {
+      await ElMessageBox.confirm(
+        '开启后，后台会按保留天数永久删除超期的消息、媒体与轮转日志，无法恢复。确定开启自动清理？',
+        '开启自动清理',
+        { type: 'warning', confirmButtonText: '开启', cancelButtonText: '取消' },
+      )
+    } catch {
+      return
+    }
+  }
+  savingRetentionAuto.value = true
+  try {
+    const data = await api<AppSettings>('/settings', {
+      method: 'PUT',
+      body: { retention_auto: { enabled } },
+    })
+    settings.value = data
+    ElMessage.success(enabled ? '自动清理已开启。' : '自动清理已关闭。')
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  } finally {
+    savingRetentionAuto.value = false
+  }
+}
+
+async function runRetentionNow(): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      '立即清理会永久删除超过保留期限的本地消息、媒体与轮转日志，无法恢复。人格证据与记忆来源会先被擦除。确定继续？',
+      '立即清理',
+      { type: 'warning', confirmButtonText: '执行清理', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  retentionRunBusy.value = true
+  try {
+    const summary = await api<{ status: string; error: string | null }>('/system/retention/run', {
+      method: 'POST',
+    })
+    await loadSettings()
+    if (summary.status === 'completed') {
+      ElMessage.success('本地清理已完成，详情见上方上次清理结果。')
+    } else if (summary.status === 'partial') {
+      ElMessage.warning(summary.error || '清理部分完成，详情见上次运行状态。')
+    } else {
+      ElMessage.error(summary.error || '清理失败，详情见上次运行状态。')
+    }
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  } finally {
+    retentionRunBusy.value = false
+  }
+}
+
 async function createBackup(): Promise<void> {
   creatingBackup.value = true
   try {
@@ -920,6 +1069,17 @@ onBeforeUnmount(() => {
 
 .retention-form {
   max-width: 620px;
+}
+
+.retention-auto {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
 }
 
 .filter-line {

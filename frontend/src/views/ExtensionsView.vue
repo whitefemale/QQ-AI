@@ -124,6 +124,38 @@
                   <div><span class="muted">ID：</span><span class="mono">{{ row.id }}</span></div>
                   <div v-if="row.entrypoint"><span class="muted">入口：</span><span class="mono">{{ row.entrypoint }}</span></div>
                   <div><span class="muted">高风险权限：</span>{{ row.high_risk_permissions.join('、') || '无' }}</div>
+                  <div>
+                    <span class="muted">健康检查声明：</span>
+                    <span v-if="row.healthcheck" class="mono">
+                      {{ row.healthcheck.type }} {{ row.healthcheck.path || '（无路径）' }} · 每
+                      {{ row.healthcheck.interval_seconds }}s · 超时 {{ row.healthcheck.timeout_seconds }}s
+                    </span>
+                    <span v-else class="muted">未声明</span>
+                  </div>
+                  <div v-if="row.healthcheck" class="muted small-text">{{ row.healthcheck_note }}</div>
+                  <div class="permission-review">
+                    <span class="muted">高风险权限审批：</span>
+                    <el-tag size="small" :type="row.permission_approved ? 'success' : 'warning'">
+                      {{ row.permission_approved ? '已批准' : '未批准' }}
+                    </el-tag>
+                    <template v-if="!row.is_builtin && row.high_risk_permissions.length">
+                      <el-button
+                        v-if="!row.permission_approved"
+                        size="small"
+                        type="warning"
+                        plain
+                        @click="approvePlugin(row, true)"
+                      >
+                        批准高风险权限
+                      </el-button>
+                      <el-button v-else size="small" type="danger" plain @click="approvePlugin(row, false)">
+                        撤销批准
+                      </el-button>
+                    </template>
+                    <span v-if="!row.is_builtin" class="muted small-text">
+                      批准只修改本地登记状态，第三方运行时仍未启用。
+                    </span>
+                  </div>
                   <div v-if="row.last_error" class="error-text">{{ row.last_error }}</div>
                 </div>
               </template>
@@ -393,11 +425,17 @@
           </p>
           <div class="action-row">
             <el-button type="primary" @click="openBudget(null)">新增预算策略</el-button>
-            <el-select v-model="checkGroupId" clearable placeholder="选择群检查预算" style="width: 200px">
+            <el-select v-model="checkAccountId" clearable placeholder="选择账号" style="width: 170px">
+              <el-option v-for="account in accounts" :key="account.id" :label="account.display_name" :value="account.id" />
+            </el-select>
+            <el-select v-model="checkGroupId" clearable placeholder="选择群" style="width: 180px">
               <el-option v-for="group in groups" :key="group.id" :label="group.name || group.platform_group_id" :value="group.id" />
             </el-select>
-            <el-select v-model="checkProviderId" clearable placeholder="选择 Provider" style="width: 200px">
+            <el-select v-model="checkProviderId" clearable placeholder="选择 Provider" style="width: 170px">
               <el-option v-for="provider in providers" :key="provider.id" :label="provider.name" :value="provider.id" />
+            </el-select>
+            <el-select v-model="checkFeature" clearable placeholder="选择功能" style="width: 160px">
+              <el-option v-for="feature in FEATURE_OPTIONS" :key="feature.value" :label="feature.label" :value="feature.value" />
             </el-select>
             <el-button @click="checkBudget">检查当前预算</el-button>
           </div>
@@ -411,7 +449,7 @@
             :title="checkResult.allowed ? '当前未触发额度阻断' : '当前会被预算阻断'"
           >
             <div v-for="block in checkResult.blocks" :key="block.policy_id" class="muted">
-              {{ block.scope_type }} / {{ block.scope_id || '全局' }} · {{ block.window }} · {{ block.metric }}：
+              {{ blockScopeLabel(block) }} · {{ block.window }} · {{ block.metric }}：
               已用 {{ block.used }} / 上限 {{ block.limit }}
               <template v-if="block.reason === 'cost_unavailable'"> · Provider 未配置单价</template>
             </div>
@@ -431,8 +469,10 @@
             </el-select>
             <el-select v-model="alertScopeType" size="small" clearable placeholder="全部作用域" style="width: 150px" @change="onAlertFilterChange">
               <el-option label="全局" value="global" />
+              <el-option label="按账号" value="account" />
               <el-option label="按群" value="group" />
               <el-option label="按 Provider" value="provider" />
+              <el-option label="按功能" value="feature" />
             </el-select>
           </div>
           <el-alert v-if="alertsError" type="error" :title="alertsError" show-icon :closable="false" class="check-alert" />
@@ -512,8 +552,15 @@
         <el-form-item label="作用域">
           <el-select v-model="budgetForm.scope_type" style="width: 100%" @change="onScopeChange">
             <el-option label="全局" value="global" />
+            <el-option label="按账号" value="account" />
             <el-option label="按群" value="group" />
             <el-option label="按 Provider" value="provider" />
+            <el-option label="按功能" value="feature" />
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="budgetForm.scope_type === 'account'" label="账号" required>
+          <el-select v-model="budgetForm.scope_id" style="width: 100%" placeholder="选择账号">
+            <el-option v-for="account in accounts" :key="account.id" :label="account.display_name" :value="account.id" />
           </el-select>
         </el-form-item>
         <el-form-item v-if="budgetForm.scope_type === 'group'" label="群" required>
@@ -524,6 +571,11 @@
         <el-form-item v-if="budgetForm.scope_type === 'provider'" label="Provider" required>
           <el-select v-model="budgetForm.scope_id" style="width: 100%" placeholder="选择 Provider">
             <el-option v-for="provider in providers" :key="provider.id" :label="provider.name" :value="provider.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="budgetForm.scope_type === 'feature'" label="功能" required>
+          <el-select v-model="budgetForm.scope_id" style="width: 100%" placeholder="选择功能">
+            <el-option v-for="feature in FEATURE_OPTIONS" :key="feature.value" :label="feature.label" :value="feature.value" />
           </el-select>
         </el-form-item>
         <el-form-item label="窗口">
@@ -589,6 +641,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 
 import { api, downloadApiFile, errorMessage } from '@/api/client'
 import type {
+  Account,
   BudgetAlert,
   BudgetAlertList,
   BudgetCheck,
@@ -604,8 +657,9 @@ import type {
 } from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
+import { FEATURE_OPTIONS, featureLabel } from '@/constants/budgets'
 import { costStatusLabel, costStatusTag, formatCost, formatNumber, formatTime, riskTag } from '@/utils/format'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 interface ToolResultView {
   ok: boolean
@@ -630,6 +684,7 @@ const budgets = ref<BudgetPolicy[]>([])
 const usageSummary = ref<UsageSummary | null>(null)
 const groups = ref<Group[]>([])
 const providers = ref<LLMProvider[]>([])
+const accounts = ref<Account[]>([])
 
 const trendBucket = ref<'hour' | 'day'>('hour')
 const trendPeriods = ref(24)
@@ -668,8 +723,10 @@ const budgetForm = reactive({
   enabled: true,
 })
 const windows = ['hour', 'day', 'week', 'month', 'all']
+const checkAccountId = ref('')
 const checkGroupId = ref('')
 const checkProviderId = ref('')
+const checkFeature = ref('')
 const checkResult = ref<BudgetCheck | null>(null)
 
 function windowLabel(value: string): string {
@@ -682,12 +739,33 @@ function metricLabel(value: string): string {
 
 function scopeLabel(policy: BudgetPolicy): string {
   if (policy.scope_type === 'global') return '全局'
+  if (policy.scope_type === 'account') {
+    const account = accounts.value.find((item) => item.id === policy.scope_id)
+    return `账号：${account?.display_name || policy.scope_id}`
+  }
   if (policy.scope_type === 'group') {
     const group = groups.value.find((item) => item.id === policy.scope_id)
     return `群：${group?.name || group?.platform_group_id || policy.scope_id}`
   }
+  if (policy.scope_type === 'feature') {
+    return `功能：${featureLabel(policy.scope_id)}`
+  }
   const provider = providers.value.find((item) => item.id === policy.scope_id)
   return `Provider：${provider?.name || policy.scope_id}`
+}
+
+function blockScopeLabel(block: BudgetCheck['blocks'][number]): string {
+  if (block.scope_type === 'global') return '全局'
+  if (block.scope_type === 'account') {
+    const account = accounts.value.find((item) => item.id === block.scope_id)
+    return `账号：${account?.display_name || block.scope_id}`
+  }
+  if (block.scope_type === 'group') {
+    const group = groups.value.find((item) => item.id === block.scope_id)
+    return `群：${group?.name || group?.platform_group_id || block.scope_id}`
+  }
+  if (block.scope_type === 'feature') return `功能：${featureLabel(block.scope_id)}`
+  return `Provider：${block.scope_id}`
 }
 
 const providerUsageRows = computed<UsageBucket[]>(
@@ -833,13 +911,14 @@ async function loadAll(): Promise<void> {
   loading.value = true
   error.value = null
   try {
-    const [toolData, pluginData, budgetData, summary, groupData, providerData] = await Promise.all([
+    const [toolData, pluginData, budgetData, summary, groupData, providerData, accountData] = await Promise.all([
       api<{ items: ToolRecord[] }>('/tools'),
       api<{ items: PluginRecord[]; load_errors: unknown[] }>('/plugins'),
       api<{ items: BudgetPolicy[] }>('/budgets'),
       api<UsageSummary>('/usage/summary', { query: { hours: 24 } }),
       api<{ items: Group[] }>('/groups'),
       api<{ items: LLMProvider[] }>('/providers'),
+      api<{ items: Account[] }>('/accounts'),
     ])
     tools.value = toolData.items
     plugins.value = pluginData.items
@@ -848,6 +927,7 @@ async function loadAll(): Promise<void> {
     usageSummary.value = summary
     groups.value = groupData.items
     providers.value = providerData.items
+    accounts.value = accountData.items
   } catch (err) {
     error.value = errorMessage(err)
   } finally {
@@ -913,6 +993,29 @@ async function togglePlugin(plugin: PluginRecord, enabled: boolean): Promise<voi
   try {
     await api(`/plugins/${plugin.id}/enable`, { method: 'POST', body: { enabled } })
     ElMessage.success(enabled ? '插件已启用。' : '插件已停用。')
+    await loadAll()
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  }
+}
+
+async function approvePlugin(plugin: PluginRecord, approved: boolean): Promise<void> {
+  if (!approved) {
+    try {
+      await ElMessageBox.confirm(
+        `撤销「${plugin.name}」的高风险权限批准？已启用的第三方运行时会被停用；本版本本就不执行第三方代码。`,
+        '撤销权限批准',
+        { type: 'warning', confirmButtonText: '撤销', cancelButtonText: '取消' },
+      )
+    } catch {
+      return
+    }
+  }
+  try {
+    await api(`/plugins/${plugin.id}/approve`, { method: 'POST', body: { approved } })
+    ElMessage.success(
+      approved ? '高风险权限已批准；第三方插件运行时仍未启用。' : '已撤销高风险权限批准。',
+    )
     await loadAll()
   } catch (err) {
     ElMessage.error(errorMessage(err))
@@ -1004,8 +1107,10 @@ async function toggleBudget(policy: BudgetPolicy, enabled: boolean): Promise<voi
 async function checkBudget(): Promise<void> {
   try {
     const query: Record<string, string> = {}
+    if (checkAccountId.value) query.account_id = checkAccountId.value
     if (checkGroupId.value) query.group_id = checkGroupId.value
     if (checkProviderId.value) query.provider_id = checkProviderId.value
+    if (checkFeature.value) query.feature = checkFeature.value
     checkResult.value = await api<BudgetCheck>('/budgets/check', { query })
   } catch (err) {
     ElMessage.error(errorMessage(err))
@@ -1038,6 +1143,13 @@ onMounted(loadAll)
   flex-direction: column;
   gap: 6px;
   font-size: 12px;
+}
+
+.permission-review {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .error-text {

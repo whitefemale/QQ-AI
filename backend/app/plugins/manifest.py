@@ -48,6 +48,27 @@ def version_at_least(current: str, minimum: str) -> bool:
     return parse_version(current) >= parse_version(minimum)
 
 
+class PluginHealthcheck(BaseModel):
+    """健康检查声明：只保存声明，本版本不执行第三方检查或任意网络请求。"""
+
+    type: Literal["builtin", "http"] = "builtin"
+    path: str = Field(default="", max_length=256)
+    interval_seconds: int = Field(default=300, ge=30, le=86400)
+    timeout_seconds: int = Field(default=5, ge=1, le=30)
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        path = value.strip()
+        if not path:
+            return ""
+        if not path.startswith("/") or path.startswith("//"):
+            raise ValueError("健康检查路径必须为空或以 / 开头的站内相对路径。")
+        if any(marker in path for marker in ("://", "@", "?", "#", "..", "\\")):
+            raise ValueError("健康检查路径不能包含协议、凭据、查询、片段或目录穿越。")
+        return path
+
+
 class PluginManifest(BaseModel):
     id: str
     name: str = Field(min_length=1, max_length=128)
@@ -62,6 +83,7 @@ class PluginManifest(BaseModel):
     min_app_version: str = "0.1.0"
     author: str = Field(default="", max_length=128)
     homepage: str = Field(default="", max_length=256)
+    healthcheck: PluginHealthcheck | None = None
 
     @field_validator("id")
     @classmethod

@@ -273,8 +273,15 @@ class LLMGateway:
         message_id: str | None,
         conversation_id: str | None,
         group_id: str | None,
+        account_id: str | None,
+        feature: str | None,
     ) -> LLMResult:
-        await self.budget_service.assert_allowed(group_id=group_id, provider_id=provider.provider_id)
+        await self.budget_service.assert_allowed(
+            group_id=group_id,
+            provider_id=provider.provider_id,
+            account_id=account_id,
+            feature=feature or request.purpose,
+        )
         payload = request.model_copy(update={"model": provider.model})
         retries = max(0, self.settings.llm_max_retries)
         attempts = 0
@@ -310,6 +317,8 @@ class LLMGateway:
                     message_id=message_id,
                     conversation_id=conversation_id,
                     group_id=group_id,
+                    account_id=account_id,
+                    feature=feature,
                     response=response,
                     latency_ms=latency_ms,
                     status="success",
@@ -335,6 +344,8 @@ class LLMGateway:
                 message_id=message_id,
                 conversation_id=conversation_id,
                 group_id=group_id,
+                account_id=account_id,
+                feature=feature,
                 response=None,
                 latency_ms=latency_ms,
                 status="error",
@@ -364,7 +375,13 @@ class LLMGateway:
         message_id: str | None = None,
         conversation_id: str | None = None,
         group_id: str | None = None,
+        account_id: str | None = None,
+        feature: str | None = None,
     ) -> LLMResult:
+        if account_id is None and group_id:
+            async with self.database.session() as session:
+                group = await session.get(Group, group_id)
+            account_id = group.account_id if group is not None else None
         route = await self._resolve_route(provider_id, group_id)
         primary = await self._resolve_primary(route)
         try:
@@ -374,6 +391,8 @@ class LLMGateway:
                 message_id=message_id,
                 conversation_id=conversation_id,
                 group_id=group_id,
+                account_id=account_id,
+                feature=feature,
             )
         except AppError as primary_error:
             if not route.fallback_id or primary_error.code not in FALLBACK_ERROR_CODES:
@@ -399,6 +418,8 @@ class LLMGateway:
                     message_id=message_id,
                     conversation_id=conversation_id,
                     group_id=group_id,
+                    account_id=account_id,
+                    feature=feature,
                 )
             except AppError as fallback_error:
                 raise AppError(
@@ -449,6 +470,8 @@ class LLMGateway:
         latency_ms: int,
         status: str,
         error_code: str | None,
+        account_id: str | None = None,
+        feature: str | None = None,
     ) -> None:
         input_tokens = response.input_tokens if response else None
         output_tokens = response.output_tokens if response else None
@@ -467,6 +490,7 @@ class LLMGateway:
                     message_id=message_id,
                     conversation_id=conversation_id,
                     group_id=group_id,
+                    account_id=account_id,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     total_tokens=total,
@@ -480,7 +504,8 @@ class LLMGateway:
         await self.budget_service.record(
             provider_id=provider_id,
             group_id=group_id,
-            feature=purpose,
+            account_id=account_id,
+            feature=feature or purpose,
             requests=1,
             tokens=float(total or 0),
             estimated_cost=cost,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -11,11 +13,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.media.base import ASRProvider, EmbeddingProvider, OCRProvider, VisionProvider
+from app.budgets.service import BudgetService
 from app.core.errors import AppError, ErrorCode
 from app.core.time import utcnow
 from app.db.session import Database
 from app.media.capability_router import CapabilityRouter
 from app.media.service import MediaService
+from app.media.usage import MediaUsageService
 from app.models.media import MediaJob, MediaTranscript
 from app.schemas.media import (
     AudioTranscriptionRequest,
@@ -23,12 +27,36 @@ from app.schemas.media import (
     OCRRequest,
 )
 
+logger = logging.getLogger(__name__)
+
+# 内部能力名 -> 预算功能键。固定映射，避免任意字符串成为作用域。
+CAPABILITY_FEATURES = {
+    "image.describe": "media.image.describe",
+    "image.understand": "media.image.describe",
+    "ocr.extract": "media.ocr.extract",
+    "audio.transcribe": "media.audio.transcribe",
+    "text.embed": "media.text.embed",
+    "media.inspect": "media.inspect",
+    "text.rerank": "media.text.rerank",
+    "video.describe": "media.video.describe",
+}
+
 
 class MediaJobService:
-    def __init__(self, database: Database, router: CapabilityRouter, media_service: MediaService) -> None:
+    def __init__(
+        self,
+        database: Database,
+        router: CapabilityRouter,
+        media_service: MediaService,
+        *,
+        budgets: BudgetService | None = None,
+        usage: MediaUsageService | None = None,
+    ) -> None:
         self.database = database
         self.router = router
         self.media_service = media_service
+        self.budgets = budgets
+        self.usage = usage
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def create_job(
@@ -95,11 +123,26 @@ class MediaJobService:
                 await session.commit()
                 await session.refresh(job)
 
+            input_data = dict(job.input_json or {})
+            account_id = str(input_data["account_id"]) if input_data.get("account_id") else None
+            group_id = str(input_data["group_id"]) if input_data.get("group_id") else None
+            feature = CAPABILITY_FEATURES.get(job.capability)
             provider = None
+            started = time.perf_counter()
             try:
                 provider, _decision = self.router.select(job.capability)
-                job.provider_id = provider.provider_id
+                if self.budgets is not None and feature is not None:
+                    # 媒体 Provider 不是模型 Provider，不参与 provider 作用域预算；
+                    # 全局/账号/群/功能预算仍会在调用前强制检查。
+                    await self.budgets.assert_allowed(
+                        group_id=group_id,
+                        provider_id=None,
+                        account_id=account_id,
+                        feature=feature,
+                    )
                 result, kind = await asyncio.wait_for(self._invoke(provider, job), timeout=job.timeout_seconds)
+                latency_ms = (time.perf_counter() - started) * 1000
+                is_mock = bool(result.get("is_mock"))
                 async with self.database.session() as session:
                     current = await session.get(MediaJob, job.id)
                     assert current is not None
@@ -114,10 +157,11 @@ class MediaJobService:
                         timestamps_json=result.get("timestamps", []),
                         provider_id=provider.provider_id,
                         confidence=result.get("confidence"),
-                        is_mock=bool(result.get("is_mock")),
+                        is_mock=is_mock,
                     )
                     session.add(transcript)
                     await session.flush()
+                    current.provider_id = provider.provider_id
                     current.status = "succeeded"
                     current.output_ref = transcript.id
                     current.error_code = None
@@ -125,13 +169,120 @@ class MediaJobService:
                     current.finished_at = utcnow()
                     await session.commit()
                     await session.refresh(current)
-                    return current
+                await self._record_usage(
+                    provider,
+                    job,
+                    account_id=account_id,
+                    group_id=group_id,
+                    latency_ms=latency_ms,
+                    is_mock=is_mock,
+                    succeeded=True,
+                    error_code=None,
+                )
+                await self._record_budget(
+                    feature,
+                    job,
+                    account_id=account_id,
+                    group_id=group_id,
+                    is_mock=is_mock,
+                )
+                return current
             except TimeoutError:
+                await self._record_usage(
+                    provider,
+                    job,
+                    account_id=account_id,
+                    group_id=group_id,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    is_mock=bool(getattr(provider, "is_mock", False)),
+                    succeeded=False,
+                    error_code=ErrorCode.MEDIA_JOB_RETRY_EXHAUSTED,
+                )
                 return await self._mark_failure(job.id, ErrorCode.MEDIA_JOB_RETRY_EXHAUSTED, "媒体处理超时。")
             except AppError as exc:
+                if exc.code == ErrorCode.BUDGET_EXCEEDED:
+                    # 预算耗尽不重排，避免形成不计费的失败重试循环。
+                    return await self._mark_failure(job.id, exc.code, exc.message, terminal=True)
+                await self._record_usage(
+                    provider,
+                    job,
+                    account_id=account_id,
+                    group_id=group_id,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    is_mock=bool(getattr(provider, "is_mock", False)),
+                    succeeded=False,
+                    error_code=exc.code,
+                )
                 return await self._mark_failure(job.id, exc.code, exc.message)
             except Exception as exc:  # pragma: no cover - 防御性
+                await self._record_usage(
+                    provider,
+                    job,
+                    account_id=account_id,
+                    group_id=group_id,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    is_mock=bool(getattr(provider, "is_mock", False)),
+                    succeeded=False,
+                    error_code=ErrorCode.INTERNAL_ERROR,
+                )
                 return await self._mark_failure(job.id, ErrorCode.INTERNAL_ERROR, f"媒体处理异常：{type(exc).__name__}")
+
+    async def _record_usage(
+        self,
+        provider: Any,
+        job: MediaJob,
+        *,
+        account_id: str | None,
+        group_id: str | None,
+        latency_ms: float,
+        is_mock: bool,
+        succeeded: bool,
+        error_code: str | None,
+    ) -> None:
+        """用量记录失败只写日志；不影响已完成或已失败的任务状态。"""
+        if self.usage is None:
+            return
+        try:
+            await self.usage.record(
+                provider_id=getattr(provider, "provider_id", None),
+                capability=job.capability,
+                job_type=job.job_type,
+                source="job",
+                account_id=account_id,
+                group_id=group_id,
+                latency_ms=latency_ms,
+                is_mock=is_mock,
+                succeeded=succeeded,
+                error_code=error_code,
+            )
+        except Exception:
+            # MediaUsageService 自身已 best-effort；这里再兜一层，防止自定义实现把成功任务带崩。
+            logger.exception("媒体用量记录失败", extra={"event": "media.usage.failed"})
+
+    async def _record_budget(
+        self,
+        feature: str | None,
+        job: MediaJob,
+        *,
+        account_id: str | None,
+        group_id: str | None,
+        is_mock: bool,
+    ) -> None:
+        if self.budgets is None or feature is None:
+            return
+        try:
+            await self.budgets.record(
+                provider_id=None,
+                group_id=group_id,
+                account_id=account_id,
+                feature=feature,
+                requests=1,
+                tokens=0.0,
+                estimated_cost=0.0 if is_mock else None,
+            )
+        except Exception:
+            # 预算用量是旁路记账；不能因为写入失败把成功的识别结果改成失败。
+            logger.exception("媒体预算用量记录失败")
 
     async def _invoke(self, provider: Any, job: MediaJob) -> tuple[dict[str, Any], str]:
         if job.capability == "image.describe":
@@ -170,21 +321,21 @@ class MediaJobService:
         if job.capability == "text.embed":
             assert isinstance(provider, EmbeddingProvider)
             vectors = await provider.embed([str(job.input_json.get("text", ""))])
-            return {"text": json.dumps(vectors), "is_mock": True}, "embedding"
+            return {"text": json.dumps(vectors), "is_mock": getattr(provider, "is_mock", False)}, "embedding"
         raise AppError(
             ErrorCode.PROVIDER_CAPABILITY_MISSING,
             "该媒体任务类型尚未实现。",
             status_code=501,
         )
 
-    async def _mark_failure(self, job_id: str, code: str, message: str) -> MediaJob:
+    async def _mark_failure(self, job_id: str, code: str, message: str, *, terminal: bool = False) -> MediaJob:
         async with self.database.session() as session:
             job = await session.get(MediaJob, job_id)
             if job is None:
                 raise AppError(ErrorCode.MEDIA_JOB_NOT_FOUND, "媒体任务不存在。", status_code=404)
             job.error_code = code
             job.error_message = message
-            if job.attempts < job.max_attempts:
+            if not terminal and job.attempts < job.max_attempts:
                 job.status = "queued"
             else:
                 job.status = "failed"
@@ -237,7 +388,7 @@ class MediaJobService:
             await self.process_job(job_id)
         return len(job_ids)
 
-    async def process_segment(
+    async def enqueue_segment(
         self,
         *,
         media_ref: str,
@@ -245,8 +396,13 @@ class MediaJobService:
         account_id: str | None,
         group_id: str | None,
         source_message_id: str,
-    ) -> MediaTranscript | None:
-        """根据消息媒体段自动补全描述/转写；无可用 Provider 时返回 None。"""
+        mime: str | None = None,
+    ) -> MediaJob | None:
+        """只为可处理的媒体段创建恢复型任务；不在此处调用 Provider。
+
+        无可用 Provider 时返回 None，调用方必须如实说明“未配置/不支持”，
+        不能等同步调用失败后再猜测。
+        """
         capability_map = {
             "image": "image.describe",
             "sticker": "image.describe",
@@ -256,17 +412,45 @@ class MediaJobService:
         if capability is None:
             return None
         try:
-            provider, _ = self.router.select(capability)
+            self.router.select(capability)
         except AppError:
             return None
-        idempotency = f"{media_ref}:{capability}:{source_message_id}"
-        job = await self.create_job(
+        return await self.create_job(
             capability=capability,
             media_ref=media_ref,
             job_type=media_type,
-            input_data={"account_id": account_id, "group_id": group_id, "mime": None},
-            idempotency_key=idempotency,
+            input_data={"account_id": account_id, "group_id": group_id, "mime": mime},
+            idempotency_key=f"{media_ref}:{capability}:{source_message_id}",
         )
+
+    async def find_transcript(self, media_ref: str, capability: str) -> MediaTranscript | None:
+        kinds = {
+            "image.describe": {"description"},
+            "image.understand": {"description"},
+            "ocr.extract": {"ocr"},
+            "audio.transcribe": {"transcript"},
+        }.get(capability, {"description", "ocr", "transcript"})
+        return await self.media_service.find_transcript(media_ref, kinds)
+
+    async def process_segment(
+        self,
+        *,
+        media_ref: str,
+        media_type: str,
+        account_id: str | None,
+        group_id: str | None,
+        source_message_id: str,
+    ) -> MediaTranscript | None:
+        """同步辅助：仅供测试/脚本使用，聊天流水线应使用 enqueue_segment。"""
+        job = await self.enqueue_segment(
+            media_ref=media_ref,
+            media_type=media_type,
+            account_id=account_id,
+            group_id=group_id,
+            source_message_id=source_message_id,
+        )
+        if job is None:
+            return None
         if job.status == "succeeded" and job.output_ref:
             async with self.database.session() as session:
                 return await session.get(MediaTranscript, job.output_ref)

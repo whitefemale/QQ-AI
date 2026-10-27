@@ -6,7 +6,7 @@
     >
       <template #actions>
         <el-button :loading="loading" @click="loadAll">刷新</el-button>
-        <el-button :loading="processing" @click="processDue">处理到期媒体任务</el-button>
+        <el-button :loading="processing" @click="processDue">立即处理到期任务</el-button>
       </template>
     </PageHeader>
 
@@ -123,6 +123,68 @@
 
     <div class="card">
       <div class="card-title">
+        <span>媒体用量</span>
+        <div class="filter-line">
+          <el-select v-model="usageHours" size="small" style="width: 130px" @change="loadUsage">
+            <el-option label="最近 24 小时" :value="24" />
+            <el-option label="最近 3 天" :value="72" />
+            <el-option label="最近 7 天" :value="168" />
+            <el-option label="最近 30 天" :value="720" />
+          </el-select>
+          <el-button size="small" @click="loadUsage">刷新</el-button>
+        </div>
+      </div>
+      <el-descriptions v-if="usage" :column="4" border size="small">
+        <el-descriptions-item label="调用次数">{{ usage.calls }}</el-descriptions-item>
+        <el-descriptions-item label="其中 Mock">{{ usage.mock_calls }}</el-descriptions-item>
+        <el-descriptions-item label="成功 / 失败">
+          {{ usage.successful_calls }} / {{ usage.failed_calls }}
+        </el-descriptions-item>
+        <el-descriptions-item label="平均时延">{{ usage.latency_ms_avg.toFixed(1) }} ms</el-descriptions-item>
+        <el-descriptions-item label="外部费用" :span="2">
+          {{ costLabel(usage.external_cost, usage.cost_status, usage.mock_calls, usage.calls) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="统计窗口" :span="2">
+          {{ formatTime(usage.window_start) }} ~ {{ formatTime(usage.window_end) }}
+        </el-descriptions-item>
+      </el-descriptions>
+      <el-table v-loading="usageLoading" :data="usage?.by_provider ?? []" size="small" class="usage-table">
+        <el-table-column label="Provider" min-width="170">
+          <template #default="{ row }">
+            {{ row.provider_name }}
+            <el-tag v-if="row.mock_calls > 0" size="small" type="warning" class="gap-tag">Mock</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="calls" label="调用" width="80" />
+        <el-table-column label="成功 / 失败" width="110">
+          <template #default="{ row }">{{ row.successful_calls }} / {{ row.failed_calls }}</template>
+        </el-table-column>
+        <el-table-column label="平均时延" width="110">
+          <template #default="{ row }">{{ row.latency_ms_avg.toFixed(1) }} ms</template>
+        </el-table-column>
+        <el-table-column label="外部费用" min-width="200">
+          <template #default="{ row }">{{ costLabel(row.external_cost, row.cost_status, row.mock_calls, row.calls) }}</template>
+        </el-table-column>
+      </el-table>
+      <el-table :data="usage?.by_capability ?? []" size="small" class="usage-table">
+        <el-table-column prop="capability" label="能力" min-width="170" />
+        <el-table-column prop="calls" label="调用" width="80" />
+        <el-table-column prop="mock_calls" label="其中 Mock" width="100" />
+        <el-table-column label="平均时延" width="110">
+          <template #default="{ row }">{{ row.latency_ms_avg.toFixed(1) }} ms</template>
+        </el-table-column>
+        <el-table-column label="外部费用" min-width="200">
+          <template #default="{ row }">{{ costLabel(row.external_cost, row.cost_status, row.mock_calls, row.calls) }}</template>
+        </el-table-column>
+      </el-table>
+      <el-empty v-if="!usageLoading && usage && !usage.calls" description="当前统计窗口内没有媒体 Provider 调用。" :image-size="45" />
+      <p class="muted job-note">
+        {{ usage?.note ?? '媒体用量只统计 Provider 调用次数、时延与费用状态，不含媒体内容或转写文本。' }}
+      </p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
         <span>媒体任务队列</span>
         <div class="filter-line">
           <el-select v-model="jobStatus" size="small" clearable placeholder="全部状态" style="width: 140px" @change="loadJobs">
@@ -162,7 +224,10 @@
         </el-table-column>
       </el-table>
       <el-empty v-if="!jobsLoading && !jobs.length" description="暂无媒体任务。P0 阶段不会自动下载真实 QQ 媒体文件。" :image-size="55" />
-      <p class="muted job-note">Mock 媒体任务的输出是模拟结果，不代表真实识别；真实媒体 Provider 属于后续版本规划。</p>
+      <p class="muted job-note">
+        后台 worker 会自动处理排队任务；上方按钮只用于手动触发一次。Mock 媒体任务的输出是模拟结果，不代表真实识别；真实媒体
+        Provider 属于后续版本规划。
+      </p>
     </div>
   </div>
 </template>
@@ -171,7 +236,7 @@
 import { computed, onMounted, ref } from 'vue'
 
 import { api, errorMessage } from '@/api/client'
-import type { CapabilitiesPayload, MediaJob } from '@/api/types'
+import type { CapabilitiesPayload, MediaJob, MediaUsageSummary } from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
 import { formatTime } from '@/utils/format'
@@ -196,6 +261,9 @@ const processing = ref(false)
 const error = ref<string | null>(null)
 const jobs = ref<MediaJob[]>([])
 const jobStatus = ref<string | undefined>(undefined)
+const usage = ref<MediaUsageSummary | null>(null)
+const usageHours = ref(24)
+const usageLoading = ref(false)
 
 function llmTypeLabel(value: string): string {
   if (value === 'mock') return 'Mock 模型'
@@ -233,8 +301,31 @@ async function loadJobs(): Promise<void> {
   }
 }
 
+async function loadUsage(): Promise<void> {
+  usageLoading.value = true
+  try {
+    usage.value = await api<MediaUsageSummary>('/media/usage', {
+      query: { hours: usageHours.value },
+    })
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  } finally {
+    usageLoading.value = false
+  }
+}
+
+/** 费用只在全部调用都有数据时展示总额；未知不显示 0。 */
+function costLabel(value: number | null, status: string, mockCalls = 0, calls = 0): string {
+  if (status === 'no_calls' || calls === 0) return '无调用'
+  if (value === null) {
+    return status === 'partial' ? '部分未知（不展示总额）' : '未知（Provider 未提供费用）'
+  }
+  if (value === 0 && mockCalls === calls) return '0.00 USD（全部为 Mock 调用）'
+  return `${value.toFixed(6)} USD`
+}
+
 async function loadAll(): Promise<void> {
-  await Promise.all([loadCapabilities(), loadJobs()])
+  await Promise.all([loadCapabilities(), loadJobs(), loadUsage()])
 }
 
 async function toggleMedia(provider: RegistryProvider, enabled: boolean): Promise<void> {
@@ -353,6 +444,10 @@ onMounted(loadAll)
   display: flex;
   gap: 8px;
   align-items: center;
+}
+
+.usage-table {
+  margin-top: 10px;
 }
 
 .job-note {

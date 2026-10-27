@@ -16,7 +16,7 @@ from app.models.governance import (
     UsageEvent,
 )
 from app.models.group import Group, Member
-from app.models.media import MediaAsset, MediaJob, MediaTranscript
+from app.models.media import MediaAsset, MediaJob, MediaProviderUsage, MediaTranscript
 from app.models.memory import MEMORY_CANDIDATE_STATUSES, Memory, MemoryCandidate
 from app.models.message import Message, OutboxMessage
 from app.models.persona import (
@@ -46,6 +46,7 @@ __all__ = [
     "LLMUsage",
     "MediaAsset",
     "MediaJob",
+    "MediaProviderUsage",
     "MediaTranscript",
     "Member",
     "Memory",

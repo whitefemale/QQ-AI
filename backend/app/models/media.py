@@ -22,9 +22,9 @@ class MediaAsset(Base, TimestampMixin):
     size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     storage_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    source_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="stored", nullable=False)
-    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True, index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
@@ -66,3 +66,23 @@ class MediaTranscript(Base, TimestampMixin):
     provider_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_mock: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class MediaProviderUsage(Base, TimestampMixin):
+    """媒体 Provider 调用审计（只含计数/时延/费用状态，不含媒体内容或转写文本）。"""
+
+    __tablename__ = "media_provider_usage"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    provider_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    capability: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    job_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), default="job", nullable=False)
+    account_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    group_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    requests: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    external_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
+    is_mock: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    succeeded: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)

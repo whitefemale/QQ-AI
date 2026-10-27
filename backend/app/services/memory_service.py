@@ -22,7 +22,8 @@ from app.core.time import ensure_utc, iso_utc, utcnow
 from app.db.session import Database
 from app.models.account import Account
 from app.models.group import Group, Member
-from app.models.memory import Memory
+from app.models.memory import Memory, MemoryCandidate
+from app.services.audit import write_audit
 
 MEMORY_TYPES = {
     "fact": "事实",
@@ -276,6 +277,44 @@ class MemoryService:
             await session.delete(record)
             await session.commit()
         return True
+
+    async def scrub_source_message_ids(self, message_ids: set[str], *, actor: str = "system") -> dict[str, int]:
+        """擦除记忆与候选的来源消息 ID。
+
+        记忆正文不改写（当前版本限制）；来源原本存在但现在为空的 pending 候选直接删除，
+        已审核候选只擦来源，保留审计痕迹。
+        """
+        result = {"memories_updated": 0, "candidates_updated": 0, "candidates_deleted": 0}
+        if not message_ids:
+            return result
+        async with self.database.session() as session:
+            for record in (await session.execute(select(Memory))).scalars():
+                sources = [str(item) for item in (record.source_message_ids_json or [])]
+                if not set(sources) & message_ids:
+                    continue
+                record.source_message_ids_json = [item for item in sources if item not in message_ids]
+                result["memories_updated"] += 1
+            for candidate in (await session.execute(select(MemoryCandidate))).scalars():
+                sources = [str(item) for item in (candidate.source_message_ids_json or [])]
+                if not set(sources) & message_ids:
+                    continue
+                remaining = [item for item in sources if item not in message_ids]
+                if not remaining and candidate.status == "pending":
+                    await session.delete(candidate)
+                    result["candidates_deleted"] += 1
+                else:
+                    candidate.source_message_ids_json = remaining
+                    result["candidates_updated"] += 1
+            await session.commit()
+        if any(result.values()):
+            await write_audit(
+                self.database,
+                action="memory.sources.scrub",
+                target_type="message_batch",
+                details={**result, "message_count": len(message_ids)},
+                actor=actor,
+            )
+        return result
 
     async def list_memories(
         self,

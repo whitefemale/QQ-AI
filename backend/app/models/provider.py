@@ -61,6 +61,7 @@ class LLMUsage(Base, TimestampMixin):
     message_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     group_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    account_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

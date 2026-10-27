@@ -7,6 +7,21 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+class GrowthInteraction(BaseModel):
+    """触发本次成长反思的最近一轮对话；只用于提示词，不落库。"""
+
+    user_message: str = ""
+    assistant_reply: str = ""
+    message_id: str | None = None
+
+    def sanitized(self, max_chars: int = 600) -> GrowthInteraction:
+        return GrowthInteraction(
+            user_message=self.user_message.strip()[:max_chars],
+            assistant_reply=self.assistant_reply.strip()[:max_chars],
+            message_id=(self.message_id or "").strip()[:128] or None,
+        )
+
+
 class TraitProposal(BaseModel):
     trait_key: str = ""
     trait_value: str = ""
@@ -20,7 +35,8 @@ class PersonaProposal(BaseModel):
     proposed_traits: list[TraitProposal] = Field(default_factory=list)
     summary: str = ""
     scope: str | None = None
-    diff: str | None = None
+    # 第一人称自然语言变化摘要；不保存推理过程或原始 diff。
+    diff_summary: str | None = None
 
 
 class ProposalDocument(BaseModel):
@@ -30,6 +46,7 @@ class ProposalDocument(BaseModel):
     proposed_traits: list[TraitProposal] = Field(default_factory=list)
     summary: str = ""
     scope: str | None = None
+    diff_summary: str | None = None
 
     def sanitized(self, max_traits: int, max_description: int = 1500) -> dict[str, Any]:
         description = (self.self_description or "").strip()[:max_description] or None
@@ -49,4 +66,5 @@ class ProposalDocument(BaseModel):
             "proposed_traits": traits,
             "summary": self.summary.strip()[:500],
             "scope": (self.scope or "").strip()[:128] or None,
+            "diff_summary": (self.diff_summary or "").strip()[:600] or None,
         }

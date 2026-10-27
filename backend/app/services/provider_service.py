@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from urllib.parse import urlparse
 
@@ -15,9 +16,12 @@ from app.core.time import iso_utc
 from app.db.session import Database
 from app.models.group import Group
 from app.models.provider import LLMProvider
+from app.models.provider import ProviderRegistry as MediaProviderState
 from app.pipeline.llm_gateway import LLMGateway
 from app.providers.registry import CAPABILITY_TYPES, ProviderRegistry
 from app.services.audit import write_audit
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_LLM_TYPES = {"mock", "openai_compatible", "anthropic_native"}
 REMOTE_LLM_TYPES = {"openai_compatible", "anthropic_native"}
@@ -294,10 +298,101 @@ class ProviderService:
     async def list_media_providers(self) -> list[dict[str, Any]]:
         return [redact_value(entry.public()) for entry in self.registry.list_entries()]
 
+    async def _persist_media_provider(
+        self,
+        entry: Any,
+        *,
+        enabled: bool | None = None,
+        status: str | None = None,
+        health_status: str | None = None,
+        last_error: str | None = None,
+        last_health_check_at: Any = None,
+    ) -> None:
+        """媒体 Provider 状态持久化。只在显式传入时覆盖字段；未知历史 Provider 不凭空注册。"""
+        async with self.database.session() as session:
+            record = await session.get(MediaProviderState, entry.provider_id)
+            if record is None:
+                record = MediaProviderState(
+                    id=entry.provider_id,
+                    provider_type=entry.provider_type,
+                    name=entry.name,
+                    version=entry.version,
+                    capabilities_json=list(entry.capabilities),
+                    config_schema_json=dict(entry.config_schema),
+                    enabled=bool(enabled if enabled is not None else entry.enabled),
+                    status=status or entry.status,
+                    health_status=health_status or entry.health_status,
+                    is_mock=bool(entry.is_mock),
+                    planned=bool(entry.planned),
+                )
+                session.add(record)
+            if enabled is not None:
+                record.enabled = bool(enabled)
+            if status is not None:
+                record.status = status
+            if health_status is not None:
+                record.health_status = health_status
+            if last_error is not None or health_status is not None:
+                record.last_error = last_error
+            if last_health_check_at is not None:
+                record.last_health_check_at = last_health_check_at
+            await session.commit()
+
+    async def load_media_provider_state(self) -> None:
+        """启动时加载已持久化的媒体 Provider 状态；未知 Provider 只告警忽略。"""
+        try:
+            async with self.database.session() as session:
+                records = list((await session.execute(select(MediaProviderState))).scalars())
+        except Exception:
+            logger.exception("读取媒体 Provider 状态失败，使用默认状态")
+            return
+        for record in records:
+            entry = self.registry.get(record.id)
+            if entry is None:
+                logger.warning(
+                    "忽略未知媒体 Provider 持久化记录",
+                    extra={"provider_id": record.id, "provider_type": record.provider_type},
+                )
+                continue
+            if entry.planned or entry.provider is None:
+                continue
+            entry.enabled = bool(record.enabled)
+            entry.health_status = record.health_status or "unknown"
+            if entry.enabled:
+                entry.status = "available" if entry.health_status != "unhealthy" else "error"
+            else:
+                entry.status = "disabled"
+            entry.last_error = record.last_error
+            entry.last_health_check_at = record.last_health_check_at
+
     async def set_media_provider_enabled(self, provider_id: str, enabled: bool) -> dict[str, Any]:
+        # 先写数据库；失败时内存状态保持不变。
+        entry = self.registry.require(provider_id)
+        if entry.planned or entry.provider is None:
+            self.registry.set_enabled(provider_id, enabled)  # 统一抛出中文错误
+        status = "disabled" if not enabled else "available"
+        try:
+            await self._persist_media_provider(entry, enabled=enabled, status=status, last_error=None)
+        except Exception as exc:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "媒体 Provider 状态保存失败，未修改内存状态。",
+                status_code=500,
+            ) from exc
         entry = self.registry.set_enabled(provider_id, enabled)
         if enabled:
             await self.registry.health_check(provider_id)
+            try:
+                await self._persist_media_provider(
+                    entry,
+                    enabled=entry.enabled,
+                    status=entry.status,
+                    health_status=entry.health_status,
+                    last_error=entry.last_error,
+                    last_health_check_at=entry.last_health_check_at,
+                )
+            except Exception:
+                logger.exception("媒体 Provider 健康状态持久化失败", extra={"provider_id": provider_id})
         await write_audit(
             self.database,
             action="provider.media.toggle",
@@ -308,7 +403,24 @@ class ProviderService:
         return redact_value(entry.public())
 
     async def test_media_provider(self, provider_id: str) -> dict[str, Any]:
+        entry = self.registry.require(provider_id)
+        snapshot = (entry.enabled, entry.status, entry.health_status, entry.last_error, entry.last_health_check_at)
         entry = await self.registry.health_check(provider_id)
+        try:
+            await self._persist_media_provider(
+                entry,
+                status=entry.status,
+                health_status=entry.health_status,
+                last_error=entry.last_error,
+                last_health_check_at=entry.last_health_check_at,
+            )
+        except Exception as exc:
+            entry.enabled, entry.status, entry.health_status, entry.last_error, entry.last_health_check_at = snapshot
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "媒体 Provider 健康状态保存失败，内存状态已回滚。",
+                status_code=500,
+            ) from exc
         await write_audit(
             self.database,
             action="provider.media.test",

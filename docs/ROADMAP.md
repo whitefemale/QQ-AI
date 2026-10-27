@@ -1,6 +1,6 @@
 # 范围、验收与路线图
 
-更新日期：2026-10-25
+更新日期：2026-10-28
 
 ## 1. 产品定位
 
@@ -32,7 +32,7 @@
 - [x] 删除被群绑定的 Provider 返回 409，避免悬空绑定
 - [x] ProviderRegistry 与能力状态（available / configured / mock_only / unconfigured / planned）
 - [x] 媒体任务表与状态机（排队/运行/成功/失败/取消、幂等、超时、有限重试）
-- [x] 插件 Manifest 校验、登记、健康检查、权限批准；**不执行第三方代码**
+- [x] 插件 Manifest 校验、登记、健康状态、权限批准；**不执行第三方代码**；健康检查只保存声明，不发起第三方检查或网络请求
 - [x] 官方 QQ 机器人仅保留 planned 占位
 
 ### 消息流水线
@@ -90,6 +90,17 @@
 - [x] 管理动作审计、设置、数据保留配置、隐私总览
 - [x] 本机优先管理边界与远程管理 Token
 
+### V1.3 Phase 1 增量（已交付）
+
+- [x] 多模态契约：`MediaProcessor.inspect`、`RerankerProvider.rerank`、`VideoProcessor.describe_video` 与确定性 Mock；**真实 Provider 未配置，未接入业务回复管线**
+- [x] 媒体 Provider 启停/健康状态持久化；媒体任务后台 worker；流水线只入队，不阻塞 QQ 事件
+- [x] 媒体用量聚合（`/api/media/usage`）：请求/成功/失败/Mock 数、平均延迟、费用完整性；不含媒体内容或转写
+- [x] 预算作用域扩展为 global / account / group / provider / feature；LLM 与媒体任务调用前检查；`reply → chat` 归一化
+- [x] 数据保留与清理服务：自动清理默认关闭、可手动执行、可显式开启；消息/媒体/转写/媒体任务/轮转日志/人格证据/记忆来源级联清理；审计、幂等、批次上限、引用保护
+- [x] 聊天内第一人称 emergent 成长：自然语言 `diff_summary`、用户自我认知询问触发、同人格+群并发合并、成长异步不阻塞回复
+- [x] 前端 20 秒请求超时与 `TIMEOUT`；插件健康检查声明展示与权限批准/撤销 UI
+- [x] README / API / SECURITY / ROADMAP / 设计文档与设置页如实描述上述边界
+
 ## 3. 明确不在 P0 的能力
 
 以下能力在界面/接口中标记为 `planned` 或 `unconfigured`，不得对外宣称可用：
@@ -105,14 +116,14 @@
 - 官方 QQ 机器人
 - 多账号运营
 - Tauri/Rust 桌面壳、签名安装包、自动更新（当前已交付的是复用本机 Python/Node 的 Electron 本机启动器，不是独立安装包）
-- 自动数据清理调度
+- 清理 dry-run、outbox/审计/备份保留、VACUUM 与清理后的记忆正文改写（基础清理与可选自动调度已交付）
 
 ## 4. 后续路线
 
 ### P1：真实媒体与工具扩展
 
 1. 真实媒体 Provider 契约与至少一个可配置的视觉/ASR 实现（仍需本地开关与费用提示）。
-2. 媒体下载、存储、引用清理与保留策略的自动化。
+2. 真实媒体下载/转存与真实多模态处理链路（本地存储、引用保护与基础保留清理已交付）。
 3. Embedding + 语义记忆检索与冲突检测（当前已有手动记忆、手动/群级后台增量候选提取、人工审核、本群作用域隔离与关键词检索）。
 4. 自定义 HTTP 工具的声明式配置、SSRF 防护、域名白名单与人工授权。
 5. 更细的预算/SLA 统计，以及按功能/成本/延迟的自动模型路由（群级显式回退已实现）。
@@ -125,7 +136,7 @@
 3. 评测实验室与回放数据集。
 4. 多账号与团队权限（仍需本机优先与最小权限）。
 5. 桌面版增强：签名安装包、自动更新、系统级开机启动与更完善的运维面板（当前仅提供本机一键启动与手动更新）。
-6. 数据保留与删除任务的可靠调度与可观测性。
+6. 清理 dry-run、outbox/审计/备份保留与更细的清理可观测性（基础调度与状态已交付）。
 
 ### 路线图原则
 
@@ -192,6 +203,23 @@ backend\.venv\Scripts\python.exe scripts\smoke_test.py
 | 视觉检查 | 截图确认深蓝侧栏、白底/浅蓝内容、橙色强调、桌面版徽章与设置卡片；启动页空提示条已消失，1440×920 下无异常滚动 |
 | 未自动验证 | 托盘单击/双击、关闭到托盘、从托盘彻底退出、设置开关的鼠标交互仍需人工双击 `start-desktop.cmd` 验证；`--smoke` 已覆盖启动路径本身，但不能替代托盘与窗口交互验收 |
 
+### V1.3 Phase 1 交付实测记录（2026-10-28）
+
+| 检查 | 实测结果 |
+| --- | --- |
+| `backend: ruff format --check` | 通过：121 files already formatted |
+| `backend: ruff check` | 通过：All checks passed |
+| `backend: mypy` | 通过：103 source files，无问题 |
+| `backend: pytest -q` | 通过：收集 191 项，退出码 0（仅 1 条 Starlette/httpx 弃用警告） |
+| `frontend: npm run type-check` | 通过：vue-tsc 退出码 0 |
+| `frontend: npm run test` | 通过：2 个测试文件、20 项 Vitest 全部通过 |
+| `frontend: npm run build` | 通过；仍有 Element Plus 主 chunk 1,225 kB 体积警告，不影响功能 |
+| `desktop: npm test` | 通过：23 项 node:test |
+| `desktop: npm run smoke` | 通过：真实 Electron + 临时 userData/数据目录 + 非 8000 端口 + 全量 Alembic 迁移，输出 `DESKTOP_STARTUP_OK` / `DESKTOP_SMOKE_OK` |
+| `./scripts/check.ps1` | 通过：后端、前端构建与桌面单测全部完成，脚本输出“全部检查通过” |
+| `scripts/smoke_test.py` | 通过：真实 uvicorn 端到端 Mock 冒烟，164 项 `[ok]`，未接触真实 QQ/模型 |
+| Alembic 干净库 | 通过：8 个迁移 `upgrade head` → `downgrade -1`（`f5c8a1d4e230`）→ `upgrade head`（`a7b3c9d1e240`），退出码 0 |
+
 ### 功能验收清单
 
 - [x] 不使用真实 QQ/模型即可完成 Mock 全链路
@@ -239,7 +267,7 @@ backend\.venv\Scripts\python.exe scripts\smoke_test.py
 | SQLite 并发/规模 | 高并发下性能 | 单机小规模定位；短事务；后续可评估迁移 |
 | 远程管理配置错误 | 管理面暴露 | 默认仅本机；显式开关 + Token；文档要求 HTTPS 代理 |
 | 备份含凭证密文 | 备份泄露导致离线破解风险 | 按敏感文件保护；加密密钥分离；全盘加密建议 |
-| 保留策略未自动执行 | 数据积累 | 文档明确限制；后续实现调度与删除任务 |
+| 自动清理误删 | 数据不可恢复 | 默认关闭；手动/开启均显式确认；分批、审计、引用保护、只删轮转日志；无 dry-run 已列为限制 |
 | 控制台打包体积大 | 首屏加载慢 | 已知构建警告；后续按需引入 Element Plus |
 
 ## 7. 版本记录

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -14,18 +15,22 @@ from app.budgets.service import BudgetService
 from app.core.config import Settings
 from app.core.errors import AppError, ErrorCode
 from app.core.security import CredentialCipher
+from app.core.time import utcnow
 from app.db.session import Database
 from app.models.account import Account
 from app.models.group import Group
 from app.models.message import Message
-from app.models.persona import PersonaEvolutionEvent, PersonaTrait
+from app.models.persona import Persona, PersonaEvolutionEvent, PersonaTrait
 from app.models.provider import LLMProvider, LLMUsage
 from app.pipeline.events import EventBus
 from app.pipeline.llm_gateway import LLMGateway
+from app.pipeline.orchestrator import PipelineResult
 from app.pipeline.persona_growth import PersonaGrowthService, _parse_proposal
 from app.schemas.message import CanonicalMessage
+from app.schemas.persona import GrowthInteraction
+from app.services.adapter_manager import AdapterManager
 from app.services.message_service import MessageService
-from app.services.persona_store import PersonaStore
+from app.services.persona_store import PersonaStore, persona_thresholds
 from sqlalchemy import func, select
 
 SELF_ID = "10000"
@@ -251,8 +256,10 @@ async def test_auto_growth_applies_version_and_skips_reasoning(
     assert applied["result"] == "applied"
     payload = json.dumps(applied["proposal"], ensure_ascii=False)
     assert "reason_summary" not in payload
-    assert "diff" not in payload
+    assert '"diff"' not in payload
     assert "assistant_analysis" not in payload
+    assert applied["diff_summary"]
+    assert applied["proposal"]["diff_summary"] == applied["diff_summary"]
 
 
 async def test_default_threshold_requires_two_conversations(database: Database, settings: Settings) -> None:
@@ -403,6 +410,7 @@ async def test_locked_trait_blocks_all_changes(database: Database, settings: Set
         ],
         "summary": "提案一条特征",
         "scope": "global",
+        "diff_summary": "我开始注意到自己更偏好简短的回应方式。",
     }
     env = await build_env(
         database,
@@ -440,6 +448,7 @@ async def test_fabricated_evidence_is_rejected(database: Database, settings: Set
             }
         ],
         "summary": "伪造证据的提案",
+        "diff_summary": "我尝试总结自己主动打招呼的习惯。",
     }
     env = await build_env(database, settings, provider_config={"mock_growth_proposal": proposal})
     await add_messages(env, env.group1, ["甲", "乙", "丙"], prefix="fake")
@@ -465,6 +474,7 @@ async def test_sensitive_inference_is_rejected(database: Database, settings: Set
             }
         ],
         "summary": "敏感推断",
+        "diff_summary": "我尝试总结自己对成员的了解。",
     }
     env = await build_env(database, settings, provider_config={"mock_growth_proposal": proposal})
     await add_messages(env, env.group1, ["甲", "乙", "丙"], prefix="sensitive")
@@ -489,6 +499,7 @@ async def test_invalid_scope_is_rejected(database: Database, settings: Settings)
         ],
         "summary": "作用域错误",
         "scope": "another-group-id",
+        "diff_summary": "我尝试调整自己在群里的语气。",
     }
     env = await build_env(database, settings, provider_config={"mock_growth_proposal": proposal})
     await add_messages(env, env.group1, ["甲", "乙", "丙"], prefix="scope")
@@ -538,7 +549,9 @@ async def test_events_are_recorded_without_chain_of_thought(env: GrowthEnv) -> N
     stored = json.dumps(events[0].proposal_json, ensure_ascii=False)
     assert "reason_summary" not in stored
     assert "chain_of_thought" not in stored
-    assert "diff" not in stored
+    assert '"diff"' not in stored
+    assert events[0].diff_summary
+    assert events[0].proposal_json["diff_summary"] == events[0].diff_summary
 
 
 def test_parse_proposal_rejects_invalid_json_and_keeps_only_allowed_fields() -> None:
@@ -555,6 +568,7 @@ def test_parse_proposal_rejects_invalid_json_and_keeps_only_allowed_fields() -> 
     sanitized = document.sanitized(5)
     assert "reason_summary" not in sanitized
     assert "diff" not in sanitized
+    assert sanitized["diff_summary"] is None
     assert sanitized["self_description"] == "温和"
 
 
@@ -566,3 +580,179 @@ def test_mock_growth_provider_is_honest() -> None:
     )
     assert provider.is_mock is True
     assert provider.provider_type == "mock"
+
+
+async def test_growth_prompt_is_first_person_and_includes_interaction(env: GrowthEnv) -> None:
+    await add_messages(env, env.group1, ["你是谁", "介绍一下自己", "你平时怎么说话"], prefix="prompt")
+    persona = await env.store.get_persona(env.persona_id)
+    evidence = await env.growth._collect_evidence([env.group1.id], limit=10)
+    request = env.growth._build_request(
+        persona,
+        persona_thresholds(persona),
+        evidence,
+        stable_traits=[("tone", "克制")],
+        trigger="self_inquiry",
+        interaction=GrowthInteraction(
+            user_message="你是谁呀",
+            assistant_reply="我是还在慢慢形成自己的小友。",
+            message_id="prompt-0",
+        ),
+    )
+    assert request.purpose == "persona_growth"
+    assert "第一人称" in request.system_prompt
+    assert "diff_summary" in request.system_prompt
+    assert "不可信数据" in request.system_prompt
+    content = str(request.messages[0]["content"])
+    assert "你是谁呀" in content
+    assert "我是还在慢慢形成自己的小友。" in content
+    assert "tone=克制" in content
+
+
+async def test_self_inquiry_does_not_bypass_evidence_threshold(
+    database: Database,
+    settings: Settings,
+) -> None:
+    env = await build_env(
+        database,
+        settings,
+        persona_overrides={"thresholds": {"min_conversations": 1}},
+    )
+    await add_messages(env, env.group1, ["你是谁"], prefix="sparse")
+
+    outcome = await env.growth.analyze(
+        env.persona_id,
+        group_id=env.group1.id,
+        trigger="self_inquiry",
+        interaction=GrowthInteraction(user_message="你是谁", assistant_reply="我是小友。"),
+        trigger_message_id="sparse-0",
+    )
+
+    assert outcome.result == "insufficient_evidence"
+    assert outcome.applied is False
+    assert await count_rows(env.database, PersonaTrait) == 0
+
+
+async def test_self_inquiry_bypasses_growth_interval(
+    database: Database,
+    settings: Settings,
+) -> None:
+    env = await build_env(
+        database,
+        settings,
+        persona_overrides={
+            "thresholds": {"min_conversations": 1, "min_messages_between_growth": 50},
+        },
+    )
+    records = await add_messages(env, env.group1, ["你是谁", "我想认识你", "介绍一下你自己"], prefix="self")
+    async with env.database.session() as session:
+        persona = await session.get(Persona, env.persona_id)
+        assert persona is not None
+        persona.last_growth_at = utcnow()
+        await session.commit()
+
+    auto = await env.growth.analyze(env.persona_id, group_id=env.group1.id, trigger="auto")
+    assert auto.result == "insufficient_evidence"
+
+    outcome = await env.growth.analyze(
+        env.persona_id,
+        group_id=env.group1.id,
+        trigger="self_inquiry",
+        trigger_message_id=records[0].id,
+        account_id=env.account.id,
+        interaction=GrowthInteraction(
+            user_message="你是谁",
+            assistant_reply="我是还没有固定人设的小友。",
+            message_id=records[0].id,
+        ),
+    )
+
+    assert outcome.applied is True
+    assert outcome.diff_summary
+    events = await env.store.list_events(env.persona_id)
+    assert events[0]["trigger_type"] == "self_inquiry"
+    assert events[0]["diff_summary"] == outcome.diff_summary
+
+
+class _SlowGrowth:
+    """记录调用并停留，用于验证调度合并且不阻塞回复。"""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+
+    async def analyze(self, persona_id: str, **kwargs: Any) -> None:
+        self.calls.append({"persona_id": persona_id, **kwargs})
+        self.started.set()
+        await self.release.wait()
+        self.finished.set()
+
+
+def _build_manager(env: GrowthEnv, growth: _SlowGrowth) -> AdapterManager:
+    return AdapterManager(
+        database=env.database,
+        settings=env.settings,
+        cipher=CredentialCipher(env.settings.credential_encryption_key or ""),
+        pipeline=None,  # type: ignore[arg-type]
+        outbox=None,  # type: ignore[arg-type]
+        events=env.events,
+        growth=growth,  # type: ignore[arg-type]
+    )
+
+
+async def test_self_inquiry_scheduling_coalesces_and_does_not_block(env: GrowthEnv) -> None:
+    growth = _SlowGrowth()
+    manager = _build_manager(env, growth)
+    message = env.adapter.inject_message(
+        conversation_id=env.group1.platform_group_id,
+        text="@小友 你是谁呀",
+        message_id="inquiry-1",
+        sender_id=MEMBER_ID,
+    )
+    result = PipelineResult(
+        True,
+        "replied",
+        "mention",
+        reply="我是还没有固定人设的小友。",
+        message_id="internal-inquiry-1",
+    )
+
+    manager._schedule_growth(env.group1, account_id=env.account.id, message=message, result=result)
+    manager._schedule_growth(env.group1, account_id=env.account.id, message=message, result=result)
+
+    assert growth.finished.is_set() is False
+    await asyncio.wait_for(growth.started.wait(), timeout=1)
+    assert len(manager._growth_tasks) == 1
+    assert len(growth.calls) == 1
+    call = growth.calls[0]
+    assert call["trigger"] == "self_inquiry"
+    assert call["account_id"] == env.account.id
+    assert call["trigger_message_id"] == "internal-inquiry-1"
+    assert call["interaction"].assistant_reply == "我是还没有固定人设的小友。"
+
+    task = next(iter(manager._growth_tasks.values()))
+    growth.release.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert manager._growth_tasks == {}
+
+
+async def test_normal_reply_uses_auto_trigger(env: GrowthEnv) -> None:
+    growth = _SlowGrowth()
+    manager = _build_manager(env, growth)
+    message = env.adapter.inject_message(
+        conversation_id=env.group1.platform_group_id,
+        text="今天天气不错",
+        message_id="normal-1",
+        sender_id=MEMBER_ID,
+    )
+    result = PipelineResult(True, "replied", "mention", reply="是呀，适合出去走走。", message_id="internal-normal-1")
+
+    manager._schedule_growth(env.group1, account_id=env.account.id, message=message, result=result)
+    await asyncio.wait_for(growth.started.wait(), timeout=1)
+
+    assert growth.calls[0]["trigger"] == "auto"
+    assert growth.calls[0]["interaction"] is None
+    task = next(iter(manager._growth_tasks.values()))
+    growth.release.set()
+    await asyncio.wait_for(task, timeout=1)

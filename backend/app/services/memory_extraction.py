@@ -165,6 +165,8 @@ class MemoryExtractionService:
             request,
             conversation_id=messages[-1].conversation_id,
             group_id=group.id,
+            account_id=group.account_id,
+            feature="memory_extraction",
         )
         document = _parse_document(result.response.text)
         if document is None:

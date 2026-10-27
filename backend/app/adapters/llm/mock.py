@@ -59,7 +59,9 @@ class MockLLMProvider(BaseLLMProvider):
             ],
             "summary": "Mock 模拟的人格自我提案，仅用于演示成长流程。",
             "scope": "global",
-            "diff": "新增 1 条候选交流风格特征。",
+            "diff_summary": (
+                "（Mock 模拟）我在这次对话中更清楚地意识到，自己习惯先听完大家的话，再用轻松简短的方式接话。"
+            ),
         }
         return json.dumps(proposal, ensure_ascii=False)
 

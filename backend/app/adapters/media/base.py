@@ -11,13 +11,18 @@ from app.schemas.media import (
     BinarySource,
     GeneratedAudio,
     ImageUnderstandRequest,
+    MediaInspectRequest,
+    MediaInspectResult,
     MediaMetadata,
     MediaUnderstandingResult,
     OCRRequest,
     OCRResult,
+    RerankRequest,
+    RerankResult,
     SpeechSynthesisRequest,
     StoredMediaRef,
     TranscriptResult,
+    VideoUnderstandRequest,
 )
 
 
@@ -84,6 +89,36 @@ class EmbeddingProvider(BaseMediaProvider):
 
     @abstractmethod
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        raise NotImplementedError
+
+
+class MediaProcessor(BaseMediaProvider):
+    """媒体检查/元数据解析。只读取内部 media_ref，不接受外部 URL。"""
+
+    provider_type = "media_processor"
+
+    @abstractmethod
+    async def inspect(self, request: MediaInspectRequest) -> MediaInspectResult:
+        raise NotImplementedError
+
+
+class RerankerProvider(BaseMediaProvider):
+    """文本重排。当前仅建立契约与 Mock，不接入记忆检索。"""
+
+    provider_type = "reranker"
+
+    @abstractmethod
+    async def rerank(self, request: RerankRequest) -> RerankResult:
+        raise NotImplementedError
+
+
+class VideoProcessor(BaseMediaProvider):
+    """视频理解。当前仅建立契约与 Mock，不做下载、解码或转码。"""
+
+    provider_type = "video"
+
+    @abstractmethod
+    async def describe_video(self, request: VideoUnderstandRequest) -> MediaUnderstandingResult:
         raise NotImplementedError
 
 

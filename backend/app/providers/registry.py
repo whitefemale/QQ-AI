@@ -10,8 +10,11 @@ from app.adapters.media.base import BaseMediaProvider
 from app.adapters.media.mock import (
     MockASRProvider,
     MockEmbeddingProvider,
+    MockMediaProcessor,
     MockOCRProvider,
+    MockRerankerProvider,
     MockTTSProvider,
+    MockVideoProcessor,
     MockVisionProvider,
 )
 from app.core.errors import AppError, ErrorCode
@@ -24,6 +27,10 @@ CAPABILITY_TYPES: dict[str, str] = {
     "audio.transcribe": "asr",
     "audio.synthesize": "tts",
     "text.embed": "embedding",
+    # 以下能力当前只有接口契约与 Mock，不接入聊天流水线。
+    "media.inspect": "media_processor",
+    "text.rerank": "reranker",
+    "video.describe": "video",
 }
 
 
@@ -189,6 +196,9 @@ def build_default_registry() -> ProviderRegistry:
         MockASRProvider(),
         MockTTSProvider(),
         MockEmbeddingProvider(),
+        MockMediaProcessor(),
+        MockRerankerProvider(),
+        MockVideoProcessor(),
     ):
         registry.register_provider(
             provider,
@@ -204,4 +214,9 @@ def build_default_registry() -> ProviderRegistry:
     registry.register_planned("planned.asr", "asr", "真实语音识别 Provider（未配置）", ["audio.transcribe"])
     registry.register_planned("planned.tts", "tts", "真实语音合成 Provider（未配置）", ["audio.synthesize"])
     registry.register_planned("planned.embedding", "embedding", "真实 Embedding Provider（未配置）", ["text.embed"])
+    registry.register_planned(
+        "planned.media_processor", "media_processor", "真实媒体检查 Provider（未配置）", ["media.inspect"]
+    )
+    registry.register_planned("planned.reranker", "reranker", "真实文本重排 Provider（未配置）", ["text.rerank"])
+    registry.register_planned("planned.video", "video", "真实视频理解 Provider（未配置）", ["video.describe"])
     return registry

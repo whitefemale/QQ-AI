@@ -262,9 +262,27 @@ async def update_budget(
 async def check_budget(
     group_id: str | None = None,
     provider_id: str | None = None,
+    account_id: str | None = None,
+    feature: str | None = None,
     runtime: AppRuntime = Depends(get_runtime),
 ) -> dict[str, Any]:
-    check = await runtime.budgets.check(group_id=group_id, provider_id=provider_id)
+    if feature is not None:
+        from app.budgets.service import FEATURE_KEYS, normalize_feature_key
+
+        normalized = normalize_feature_key(feature)
+        if normalized not in FEATURE_KEYS:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                f"功能键无效，必须为：{', '.join(sorted(FEATURE_KEYS))}。",
+                status_code=400,
+            )
+        feature = normalized
+    check = await runtime.budgets.check(
+        group_id=group_id,
+        provider_id=provider_id,
+        account_id=account_id,
+        feature=feature,
+    )
     return ok(check.as_dict())
 
 

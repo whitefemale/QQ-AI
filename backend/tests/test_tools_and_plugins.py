@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from app.adapters.tools.base import Tool, ToolContext, ToolResult
 from app.adapters.tools.builtin import CalculatorTool
 from app.adapters.tools.executor import ToolExecutor
 from app.adapters.tools.registry import ToolRegistry
 from app.core.config import Settings
-from app.core.errors import AppError
+from app.core.errors import AppError, ErrorCode
 from app.db.session import Database
 from app.models.tool import ToolRun
 from app.plugins.manifest import parse_manifest
@@ -71,3 +73,70 @@ async def test_plugin_validation_and_builtin_sync(settings: Settings, database: 
     await service.approve_permissions("builtin.core-tools", False)
     with pytest.raises(AppError):
         await service.set_enabled("builtin.core-tools", True)
+
+
+def _write_manifest(settings: Settings, plugin_id: str, payload: dict) -> None:
+    directory = settings.plugins_path / plugin_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def test_plugin_healthcheck_declaration_validation() -> None:
+    manifest = parse_manifest(
+        {
+            "id": "demo.health",
+            "name": "健康检查示例",
+            "healthcheck": {
+                "type": "http",
+                "path": "/plugins/demo.health/health",
+                "interval_seconds": 60,
+                "timeout_seconds": 5,
+            },
+        }
+    )
+    assert manifest.healthcheck is not None
+    assert manifest.healthcheck.path == "/plugins/demo.health/health"
+
+    for path in ("http://evil.example/health", "//evil.example/health", "/../secret", "/x?y=1", "/x#f", "x"):
+        with pytest.raises(AppError):
+            parse_manifest({"id": "demo.health", "name": "x", "healthcheck": {"path": path}})
+
+    with pytest.raises(AppError):
+        parse_manifest({"id": "demo.health", "name": "x", "healthcheck": {"interval_seconds": 5}})
+
+
+async def test_plugin_healthcheck_is_persisted_but_not_executed(
+    settings: Settings,
+    database: Database,
+) -> None:
+    _write_manifest(
+        settings,
+        "demo.health",
+        {
+            "id": "demo.health",
+            "name": "健康检查示例",
+            "permissions": ["messages:send"],
+            "healthcheck": {"type": "http", "path": "/health", "interval_seconds": 120},
+        },
+    )
+    service = PluginService(database, settings)
+    await service.sync()
+
+    data = await service.get("demo.health")
+    assert data["healthcheck"]["path"] == "/health"
+    assert data["healthcheck"]["interval_seconds"] == 120
+    assert "不执行第三方健康检查" in data["healthcheck_note"]
+    assert data["permission_approved"] is False
+    assert data["enabled"] is False
+    assert data["runtime_status"] == "runtime_planned"
+
+    approved = await service.approve_permissions("demo.health", True)
+    assert approved["permission_approved"] is True
+    with pytest.raises(AppError) as excinfo:
+        await service.set_enabled("demo.health", True)
+    assert excinfo.value.code == ErrorCode.OPERATION_PLANNED
+    assert (await service.get("demo.health"))["enabled"] is False
+
+    revoked = await service.approve_permissions("demo.health", False)
+    assert revoked["permission_approved"] is False
+    assert revoked["enabled"] is False

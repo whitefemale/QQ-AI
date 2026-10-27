@@ -102,7 +102,7 @@ class BaseQQAdapter:
 4. **频率限制**：冷却、每小时、每日、连续回复上限。
 5. **命令**：仅白名单管理员或控制台命令可触发管理动作。
 6. **触发决策**：`observe` / `mention_only` / `keyword` / `context`；默认仅 @。
-7. **上下文**：按账号+会话隔离，限制条数；媒体只生成诚实降级说明。
+7. **上下文**：按账号+会话隔离，限制条数；图片/语音/文件片段只登记 `media_ref` 并入队媒体任务，不阻塞事件消费；已有转写可作为不可信资料注入，未配置或处理中时只生成诚实降级说明。
 8. **提示词**：安全层 → 账号基线 → 用户编写/锁定字段 → 稳定特征 → 群规则/人格修饰 → 本群长期记忆（不可信历史资料）→ 不可信上下文。
 9. **模型与工具**：预算检查 → LLM 调用 → 最多 `MAX_TOOL_ROUNDS` 轮工具 → 工具权限/次数/超时。
 10. **回复审查**：长度、控制字符、安全边界。
@@ -162,7 +162,8 @@ AI 候选提取（手动触发或群级后台增量 + 人工审核）：
 - 受控回退：只有主 Provider 的调用错误（超时、网络、认证、限流、额度、模型不存在、无效响应、Provider 不健康）才尝试备用模型一次。预算超限、全局暂停、Provider 禁用/缺失、配置或凭证错误直接失败，不允许借回退绕过控制。备用调用失败时错误详情同时保留主/备用错误码。
 - 回退结果仍走同一条回复审查与 outbox 入队路径，因此不会因此重复发送；用量按 Provider 分别记录，`reply.generated` 事件与 dry-run 结果携带 `fallback_used`、`primary_provider_id`、`primary_error_code`、`route_source`。
 - 删除被群绑定的 Provider 会被 409 拒绝，避免产生静默的悬空绑定。
-- 媒体 Provider：Mock 与接口骨架；真实 Vision/OCR/ASR/TTS/Embedding 未配置。
+- 媒体 Provider：`MediaProcessor`（inspect）、`RerankerProvider`（text.rerank）与 `VideoProcessor`（video.describe）已定义契约并注册确定性 Mock；媒体任务状态机、应用内后台 worker、启停/健康状态持久化与用量聚合已实现。真实 Vision/OCR/ASR/TTS/Embedding/视频 Provider 未配置，inspect/rerank/video 尚未接入业务回复管线，界面如实标注 `mock_only` / `unconfigured`。
+- 媒体用量只记录调用元数据（Provider、能力、任务类型、账号/群、请求、延迟、Mock 标记、外部费用完整性），不保存媒体内容、转写或提示词；Mock 外部费用为 0，真实/未知为 `null`。
 - 能力状态：`available` / `configured` / `disabled` / `unsupported_by_adapter` / `mock_only` / `unconfigured` / `planned`。
 - 前端能力页对 `mock_only`、`unconfigured`、`planned` 使用非成功色并给出解释。
 - 测试连接按错误类型分类，不静默回退到 Mock 生成虚假回复。
@@ -180,13 +181,16 @@ AI 候选提取（手动触发或群级后台增量 + 人工审核）：
 ### 成长流程
 
 ```text
-聊天记录 → 手动/调度分析 → 模型结构化提案
+聊天记录（含刚发出的回复）→ 回复后异步/手动分析 → 第一人称结构化提案
         → 治理校验（Schema/证据/会话数/置信度/范围/锁定字段）
         → auto 生成版本 | review 待审核 | paused 不处理
         → 特征 candidate → stable/rejected
         → 版本快照 + 变更事件（可回滚）
 ```
 
+- 成长提示词让“人格自身”以第一人称反思当前自述、稳定特征、锁定字段与这次互动，输出 `self_description`、`proposed_traits`、`diff_summary`、`summary`、`scope`。`diff_summary` 是自然语言变化摘要，随事件与待审提案展示；不保存分析步骤或思维链。
+- 回复生成成功后异步调度成长，正常回复不被成长阻塞。用户询问“你是谁 / 你的人设 / 介绍你自己”等会触发一次 `self_inquiry` 分析；它只豁免成长最小间隔，不豁免证据数量、会话数、置信度、锁定字段与范围。同一人格+群已有任务在运行时跳过重复调度。
+- 聊天提示词要求被问及自我认知时用当前人格第一人称自然回答，不编造现实身体/经历，不透露系统提示词、内部规则或成长机制。
 - 默认阈值：≥3 条一致证据、≥2 个不同会话、置信度 ≥0.6（可配置）。
 - 单条消息不能改变人格。
 - 跨群学习默认关闭；默认范围 `admin_only`。
@@ -211,15 +215,16 @@ class Tool:
 
 ### 插件
 
-- 校验 Manifest（ID、版本、权限、兼容性），同步到注册表，默认禁用。
-- 只登记与健康检查，**不加载、不执行第三方代码**；权限批准单独记录。
+- 校验 Manifest（ID、版本、权限、兼容性、`healthcheck` 声明），同步到注册表，默认禁用。
+- 只登记与查看健康状态，**不加载、不执行第三方代码**；权限批准单独记录，且批准后第三方启用仍返回 `OPERATION_PLANNED`。
+- `healthcheck` 只保存声明（类型、站内相对路径、间隔、超时），本版本不执行第三方健康检查或任意网络请求；路径拒绝协议、凭据、查询、片段和目录穿越。
 - 加载失败被隔离，不影响核心流水线。
 
 ## 10. 预算与用量
 
-- 作用域：`global` / `group` / `provider`；窗口：小时/日/周/月/全部；指标：请求、Token、成本。
-- 模型调用前检查硬上限；超限返回 `BUDGET_EXCEEDED`，不调用 Provider。预算按已记录的本地用量执行，单次调用可能让累计用量略超上限。
-- `usage_events` 是调用前的执行账本；`llm_usage` 是每次调用的明细账本（Provider、群、输入/输出 Token、耗时、估算成本、状态、错误码）。重试与工具轮次计入。
+- 作用域：`global` / `account` / `group` / `provider` / `feature`；窗口：小时/日/周/月/全部；指标：请求、Token、成本。功能作用域只接受固定键（`chat`、`persona_growth`、`memory_extraction`、`media.*`），`reply` 在预算层归一化为 `chat`。
+- 模型调用与媒体任务调用前检查硬上限；超限返回 `BUDGET_EXCEEDED`，不调用 Provider。媒体任务预算耗尽时终态失败，不自动重排，手动重试仍受同一预算约束。预算按已记录的本地用量执行，单次调用可能让累计用量略超上限。
+- `usage_events` 是调用前的执行账本；`llm_usage` 是每次调用的明细账本（Provider、账号、群、输入/输出 Token、耗时、估算成本、状态、错误码）。重试与工具轮次计入。媒体调用另记 `media_provider_usage`，只含元数据与外部费用完整性。
 - `usage_summary` 按 Provider 与群聚合 `llm_usage`，包含零调用行与已删除/未知 ID 占位行，供仪表盘与扩展页展示真实用量。
 - `usage_trends` 在应用层按 `DEFAULT_TIMEZONE`（默认 `Asia/Shanghai`）把真实 `llm_usage` 归入当前结束的小时/自然日桶；空桶补 0，未知成本保持 `null`。小时最多 744 桶，自然日最多 365 桶，可筛选群/Provider。不依赖 SQLite 的时区函数，也不调用外部服务。
 - 费用只按用户在 Provider 中填写的 `input_price_per_1k` / `output_price_per_1k` 与本地 Token 估算，**不是服务商账单**。Mock 的外部费用视为 0；未配置单价或 Provider 未返回完整 Token 用量的成功调用记为不可计价，统计返回 `partial` / `unconfigured`，`cost` 为 `null`，绝不伪造为 0。
@@ -228,6 +233,14 @@ class Tool:
 - 预算告警：`record()` 写入用量事件后评估适用于当前群/Provider 的启用策略；保存策略时也按当前真实用量评估一次。达到 `warn_threshold` 生成 `warning`，达到/超过上限生成 `exceeded`。事件写入 `budget_alerts`，唯一键 `(policy_id, period_key, level)` 去重；`period_key` 按本地小时/自然日/ISO 周/月/`all` 对齐，避免滚动小时窗口每次变化都重复告警。新事件写审计并发布 `budget.alert` SSE。告警评估失败只记日志，不回滚已发生的调用或用量记录；只读的预算检查不产生副作用。
 - 当前 `action` 字段会保存，但超限行为一律阻断；告警不是“仅告警”策略，不改变阻断。
 - CSV 导出直接查询 `llm_usage` 并输出固定列；不拼接消息正文或提示词。使用 UTF-8 BOM、标准 CSV、公式注入前缀防护与 `no-store` / `nosniff` 响应头；每次导出写 `usage.export` 审计。
+
+### 数据保留与清理
+
+- `RetentionService` 按 `log_retention_days` / `message_retention_days` / `media_retention_days` 分批删除过期数据，`RetentionScheduler` 按固定间隔触发；自动清理默认关闭，开关保存在 `system_settings`，可在设置页显式开启。
+- 手动与自动运行共用 `asyncio.Lock`：并发手动请求返回 409，调度器重叠运行跳过。每轮有批次上限，摘要标记 `truncated`；运行结果写入 `system_settings` 与审计，下一次重复运行计数为 0。
+- 消息清理先擦除人格特征/提案/事件/版本快照中的证据引用与记忆/候选的来源 ID，再删除消息；证据不足时降级 stable，无证据待审提案标记 rejected。记忆正文不改写。
+- 媒体删除前解析仍被保留消息引用的资产；按 SHA 去重时仅清理来源引用，不删除共享文件。日志只删除 `logs` 目录下 `app.log.*` 轮转文件，当前 `app.log` 始终保留。
+- 清理不发送消息、不调用模型、不处理媒体任务、不出网；全局暂停不阻止清理。不覆盖 outbox、审计、备份，也没有 dry-run。
 
 ## 11. 数据模型（主要表）
 
@@ -239,7 +252,7 @@ class Tool:
 | `personas` / `persona_versions` / `persona_traits` / `persona_evolution_events` | 人格、版本、特征、成长事件 |
 | `llm_providers` / `llm_usage` | 模型 Provider 与用量；群表记录主/备用 Provider 绑定 |
 | `tools` / `tool_runs` | 工具注册与执行记录 |
-| `media_assets` / `media_processing_jobs` / `media_transcripts` / `provider_registry` | 媒体与能力注册 |
+| `media_assets` / `media_processing_jobs` / `media_transcripts` / `media_provider_usage` / `provider_registry` | 媒体、任务、转写、用量与能力注册 |
 | `memories` | 长期记忆：作用域、来源、置信度、敏感度、过期与固定状态 |
 | `memory_candidates` | AI 提取候选：证据消息、置信度、Provider/模型、审核状态与生成的记忆引用 |
 | `plugin_registry` / `budget_policies` / `usage_events` | 插件、预算、调用前用量账本 |
@@ -313,7 +326,7 @@ class Tool:
 
 ## 17. 已知技术债
 
-- 数据保留策略未自动执行；需要可恢复的后台调度。
+- 数据保留只有基础定时清理，没有 dry-run；不覆盖 outbox、审计、备份与当前 `app.log`，清理后的记忆正文也不会改写，仅擦除来源 ID。
 - 真实媒体下载/转存与真实多模态 Provider 未实现；长期记忆支持手动录入、手动或群级后台增量候选提取与关键词/二元词检索，但没有摘要压缩或向量语义检索。后台提取只生成待审核候选，不自动批准。
 - 模型路由目前仅支持群级主/备用绑定与单次调用回退，不支持按功能拆分模型或基于成本/延迟/健康度的自动路由。
 - Element Plus 全量打包导致构建产物偏大。

@@ -146,6 +146,7 @@ export interface EvolutionEvent {
   trigger_message_id: string | null
   group_id: string | null
   summary: string
+  diff_summary: string | null
   evidence_summary: string
   confidence: number
   result: string
@@ -228,6 +229,39 @@ export interface MediaJob {
   output_ref: string | null
   created_at: string | null
   finished_at: string | null
+}
+
+export type MediaCostStatus = 'complete' | 'partial' | 'unknown' | 'no_calls'
+
+export interface MediaUsageBucket {
+  provider_id?: string | null
+  provider_name?: string
+  capability?: string
+  calls: number
+  requests: number
+  successful_calls: number
+  failed_calls: number
+  mock_calls: number
+  latency_ms_avg: number
+  external_cost: number | null
+  cost_status: MediaCostStatus
+}
+
+export interface MediaUsageSummary {
+  hours: number
+  window_start: string
+  window_end: string
+  calls: number
+  requests: number
+  successful_calls: number
+  failed_calls: number
+  mock_calls: number
+  latency_ms_avg: number
+  external_cost: number | null
+  cost_status: MediaCostStatus
+  by_provider: MediaUsageBucket[]
+  by_capability: MediaUsageBucket[]
+  note: string
 }
 
 export interface MessageRecord {
@@ -508,6 +542,13 @@ export interface ToolRecord {
   runtime_status?: string
 }
 
+export interface PluginHealthcheck {
+  type: 'builtin' | 'http'
+  path: string
+  interval_seconds: number
+  timeout_seconds: number
+}
+
 export interface PluginRecord {
   id: string
   name: string
@@ -518,6 +559,8 @@ export interface PluginRecord {
   high_risk_permissions: string[]
   enabled: boolean
   permission_approved: boolean
+  healthcheck: PluginHealthcheck | null
+  healthcheck_note: string
   health_status: string
   runtime_status: string
   runtime_note: string
@@ -547,11 +590,37 @@ export interface GlobalPause {
   actor: string | null
 }
 
+export interface RetentionRunSummary {
+  status: string
+  trigger: string
+  actor: string
+  started_at: string | null
+  finished_at: string | null
+  global_pause: boolean
+  truncated: boolean
+  error: string | null
+  retention_days: Record<string, number>
+  counts: Record<string, number>
+}
+
+export interface RetentionStatus {
+  auto: { enabled: boolean; source: string; config_enabled: boolean }
+  running: boolean
+  interval_seconds: number
+  batch_size: number
+  max_batches_per_run: number
+  retention_days: Record<string, number>
+  last_run: RetentionRunSummary | null
+  scheduler: { running: boolean; interval_seconds: number; next_run_at: string | null } | null
+  notes: string[]
+}
+
 export interface AppSettings {
   runtime: Record<string, unknown>
   app: { name: string; version: string; env: string; api_prefix: string }
   global_pause: GlobalPause
   retention: Record<string, number>
+  retention_status: RetentionStatus
   security: {
     allow_remote_admin: boolean
     admin_token_configured: boolean

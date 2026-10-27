@@ -2,14 +2,75 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   ApiError,
+  api,
   downloadApiFile,
   filenameFromDisposition,
   setAdminToken,
 } from '@/api/client'
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
   setAdminToken(null)
+})
+
+function abortableFetch() {
+  return vi.fn(
+    (_url: string, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('Aborted', 'AbortError'))
+        })
+      }),
+  )
+}
+
+describe('request timeout', () => {
+  it('aborts a slow JSON request with TIMEOUT', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', abortableFetch())
+
+    const pending = api('/health', { timeoutMs: 50 }).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(60)
+
+    const error = await pending
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error).toMatchObject({ code: 'TIMEOUT', status: 0 })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('keeps caller cancellation distinct from timeout', async () => {
+    vi.stubGlobal('fetch', abortableFetch())
+    const controller = new AbortController()
+
+    const pending = api('/health', { signal: controller.signal }).catch((error: unknown) => error)
+    controller.abort()
+
+    const error = await pending
+    expect((error as Error).name).toBe('AbortError')
+  })
+
+  it('times out downloads and clears the timer', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', abortableFetch())
+
+    const pending = downloadApiFile('/usage/export.csv', { timeoutMs: 40 }).catch(
+      (error: unknown) => error,
+    )
+    await vi.advanceTimersByTimeAsync(50)
+
+    expect(await pending).toMatchObject({ code: 'TIMEOUT', status: 0 })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('clears the timer after a successful download', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('a,b\r\n1,2\r\n', { status: 200 })))
+
+    await downloadApiFile('/usage/export.csv', { timeoutMs: 1000 })
+
+    expect(vi.getTimerCount()).toBe(0)
+  })
 })
 
 describe('download filename handling', () => {

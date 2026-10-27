@@ -17,6 +17,7 @@ class Message(Base, TimestampMixin):
         UniqueConstraint("account_id", "platform_message_id", "direction", name="uq_messages_account_platform_dir"),
         Index("ix_messages_conversation_time", "conversation_id", "event_timestamp"),
         Index("ix_messages_group_time", "group_id", "event_timestamp"),
+        Index("ix_messages_event_timestamp", "event_timestamp"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Float, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TimestampMixin, UTCDateTime, new_id
@@ -45,6 +45,7 @@ class PluginRegistry(Base, TimestampMixin):
     permissions_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     config_schema_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     dependencies_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    healthcheck_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     min_app_version: Mapped[str] = mapped_column(String(32), default="0.1.0", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     permission_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -122,12 +123,22 @@ class BudgetAlert(Base, TimestampMixin):
 
 class UsageEvent(Base, TimestampMixin):
     __tablename__ = "usage_events"
+    __table_args__ = (
+        Index(
+            "ix_usage_events_scope_feature_window",
+            "scope_type",
+            "scope_id",
+            "feature",
+            "metric",
+            "window_start",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
     scope_type: Mapped[str] = mapped_column(String(32), default="global", nullable=False, index=True)
     scope_id: Mapped[str] = mapped_column(String(64), default="", nullable=False, index=True)
     provider_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    feature: Mapped[str] = mapped_column(String(32), default="reply", nullable=False)
+    feature: Mapped[str] = mapped_column(String(32), default="chat", nullable=False)
     metric: Mapped[str] = mapped_column(String(32), default="requests", nullable=False)
     amount: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     estimated_cost: Mapped[float | None] = mapped_column(Float, nullable=True)

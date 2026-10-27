@@ -51,6 +51,7 @@
 - 非本机请求在 `ALLOW_REMOTE_ADMIN=false` 时统一返回 HTTP 403 `REMOTE_ADMIN_FORBIDDEN`。
 - 开启远程后必须配置强 `ADMIN_API_TOKEN`，否则返回 401 `UNAUTHORIZED`。远程访问应置于 HTTPS 反向代理之后。
 - 前端管理 Token 只保存在 `sessionStorage`（键 `aiqf.adminToken`），不会写入 LocalStorage。
+- 前端 API 客户端默认 20 秒超时，可用 `timeoutMs` 覆盖；超时抛出 `ApiError(code="TIMEOUT", status=0)`，调用方主动取消仍保留 `AbortError`。超时不会自动重试写操作，避免重复发送。
 
 ### 格式约定
 
@@ -83,8 +84,10 @@
 | GET | `/api/ready` | 数据库、加密密钥、全局暂停、SSE 订阅者 |
 | GET | `/api/dashboard` | 仪表盘聚合数据与全局暂停 |
 | GET | `/api/capabilities` | 连接器、模型与媒体能力状态（含 `planned` / `unconfigured`） |
-| GET | `/api/settings` | 运行信息、保留策略、安全状态、隐私计数 |
-| PUT | `/api/settings` | 更新 `retention` / `global_pause` |
+| GET | `/api/settings` | 运行信息、保留策略与真实清理状态（`retention_status`）、安全状态、隐私计数 |
+| PUT | `/api/settings` | 更新 `retention` / `retention_auto` / `global_pause` |
+| GET | `/api/system/retention/status` | 清理是否运行、自动清理开关与来源、调度器下次运行、上次摘要 |
+| POST | `/api/system/retention/run` | 立即执行一次清理；并发运行返回 409 `CONFLICT` |
 | POST | `/api/system/pause-all` | 全局紧急暂停 |
 | POST | `/api/system/resume` | 解除全局暂停 |
 | GET | `/api/audit` | 审计日志分页查询 |
@@ -97,6 +100,21 @@
 ```json
 { "reason": "账号出现验证码提示，立即暂停" }
 ```
+
+`PUT /api/settings` 的保留相关示例（自动清理默认关闭，开启会写审计）：
+
+```json
+{
+  "retention": { "log_retention_days": 30, "message_retention_days": 90, "media_retention_days": 30 },
+  "retention_auto": { "enabled": false }
+}
+```
+
+清理状态与执行：
+
+- `GET /api/system/retention/status` 返回 `auto`（`enabled` / `source` / 配置默认值）、`running`、间隔与批次上限、保留天数、`scheduler`（是否运行、下次运行时间）与 `last_run`。
+- `POST /api/system/retention/run` 立即执行一次，返回与 `last_run` 相同的摘要：`status`、`trigger`、`actor`、起止时间、`global_pause`、`truncated`、`retention_days`、各类 `counts` 与脱敏 `error`。并发执行返回 409 `CONFLICT`。
+- 自动清理只删除超过保留期限的消息、媒体资产、转写、媒体任务、`app.log.*` 轮转日志、人格证据/版本快照中的证据引用与记忆来源 ID；不会删除 outbox、审计、备份或当前 `app.log`，不会调用模型或发送消息。全局暂停不阻止本地清理。记忆正文不会被改写。
 
 返回：
 
@@ -329,6 +347,9 @@ data: {"seq":42,"type":"message.received","at":"2026-10-25T03:00:00+00:00","payl
 - `growth_policy`：`auto` / `review` / `paused`。
 - `learning_scope`：`admin_only`（默认）/ `group` / `cross_group`（默认关闭）。
 - 审核请求：`{ "approve": true }`。
+- 成长事件与待审核提案返回 `diff_summary`：由模型以第一人称生成的自然语言变化摘要（最多 600 字），旧事件可能为 `null`。不返回推理步骤或思维链。
+- `trigger_type` 包含 `auto`（回复后常规触发）、`self_inquiry`（用户询问“你是谁/你的人设/介绍你自己”等）、`manual`（管理员手动分析）与 `review`（审核后应用）。`self_inquiry` 只豁免成长最小间隔，不豁免证据数量、会话数、置信度、锁定字段与范围治理。
+- 成长在回复完成后异步执行，同一人格与群的并发成长会合并，不阻塞正常回复。
 
 测试人格等同于 `/api/playground/run`，必须提供 `account_id` 与 `group_id`，不发送、不落库。
 
@@ -346,6 +367,7 @@ data: {"seq":42,"type":"message.received","at":"2026-10-25T03:00:00+00:00","payl
 | GET | `/api/media/capabilities` | 能力概览 |
 | POST | `/api/media/providers/{provider_id}/enable` | 启用/禁用媒体 Provider |
 | POST | `/api/media/providers/{provider_id}/test` | 媒体 Provider 测试 |
+| GET | `/api/media/usage?hours=&provider_id=&capability=&account_id=&group_id=` | 媒体 Provider 用量聚合（请求数、成功/失败、Mock 数、平均延迟、外部费用完整性） |
 | GET | `/api/media/jobs?status=&limit=` | 媒体任务队列 |
 | POST | `/api/media/jobs/{job_id}/cancel` | 取消任务 |
 | POST | `/api/media/jobs/{job_id}/retry` | 重试任务 |
@@ -394,7 +416,9 @@ data: {"seq":42,"type":"message.received","at":"2026-10-25T03:00:00+00:00","payl
 - Anthropic 适配器只发送 `system`、`user`、`assistant` 消息；通用消息中的 system 会合并到顶层 `system`，连续同角色消息会合并，工具定义转换为 `input_schema`。温度会被限制在 0–1。
 - 旧的 `anthropic` / `claude` / `openai` / `official` 类型返回 400，并提示改用 `anthropic_native` 或 `openai_compatible`。
 - 删除仍被任一群绑定为主模型或备用模型的 Provider 会返回 HTTP 409 `PROVIDER_IN_USE`，并在 `details.group_ids` 中列出（最多 20 个）受影响群；请先在群管理中解除绑定。
-- 真实视觉/语音等媒体 Provider 尚未实现；请勿把 Mock 媒体任务当作真实识别结果。
+- 真实视觉/语音等媒体 Provider 尚未实现；请勿把 Mock 媒体任务当作真实识别结果。媒体契约（inspect / rerank / video）与确定性 Mock 已提供，但未接入业务回复管线。
+- 媒体任务在收到图片/语音/文件片段时只入队，由应用内后台 worker 处理，不阻塞 QQ 事件；未配置时返回诚实的“未配置/处理中”说明。每次 Provider 调用（含失败）写一条媒体用量；Mock 外部费用为 0，真实/未知为 `null`，不会伪造金额。媒体用量不含媒体内容、转写文本或提示词。
+- `GET /api/media/usage` 返回窗口总量、`by_provider` 与 `by_capability`，费用状态为 `complete` / `partial` / `unknown` / `no_calls`。
 
 ## 模拟测试
 
@@ -463,7 +487,7 @@ data: {"seq":42,"type":"message.received","at":"2026-10-25T03:00:00+00:00","payl
 | POST | `/api/budgets` | 新建/提交预算策略 |
 | PUT | `/api/budgets/{policy_id}` | 更新预算策略 |
 | GET | `/api/budgets/{policy_id}` | 详情（含真实用量快照） |
-| GET | `/api/budgets/check?group_id=&provider_id=` | 检查预算；返回阻断原因与说明 |
+| GET | `/api/budgets/check?account_id=&group_id=&provider_id=&feature=` | 检查预算；返回阻断原因与说明 |
 | GET | `/api/budgets/alerts` | 预算告警事件历史；支持 `level`、`scope_type`、`scope_id`、`since` 与分页 |
 | GET | `/api/memories` | 记忆列表；支持 `account_id`、`group_id`、`member_id`、`memory_type`、`search`、`include_expired` |
 | POST | `/api/memories` | 手动添加记忆；拒绝疑似密码/验证码/证件号/银行卡号/密钥 |
@@ -524,7 +548,8 @@ AI 候选提取与审核：
 }
 ```
 
-- `scope_type`：`global` / `group` / `provider`。`group` / `provider` 必须引用真实存在的实体，创建/更新时会校验。
+- `scope_type`：`global` / `account` / `group` / `provider` / `feature`。`account` / `group` / `provider` 的 `scope_id` 必须引用真实存在的实体；`feature` 的 `scope_id` 只接受固定功能键：`chat`、`persona_growth`、`memory_extraction`、`media.image.describe`、`media.ocr.extract`、`media.audio.transcribe`、`media.text.embed`、`media.inspect`、`media.text.rerank`、`media.video.describe`。旧的 `reply` 在预算层归一化为 `chat`，不改写模型调用内部的 `purpose`。
+- 预算检查可同时传 `account_id`、`group_id`、`provider_id` 与 `feature`；只有与调用实际匹配的策略才会阻断。媒体任务同样在调用前检查预算，耗尽时任务终态失败且不自动重排。
 - `window`：`hour` / `day` / `week` / `month` / `all`。
 - `metric`：`requests` / `tokens` / `cost`。
 - `warn_threshold`：0–1，按上限比例生成 `warning` 告警；0 表示关闭接近上限告警。达到或超过上限生成 `exceeded` 告警。
@@ -532,7 +557,7 @@ AI 候选提取与审核：
 - 预算快照包含 `used`、`remaining`、`usage_ratio`、`state`（`ok` / `warning` / `exceeded` / `disabled`）与 `period_start`。`metric=cost` 时还包含 `cost_status` 与 `unpriced_success_requests`。
 - 保存策略后会立即按当前真实用量评估一次；模型调用记录用量后也会评估。新告警写入 `budget_alerts`，同一 `policy_id + period_key + level` 只保留一条；每个新事件写审计 `budget.alert.warning` / `budget.alert.exceeded`，并通过 SSE 发布 `budget.alert`。只读的 `/api/budgets/check` 不会生成告警。
 
-`GET /api/budgets/alerts` 返回 `items`、`total`、`page`、`page_size` 与 `note`。事件包含策略 ID、作用域名称、窗口、指标、级别、周期键、已用/上限、比例、中文说明与创建时间。`level` 只接受 `warning` / `exceeded`；`scope_type` 只接受 `global` / `group` / `provider`。
+`GET /api/budgets/alerts` 返回 `items`、`total`、`page`、`page_size` 与 `note`。事件包含策略 ID、作用域名称、窗口、指标、级别、周期键、已用/上限、比例、中文说明与创建时间。`level` 只接受 `warning` / `exceeded`；`scope_type` 接受 `global` / `account` / `group` / `provider` / `feature`。账号与功能作用域的名称由服务端解析为账号名/功能中文名。
 
 `GET /api/usage/trends` 参数：
 
@@ -578,11 +603,13 @@ AI 候选提取与审核：
 | GET | `/api/plugins` | 插件清单与加载错误 |
 | POST | `/api/plugins/sync` | 重新读取清单 |
 | GET | `/api/plugins/{plugin_id}` | 详情 |
-| GET | `/api/plugins/{plugin_id}/health` | 健康检查 |
+| GET | `/api/plugins/{plugin_id}/health` | 本地登记健康状态；第三方插件为 `runtime_planned`，不执行外部检查 |
 | POST | `/api/plugins/{plugin_id}/enable` | 启用/禁用（仅内置） |
 | POST | `/api/plugins/{plugin_id}/approve` | 批准/撤销权限 |
 
 工具测试请求：`{ "arguments": { "expression": "1+2*3" } }`。不存在任意 Shell、文件读写或任意网络请求工具。
+
+插件记录包含可选的 `healthcheck` 声明：`type`（`builtin` / `http`）、站内相对 `path`（空或以 `/` 开头，拒绝协议、凭据、查询、片段与目录穿越）、`interval_seconds`（30–86400）与 `timeout_seconds`（1–30）。该字段**只是清单声明**，`healthcheck_note` 会明确说明本版本不执行第三方健康检查或任意网络请求。`POST .../approve` 只改变本地高风险权限登记状态；第三方插件启用仍返回 `OPERATION_PLANNED`，不会加载或执行代码。
 
 ## 备份与恢复
 

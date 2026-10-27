@@ -9,6 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError, ErrorCode
+from app.core.time import utcnow
 from app.db.session import Database
 from app.models.group import Group
 from app.models.persona import (
@@ -29,6 +30,32 @@ TRAIT_STATUSES = frozenset({"candidate", "stable", "rejected"})
 SELF_DESCRIPTION_FIELD = "self_description"
 _MAX_DESCRIPTION = 4000
 _MAX_OVERLAY = 2000
+
+
+def _scrub_evidence_refs(value: Any, message_ids: set[str]) -> tuple[Any, bool]:
+    """递归移除提案/版本快照中的证据消息 ID；不保存被删消息的任何引用。"""
+    if isinstance(value, dict):
+        changed = False
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"evidence_message_ids", "source_message_ids"} and isinstance(item, list):
+                filtered = [entry for entry in item if str(entry) not in message_ids]
+                changed = changed or len(filtered) != len(item)
+                output[key] = filtered
+            else:
+                new_item, item_changed = _scrub_evidence_refs(item, message_ids)
+                output[key] = new_item
+                changed = changed or item_changed
+        return output, changed
+    if isinstance(value, list):
+        changed = False
+        items: list[Any] = []
+        for item in value:
+            new_item, item_changed = _scrub_evidence_refs(item, message_ids)
+            items.append(new_item)
+            changed = changed or item_changed
+        return items, changed
+    return value, False
 
 
 def _clean_str(value: Any, limit: int) -> str:
@@ -128,6 +155,7 @@ def event_public(event: PersonaEvolutionEvent) -> dict[str, Any]:
         "trigger_message_id": event.trigger_message_id,
         "group_id": event.group_id,
         "summary": event.summary,
+        "diff_summary": event.diff_summary,
         "evidence_summary": event.evidence_summary,
         "confidence": round(event.confidence, 2),
         "result": event.result,
@@ -477,6 +505,78 @@ class PersonaStore:
                 actor=actor,
             )
         return {"affected_traits": affected, "demoted_traits": demoted}
+
+    async def prune_evidence(self, message_ids: set[str], *, actor: str = "system") -> dict[str, int]:
+        """批量清理被删消息的人格证据、待审提案与版本快照引用。"""
+        result = {
+            "affected_traits": 0,
+            "demoted_traits": 0,
+            "events_updated": 0,
+            "proposals_rejected": 0,
+            "versions_updated": 0,
+        }
+        if not message_ids:
+            return result
+        async with self.database.session() as session:
+            traits = list((await session.execute(select(PersonaTrait))).scalars())
+            personas = {persona.id: persona for persona in (await session.execute(select(Persona))).scalars()}
+            for trait in traits:
+                evidence = [str(item) for item in (trait.evidence_message_ids_json or [])]
+                if not set(evidence) & message_ids:
+                    continue
+                evidence = [item for item in evidence if item not in message_ids]
+                trait.evidence_message_ids_json = evidence
+                trait.evidence_count = len(evidence)
+                result["affected_traits"] += 1
+                persona = personas.get(trait.persona_id)
+                threshold = int(persona_thresholds(persona)["min_evidence_count"]) if persona else 3
+                if trait.status == "stable" and len(evidence) < threshold:
+                    trait.status = "candidate"
+                    result["demoted_traits"] += 1
+
+            for event in (await session.execute(select(PersonaEvolutionEvent))).scalars():
+                changed = False
+                for attr in ("proposal_json", "old_state_json", "new_state_json"):
+                    value = getattr(event, attr) or {}
+                    new_value, scrubbed = _scrub_evidence_refs(value, message_ids)
+                    if scrubbed:
+                        setattr(event, attr, new_value)
+                        changed = True
+                if event.trigger_message_id and str(event.trigger_message_id) in message_ids:
+                    event.trigger_message_id = None
+                    changed = True
+                if changed:
+                    result["events_updated"] += 1
+                if event.result == "pending_review":
+                    proposal = dict(event.proposal_json or {})
+                    traits_in_proposal = proposal.get("proposed_traits") or []
+                    has_evidence = any(
+                        (item or {}).get("evidence_message_ids")
+                        for item in traits_in_proposal
+                        if isinstance(item, dict)
+                    )
+                    if not has_evidence:
+                        event.result = "rejected"
+                        event.reviewed_at = utcnow()
+                        event.error_message = "证据消息已被保留策略删除，提案自动拒绝。"
+                        result["proposals_rejected"] += 1
+
+            for version in (await session.execute(select(PersonaVersion))).scalars():
+                snapshot, scrubbed = _scrub_evidence_refs(dict(version.snapshot_json or {}), message_ids)
+                if scrubbed:
+                    version.snapshot_json = snapshot
+                    result["versions_updated"] += 1
+            await session.commit()
+
+        if any(result.values()):
+            await write_audit(
+                self.database,
+                action="persona.evidence.batch_delete",
+                target_type="message_batch",
+                details={**result, "message_count": len(message_ids)},
+                actor=actor,
+            )
+        return result
 
     async def list_events(self, persona_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
         async with self.database.session() as session:

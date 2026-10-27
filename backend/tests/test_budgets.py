@@ -12,7 +12,7 @@ from app.core.errors import AppError, ErrorCode
 from app.core.time import utcnow
 from app.db.session import Database
 from app.models.account import Account
-from app.models.governance import AuditLog
+from app.models.governance import AuditLog, UsageEvent
 from app.models.group import Group
 from app.models.provider import LLMProvider, LLMUsage
 from app.pipeline.events import EventBus
@@ -515,3 +515,130 @@ async def test_upsert_policy_alerts_on_existing_usage(database: Database, settin
     alerts = await fx.service.list_alerts()
     assert alerts["total"] == 1
     assert alerts["items"][0]["level"] == "exceeded"
+
+
+async def test_account_and_feature_scopes_block_and_record(database: Database, settings: Settings) -> None:
+    fx = await _seed(database, settings)
+    account_policy = await fx.service.upsert_policy(
+        {
+            "scope_type": "account",
+            "scope_id": "acc-budget",
+            "window": "day",
+            "metric": "requests",
+            "limit_value": 1,
+            "warn_threshold": 0.8,
+        }
+    )
+    feature_policy = await fx.service.upsert_policy(
+        {
+            "scope_type": "feature",
+            "scope_id": "chat",
+            "window": "all",
+            "metric": "requests",
+            "limit_value": 1,
+            "warn_threshold": 0.8,
+        }
+    )
+    assert account_policy["scope_type"] == "account"
+    assert feature_policy["scope_type"] == "feature"
+
+    # 旧 purpose=reply 在预算层归一化为 chat，且同时记入账号与功能用量。
+    await fx.service.record(
+        provider_id=fx.mock.id,
+        group_id=fx.group_a.id,
+        account_id="acc-budget",
+        feature="reply",
+        requests=1,
+    )
+
+    check = await fx.service.check(
+        group_id=fx.group_a.id,
+        provider_id=fx.mock.id,
+        account_id="acc-budget",
+        feature="chat",
+    )
+    assert check.allowed is False
+    assert {block.scope_type for block in check.blocks} == {"account", "feature"}
+
+    with pytest.raises(AppError) as exc_info:
+        await fx.service.assert_allowed(
+            group_id=fx.group_a.id,
+            provider_id=fx.mock.id,
+            account_id="acc-budget",
+            feature="reply",
+        )
+    assert exc_info.value.code == ErrorCode.BUDGET_EXCEEDED
+
+    # 其它账号、其它功能不受这两个作用域影响（仍会受全局策略影响，此处没有全局策略）。
+    other = await fx.service.check(
+        group_id=fx.group_a.id,
+        provider_id=fx.mock.id,
+        account_id="acc-other",
+        feature="persona_growth",
+    )
+    assert other.allowed is True
+
+    alerts = await fx.service.list_alerts()
+    assert alerts["total"] >= 2
+    names = {item["scope_name"] for item in alerts["items"]}
+    assert "预算测试账号" in names
+    assert "聊天回复" in names
+
+
+async def test_feature_scope_rejects_unknown_key_and_missing_account(database: Database, settings: Settings) -> None:
+    fx = await _seed(database, settings)
+    with pytest.raises(AppError) as feature_error:
+        await fx.service.upsert_policy(
+            {
+                "scope_type": "feature",
+                "scope_id": "arbitrary-prompt-text",
+                "window": "day",
+                "metric": "requests",
+                "limit_value": 1,
+            }
+        )
+    assert feature_error.value.code == ErrorCode.VALIDATION_ERROR
+
+    with pytest.raises(AppError) as account_error:
+        await fx.service.upsert_policy(
+            {
+                "scope_type": "account",
+                "scope_id": "missing-account",
+                "window": "day",
+                "metric": "requests",
+                "limit_value": 1,
+            }
+        )
+    assert account_error.value.code == ErrorCode.VALIDATION_ERROR
+
+
+async def test_unknown_feature_usage_is_recorded_but_not_matched(database: Database, settings: Settings) -> None:
+    fx = await _seed(database, settings)
+    await fx.service.upsert_policy(
+        {
+            "scope_type": "feature",
+            "scope_id": "chat",
+            "window": "all",
+            "metric": "requests",
+            "limit_value": 1,
+        }
+    )
+    await fx.service.record(
+        provider_id=fx.mock.id,
+        group_id=fx.group_a.id,
+        feature="custom_unlisted_feature",
+        requests=1,
+    )
+    check = await fx.service.check(
+        group_id=fx.group_a.id,
+        provider_id=fx.mock.id,
+        feature="custom_unlisted_feature",
+    )
+    assert check.allowed is True
+
+    async with fx.database.session() as session:
+        feature_rows = await session.scalar(select(func.count(UsageEvent.id)).where(UsageEvent.scope_type == "feature"))
+        total_rows = await session.scalar(select(func.count(UsageEvent.id)))
+    # 未列入固定键的功能仍记录全局/群/Provider 用量，但不会生成 feature 作用域行。
+    assert feature_rows == 0
+    assert int(total_rows or 0) > 0

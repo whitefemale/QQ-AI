@@ -27,10 +27,12 @@ from app.models.account import Account, AdapterInstance
 from app.models.group import Group
 from app.models.persona import Persona
 from app.pipeline.events import EventBus
-from app.pipeline.orchestrator import MessagePipeline
+from app.pipeline.orchestrator import MessagePipeline, PipelineResult
 from app.pipeline.outbox import OutboxService
 from app.pipeline.persona_growth import PersonaGrowthService
+from app.pipeline.self_inquiry import detect_self_inquiry
 from app.schemas.message import CanonicalMessage
+from app.schemas.persona import GrowthInteraction
 from app.services.settings_store import get_global_pause
 
 logger = logging.getLogger(__name__)
@@ -61,7 +63,7 @@ class AdapterManager:
         self._listeners: dict[str, asyncio.Task[None]] = {}
         self._instance_locks: dict[str, asyncio.Lock] = {}
         self._account_locks: dict[str, asyncio.Lock] = {}
-        self._growth_tasks: set[asyncio.Task[None]] = set()
+        self._growth_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._closed = False
 
     # ------------------------------------------------------------------ 构建
@@ -311,22 +313,73 @@ class AdapterManager:
                 adapter=adapter,
             )
         if result.action in {"replied", "command"} and group is not None:
-            self._schedule_growth(group)
+            self._schedule_growth(
+                group,
+                account_id=account.id,
+                message=message,
+                result=result,
+            )
         return result.as_dict()
 
-    def _schedule_growth(self, group: Group) -> None:
-        """回复成功后，为开启了自成长的空白人格安排一次后台分析。"""
+    def _schedule_growth(
+        self,
+        group: Group,
+        *,
+        account_id: str,
+        message: CanonicalMessage,
+        result: PipelineResult,
+    ) -> None:
+        """回复成功后，为开启了自成长的空白人格安排一次后台分析。
+
+        同一人格/群已有分析在运行时直接跳过；成长永远是后台任务，不阻塞回复发送。
+        用户询问“你是谁”时触发一次 self_inquiry 反思，但仍受证据与治理约束。
+        """
         if self.growth is None or not group.persona_id:
             return
         persona_id = group.persona_id
+        key = (persona_id, group.id)
+        running = self._growth_tasks.get(key)
+        if running is not None and not running.done():
+            return
+        inquiry = detect_self_inquiry(message.text)
+        interaction = (
+            GrowthInteraction(
+                user_message=message.text,
+                assistant_reply=str(result.reply or ""),
+                message_id=result.message_id,
+            )
+            if inquiry
+            else None
+        )
         task = asyncio.create_task(
-            self._maybe_grow(persona_id, group.id),
+            self._maybe_grow(
+                persona_id,
+                group.id,
+                trigger="self_inquiry" if inquiry else "auto",
+                account_id=account_id,
+                interaction=interaction,
+                trigger_message_id=result.message_id,
+            ),
             name=f"persona-growth-{persona_id[:8]}",
         )
-        self._growth_tasks.add(task)
-        task.add_done_callback(self._growth_tasks.discard)
+        self._growth_tasks[key] = task
 
-    async def _maybe_grow(self, persona_id: str, group_id: str) -> None:
+        def _forget(done: asyncio.Task[None], key: tuple[str, str] = key) -> None:
+            if self._growth_tasks.get(key) is done:
+                self._growth_tasks.pop(key, None)
+
+        task.add_done_callback(_forget)
+
+    async def _maybe_grow(
+        self,
+        persona_id: str,
+        group_id: str,
+        *,
+        trigger: str = "auto",
+        account_id: str | None = None,
+        interaction: GrowthInteraction | None = None,
+        trigger_message_id: str | None = None,
+    ) -> None:
         if self.growth is None:
             return
         try:
@@ -343,13 +396,16 @@ class AdapterManager:
             await self.growth.analyze(
                 persona_id,
                 group_id=group_id,
-                trigger="auto",
+                trigger=trigger,
+                trigger_message_id=trigger_message_id,
                 actor="system",
+                account_id=account_id,
+                interaction=interaction,
             )
         except AppError as exc:
             logger.info(
                 "自动人格成长未执行",
-                extra={"error_code": exc.code, "persona_id": persona_id},
+                extra={"error_code": exc.code, "persona_id": persona_id, "trigger": trigger},
             )
         except Exception:
             logger.exception("自动人格成长失败", extra={"persona_id": persona_id})
@@ -488,10 +544,11 @@ class AdapterManager:
 
     async def stop(self) -> None:
         self._closed = True
-        for task in list(self._growth_tasks):
+        tasks = list(self._growth_tasks.values())
+        for task in tasks:
             task.cancel()
-        if self._growth_tasks:
-            await asyncio.gather(*self._growth_tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._growth_tasks.clear()
         for instance_id in list(self._adapters):
             await self._teardown(instance_id, disconnect=True)

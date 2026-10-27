@@ -74,6 +74,51 @@ class GeneratedAudio(BaseModel):
     is_mock: bool = False
 
 
+class MediaInspectRequest(BaseModel):
+    media_ref: str
+    mime: str | None = None
+    filename: str | None = None
+
+
+class MediaInspectResult(BaseModel):
+    media_ref: str
+    mime: str | None = None
+    size_bytes: int | None = None
+    sha256: str | None = None
+    media_type: str | None = None
+    recognized: bool = False
+    provider_id: str | None = None
+    confidence: float | None = None
+    is_mock: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
+class RerankRequest(BaseModel):
+    query: str
+    documents: list[str] = Field(default_factory=list)
+    top_n: int | None = None
+
+
+class RerankItem(BaseModel):
+    index: int
+    document: str
+    score: float
+
+
+class RerankResult(BaseModel):
+    items: list[RerankItem] = Field(default_factory=list)
+    provider_id: str | None = None
+    is_mock: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
+class VideoUnderstandRequest(BaseModel):
+    media_ref: str
+    mime: str | None = None
+    prompt: str | None = None
+    language: str = "zh"
+
+
 class BinarySource:
     """媒体二进制输入的轻量包装，避免业务层依赖供应商临时 URL。"""
 

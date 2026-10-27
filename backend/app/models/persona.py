@@ -89,6 +89,7 @@ class PersonaEvolutionEvent(Base, TimestampMixin):
     trigger_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     group_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    diff_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     proposal_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     old_state_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     new_state_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)

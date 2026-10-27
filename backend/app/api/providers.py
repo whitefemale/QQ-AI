@@ -106,6 +106,26 @@ async def test_media_provider(
     return ok(await runtime.providers.test_media_provider(provider_id))
 
 
+@router.get("/media/usage")
+async def media_usage(
+    hours: int = Query(24, ge=1, le=744),
+    provider_id: str | None = None,
+    capability: str | None = None,
+    account_id: str | None = None,
+    group_id: str | None = None,
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    return ok(
+        await runtime.media_usage.aggregate(
+            hours=hours,
+            provider_id=provider_id,
+            capability=capability,
+            account_id=account_id,
+            group_id=group_id,
+        )
+    )
+
+
 @router.get("/media/jobs")
 async def list_media_jobs(
     status: str | None = Query(default=None),

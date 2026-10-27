@@ -545,6 +545,8 @@ class MessagePipeline:
                 message_id=record_id,
                 conversation_id=message.conversation_id,
                 group_id=group.id if group else None,
+                account_id=message.account_id,
+                feature="chat",
             )
             last_result = result
             total_in += result.response.input_tokens or 0

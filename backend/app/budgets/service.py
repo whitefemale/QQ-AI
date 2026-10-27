@@ -1,4 +1,4 @@
-"""预算与用量：调用前硬上限检查、调用后用量记录、Provider/群聚合（全局 / 群 / Provider 隔离）。"""
+"""预算与用量：全局 / 账号 / 群 / Provider / 功能作用域的调用前硬上限与调用后用量。"""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from app.core.time import (
     utcnow,
 )
 from app.db.session import Database
+from app.models.account import Account
 from app.models.governance import BudgetAlert, BudgetPolicy, UsageEvent
 from app.models.group import Group
 from app.models.provider import LLMProvider, LLMUsage
@@ -36,8 +37,42 @@ Metric = Literal["requests", "tokens", "cost"]
 
 SUPPORTED_WINDOWS = {"hour", "day", "week", "month", "all"}
 SUPPORTED_METRICS = {"requests", "tokens", "cost"}
-SUPPORTED_SCOPES = {"global", "group", "provider"}
+SUPPORTED_SCOPES = {"global", "account", "group", "provider", "feature"}
 TREND_BUCKETS = {"hour", "day"}
+
+# 预算与用量中的固定功能键。模型请求内部的 purpose 仍是自由文本（如 reply），
+# 只在预算层归一化为固定键，避免任意文本成为作用域 ID。
+FEATURE_KEYS = {
+    "chat": "聊天回复",
+    "persona_growth": "人格成长",
+    "memory_extraction": "记忆提取",
+    "media.image.describe": "图片描述",
+    "media.ocr.extract": "OCR 文字识别",
+    "media.audio.transcribe": "语音转写",
+    "media.text.embed": "文本向量",
+    "media.inspect": "媒体检查",
+    "media.text.rerank": "文本重排",
+    "media.video.describe": "视频理解",
+}
+FEATURE_ALIASES = {"reply": "chat"}
+
+
+def normalize_feature_key(feature: str | None) -> str | None:
+    """把历史或内部用途名归一化为固定功能键；未知值保持原样但不会匹配功能预算。"""
+    if feature is None:
+        return None
+    key = str(feature).strip()
+    if not key:
+        return None
+    return FEATURE_ALIASES.get(key, key)
+
+
+def feature_label(feature: str | None) -> str:
+    key = normalize_feature_key(feature)
+    if not key:
+        return "未指定功能"
+    return FEATURE_KEYS.get(key, key)
+
 
 WINDOW_LABELS = {
     "hour": "每小时",
@@ -53,8 +88,10 @@ METRIC_LABELS = {
 }
 SCOPE_LABELS = {
     "global": "全局",
+    "account": "账号",
     "group": "群",
     "provider": "模型 Provider",
+    "feature": "功能",
 }
 ALERT_LEVEL_LABELS = {
     "warning": "接近上限",
@@ -280,13 +317,25 @@ class BudgetService:
         self.settings = settings
         self.events = events
 
-    def _applicable_scope(self, policy: BudgetPolicy, group_id: str | None, provider_id: str | None) -> bool:
+    def _applicable_scope(
+        self,
+        policy: BudgetPolicy,
+        group_id: str | None,
+        provider_id: str | None,
+        account_id: str | None = None,
+        feature: str | None = None,
+    ) -> bool:
         if policy.scope_type == "global":
             return True
+        if policy.scope_type == "account":
+            return bool(account_id) and policy.scope_id == account_id
         if policy.scope_type == "group":
             return bool(group_id) and policy.scope_id == group_id
         if policy.scope_type == "provider":
             return bool(provider_id) and policy.scope_id == provider_id
+        if policy.scope_type == "feature":
+            normalized = normalize_feature_key(feature)
+            return bool(normalized) and policy.scope_id == normalized
         return False
 
     async def _usage(self, policy: BudgetPolicy, start: datetime | None) -> float:
@@ -306,7 +355,14 @@ class BudgetService:
             record = await session.get(LLMProvider, provider_id)
         return provider_pricing_state(record) in {"configured", "mock_zero"}
 
-    async def check(self, *, group_id: str | None, provider_id: str | None) -> BudgetCheck:
+    async def check(
+        self,
+        *,
+        group_id: str | None,
+        provider_id: str | None,
+        account_id: str | None = None,
+        feature: str | None = None,
+    ) -> BudgetCheck:
         async with self.database.session() as session:
             policies = list(
                 (await session.execute(select(BudgetPolicy).where(BudgetPolicy.enabled.is_(True)))).scalars()
@@ -314,7 +370,7 @@ class BudgetService:
         cost_tracking = await self._cost_tracking_available(provider_id) if provider_id else None
         blocks: list[BudgetBlock] = []
         for policy in policies:
-            if not self._applicable_scope(policy, group_id, provider_id):
+            if not self._applicable_scope(policy, group_id, provider_id, account_id, feature):
                 continue
             if policy.limit_value <= 0:
                 continue
@@ -342,8 +398,20 @@ class BudgetService:
             )
         return BudgetCheck(allowed=not blocks, blocks=blocks)
 
-    async def assert_allowed(self, *, group_id: str | None, provider_id: str | None) -> None:
-        check = await self.check(group_id=group_id, provider_id=provider_id)
+    async def assert_allowed(
+        self,
+        *,
+        group_id: str | None,
+        provider_id: str | None,
+        account_id: str | None = None,
+        feature: str | None = None,
+    ) -> None:
+        check = await self.check(
+            group_id=group_id,
+            provider_id=provider_id,
+            account_id=account_id,
+            feature=feature,
+        )
         if not check.allowed:
             first = check.blocks[0]
             if first.reason == "cost_unavailable":
@@ -352,13 +420,11 @@ class BudgetService:
                     "无法估算本次费用，已阻断调用。请先在「模型 API」配置单价，或停用该费用预算。"
                 )
             else:
-                scope_label = {"global": "全局", "group": "群", "provider": "模型 Provider"}.get(
-                    first.scope_type, first.scope_type
-                )
-                metric_label = {"requests": "请求次数", "tokens": "Token 用量", "cost": "费用"}.get(
-                    first.metric, first.metric
-                )
-                message = f"{scope_label}预算已用尽（{metric_label}，上限 {first.limit:g}）。本次模型调用已阻断。"
+                scope_label = SCOPE_LABELS.get(first.scope_type, first.scope_type)
+                if first.scope_type == "feature":
+                    scope_label = f"功能「{feature_label(first.scope_id)}」"
+                metric_label = METRIC_LABELS.get(first.metric, first.metric)
+                message = f"{scope_label}预算已用尽（{metric_label}，上限 {first.limit:g}）。本次调用已阻断。"
             raise AppError(
                 ErrorCode.BUDGET_EXCEEDED,
                 message,
@@ -497,6 +563,8 @@ class BudgetService:
         *,
         group_id: str | None,
         provider_id: str | None,
+        account_id: str | None = None,
+        feature: str | None = None,
     ) -> list[dict[str, Any]]:
         async with self.database.session() as session:
             policies = list(
@@ -506,7 +574,7 @@ class BudgetService:
         zone = get_zone(self.settings.default_timezone)
         created: list[dict[str, Any]] = []
         for policy in policies:
-            if not self._applicable_scope(policy, group_id, provider_id):
+            if not self._applicable_scope(policy, group_id, provider_id, account_id, feature):
                 continue
             if policy.limit_value <= 0:
                 continue
@@ -564,8 +632,17 @@ class BudgetService:
                     )
                 ).scalars()
             )
+            account_ids = {item.scope_id for item in records if item.scope_type == "account" and item.scope_id}
             group_ids = {item.scope_id for item in records if item.scope_type == "group" and item.scope_id}
             provider_ids = {item.scope_id for item in records if item.scope_type == "provider" and item.scope_id}
+            accounts = (
+                {
+                    item.id: item
+                    for item in (await session.execute(select(Account).where(Account.id.in_(account_ids)))).scalars()
+                }
+                if account_ids
+                else {}
+            )
             groups = (
                 {
                     item.id: item
@@ -588,9 +665,14 @@ class BudgetService:
         for record in records:
             if record.scope_type == "global":
                 scope_name = "全局"
+            elif record.scope_type == "account":
+                account = accounts.get(record.scope_id)
+                scope_name = account.display_name if account is not None else "已删除或未知账号"
             elif record.scope_type == "group":
                 group = groups.get(record.scope_id)
                 scope_name = (group.name or group.platform_group_id) if group is not None else "已删除或未知群"
+            elif record.scope_type == "feature":
+                scope_name = feature_label(record.scope_id)
             else:
                 provider = providers.get(record.scope_id)
                 scope_name = provider.name if provider is not None else "已删除或未知 Provider"
@@ -628,31 +710,32 @@ class BudgetService:
         provider_id: str | None,
         group_id: str | None,
         feature: str,
+        account_id: str | None = None,
         requests: float = 1.0,
         tokens: float = 0.0,
         estimated_cost: float | None = None,
     ) -> None:
         now = utcnow()
         day_start = start_of_day_utc(now, self.settings.default_timezone)
-        entries: list[tuple[str, str, str, float, float | None]] = [
-            ("global", "", "requests", requests, None),
-        ]
+        normalized_feature = normalize_feature_key(feature) or "chat"
+        scopes: list[tuple[str, str]] = [("global", "")]
+        if account_id:
+            scopes.append(("account", account_id))
         if group_id:
-            entries.append(("group", group_id, "requests", requests, None))
+            scopes.append(("group", group_id))
         if provider_id:
-            entries.append(("provider", provider_id, "requests", requests, None))
-        if tokens > 0:
-            entries.append(("global", "", "tokens", tokens, None))
-            if group_id:
-                entries.append(("group", group_id, "tokens", tokens, None))
-            if provider_id:
-                entries.append(("provider", provider_id, "tokens", tokens, None))
-        if estimated_cost is not None and estimated_cost > 0:
-            entries.append(("global", "", "cost", estimated_cost, estimated_cost))
-            if group_id:
-                entries.append(("group", group_id, "cost", estimated_cost, estimated_cost))
-            if provider_id:
-                entries.append(("provider", provider_id, "cost", estimated_cost, estimated_cost))
+            scopes.append(("provider", provider_id))
+        # 功能作用域只对固定功能键生效；未知 purpose 仍记录在用量事件里，
+        # 但不会被任何功能预算匹配。
+        if normalized_feature in FEATURE_KEYS:
+            scopes.append(("feature", normalized_feature))
+        entries: list[tuple[str, str, str, float, float | None]] = []
+        for scope_type, scope_id in scopes:
+            entries.append((scope_type, scope_id, "requests", requests, None))
+            if tokens > 0:
+                entries.append((scope_type, scope_id, "tokens", tokens, None))
+            if estimated_cost is not None and estimated_cost > 0:
+                entries.append((scope_type, scope_id, "cost", estimated_cost, estimated_cost))
         async with self.database.session() as session:
             for scope_type, scope_id, metric, amount, cost in entries:
                 session.add(
@@ -660,7 +743,7 @@ class BudgetService:
                         scope_type=scope_type,
                         scope_id=scope_id,
                         provider_id=provider_id,
-                        feature=feature,
+                        feature=normalized_feature,
                         metric=metric,
                         amount=amount,
                         estimated_cost=cost,
@@ -670,7 +753,12 @@ class BudgetService:
             await session.commit()
         # 告警是旁路能力：写入失败不能回滚已经发生的模型调用用量。
         try:
-            await self._evaluate_alerts(group_id=group_id, provider_id=provider_id)
+            await self._evaluate_alerts(
+                group_id=group_id,
+                provider_id=provider_id,
+                account_id=account_id,
+                feature=normalized_feature,
+            )
         except Exception:
             logger.exception("预算告警评估失败", extra={"event": "budget.alert.failed"})
 
@@ -744,10 +832,17 @@ class BudgetService:
         )
         if start is not None:
             query = query.where(LLMUsage.created_at >= start)
-        if policy.scope_type == "group":
+        if policy.scope_type == "account":
+            query = query.where(LLMUsage.account_id == policy.scope_id)
+        elif policy.scope_type == "group":
             query = query.where(LLMUsage.group_id == policy.scope_id)
         elif policy.scope_type == "provider":
             query = query.where(LLMUsage.provider_id == policy.scope_id)
+        elif policy.scope_type == "feature":
+            if policy.scope_id == "chat":
+                query = query.where(LLMUsage.purpose.in_(("chat", "reply")))
+            else:
+                query = query.where(LLMUsage.purpose == policy.scope_id)
         async with self.database.session() as session:
             row = (await session.execute(query)).one()
         successes, priced, mock_successes = (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0))
@@ -759,13 +854,23 @@ class BudgetService:
     async def _validate_scope_target(self, scope_type: str, scope_id: str) -> None:
         if scope_type == "global":
             return
+        if scope_type == "feature":
+            if scope_id not in FEATURE_KEYS:
+                raise AppError(
+                    ErrorCode.VALIDATION_ERROR,
+                    f"功能预算必须使用固定功能键：{', '.join(sorted(FEATURE_KEYS))}。",
+                    status_code=400,
+                )
+            return
         async with self.database.session() as session:
-            if scope_type == "group":
+            if scope_type == "account":
+                exists = await session.get(Account, scope_id) is not None
+            elif scope_type == "group":
                 exists = await session.get(Group, scope_id) is not None
             else:
                 exists = await session.get(LLMProvider, scope_id) is not None
         if not exists:
-            label = "群" if scope_type == "group" else "模型 Provider"
+            label = {"account": "账号", "group": "群"}.get(scope_type, "模型 Provider")
             raise AppError(ErrorCode.VALIDATION_ERROR, f"预算绑定的{label}不存在。", status_code=400)
 
     async def upsert_policy(self, payload: dict[str, Any], policy_id: str | None = None) -> dict[str, Any]:
@@ -780,7 +885,11 @@ class BudgetService:
         if metric not in SUPPORTED_METRICS:
             raise AppError(ErrorCode.VALIDATION_ERROR, "预算指标无效。", status_code=400)
         if scope_type != "global" and not scope_id:
-            raise AppError(ErrorCode.VALIDATION_ERROR, "群或 Provider 预算必须指定作用域 ID。", status_code=400)
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "账号、群、Provider 或功能预算必须指定作用域 ID。",
+                status_code=400,
+            )
         limit_value = float(payload.get("limit_value") or 0)
         if limit_value < 0:
             raise AppError(ErrorCode.VALIDATION_ERROR, "预算上限不能为负数。", status_code=400)
@@ -818,6 +927,8 @@ class BudgetService:
             await self._evaluate_alerts(
                 group_id=scope_id if scope_type == "group" else None,
                 provider_id=scope_id if scope_type == "provider" else None,
+                account_id=scope_id if scope_type == "account" else None,
+                feature=scope_id if scope_type == "feature" else None,
             )
         except Exception:
             logger.exception("预算告警评估失败", extra={"event": "budget.alert.failed"})

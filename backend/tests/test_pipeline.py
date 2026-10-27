@@ -21,7 +21,7 @@ from app.core.time import utcnow
 from app.db.base import new_id
 from app.db.session import Database
 from app.models.account import Account
-from app.models.governance import AuditLog, BudgetPolicy
+from app.models.governance import AuditLog, BudgetPolicy, UsageEvent
 from app.models.group import Group, Member
 from app.models.message import Message, OutboxMessage
 from app.models.provider import LLMProvider, LLMUsage
@@ -478,9 +478,26 @@ async def test_mock_calls_never_record_fabricated_cost(database: Database, setti
 
     async with database.session() as session:
         usage = (await session.execute(select(LLMUsage).order_by(LLMUsage.created_at.desc()))).scalars().first()
+        feature_rows = await session.scalar(
+            select(UsageEvent.id).where(
+                UsageEvent.scope_type == "feature",
+                UsageEvent.scope_id == "chat",
+                UsageEvent.metric == "requests",
+            )
+        )
+        account_rows = await session.scalar(
+            select(UsageEvent.id).where(
+                UsageEvent.scope_type == "account",
+                UsageEvent.scope_id == env.account.id,
+            )
+        )
     assert usage is not None
     assert usage.provider_type == "mock"
     assert usage.estimated_cost is None
+    # 聊天调用必须归属到真实账号与 chat 功能，便于账号/功能预算统计。
+    assert usage.account_id == env.account.id
+    assert feature_rows is not None
+    assert account_rows is not None
 
     summary = await env.budget.usage_summary(hours=24)
     assert summary["cost"] == 0.0

@@ -20,6 +20,7 @@ from app.models.persona import Persona
 from app.models.provider import LLMProvider
 from app.runtime import AppRuntime
 from app.services.audit import write_audit
+from app.services.retention import RETENTION_AUTO_KEY, normalize_retention_days
 from app.services.settings_store import (
     get_global_pause,
     list_settings,
@@ -31,12 +32,6 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, text
 
 router = APIRouter()
-
-_RETENTION_DEFAULTS = {
-    "log_retention_days": 30,
-    "message_retention_days": 90,
-    "media_retention_days": 30,
-}
 
 
 @router.get("/health")
@@ -210,26 +205,18 @@ async def capabilities(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, 
                 },
                 {"key": "real_vision", "state": "unconfigured", "note": "真实视觉 Provider 未配置。"},
                 {"key": "real_asr", "state": "unconfigured", "note": "真实语音识别 Provider 未配置。"},
+                {
+                    "key": "data_retention",
+                    "state": "available",
+                    "note": (
+                        "可按保留天数手动清理消息、媒体与轮转日志，并擦除人格证据与记忆来源。"
+                        "自动清理默认关闭，需管理员显式开启；清理不调用模型、不发送消息，日志只删除 app.log.*。"
+                    ),
+                },
                 {"key": "scheduled_topic", "state": "planned", "note": "定时话题尚未实现。"},
             ],
         }
     )
-
-
-def _retention_value(raw: Any) -> dict[str, int]:
-    result = dict(_RETENTION_DEFAULTS)
-    if isinstance(raw, dict):
-        for key in result:
-            candidate = raw.get(key)
-            if candidate is None:
-                continue
-            try:
-                value = int(candidate)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= value <= 3650:
-                result[key] = value
-    return result
 
 
 async def _privacy_overview(runtime: AppRuntime) -> dict[str, Any]:
@@ -253,6 +240,7 @@ async def _privacy_overview(runtime: AppRuntime) -> dict[str, Any]:
             "长期记忆仅在显式开启的群内检索；只使用本群与当前发送者的普通敏感度记忆，不跨群。",
             "敏感记忆、已过期记忆、被排除成员的成员级记忆不会自动注入提示词。",
             "AI 记忆候选只用于人工审核，批准前不是正式记忆、不会注入提示词；已审核候选记录保留在本地供追溯。",
+            "自动清理默认关闭；手动或开启后的清理只删除超过保留期限的本地数据，日志仅处理 app.log.* 轮转文件。",
         ],
     }
 
@@ -271,7 +259,8 @@ async def read_settings(runtime: AppRuntime = Depends(get_runtime)) -> dict[str,
                 "api_prefix": runtime.settings.api_prefix,
             },
             "global_pause": pause,
-            "retention": _retention_value(settings.get("retention")),
+            "retention": normalize_retention_days(settings.get("retention")),
+            "retention_status": await runtime.retention.status(),
             "security": {
                 "allow_remote_admin": runtime.settings.allow_remote_admin,
                 "admin_token_configured": bool(runtime.settings.admin_api_token),
@@ -296,9 +285,19 @@ async def update_settings(
         raw = data.get("retention")
         if not isinstance(raw, dict):
             raise AppError(ErrorCode.VALIDATION_ERROR, "保留策略格式无效。", status_code=400)
-        retention = _retention_value(raw)
+        retention = normalize_retention_days(raw)
         await set_setting(runtime.database, "retention", retention)
         changed.append("retention")
+    if "retention_auto" in data:
+        raw_auto = data.get("retention_auto")
+        if not isinstance(raw_auto, dict) or not isinstance(raw_auto.get("enabled"), bool):
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "自动清理设置格式无效，需提供 enabled 布尔值。",
+                status_code=400,
+            )
+        await runtime.retention.set_enabled(bool(raw_auto["enabled"]), actor=actor)
+        changed.append(RETENTION_AUTO_KEY)
     if "global_pause" in data:
         raw_pause = data.get("global_pause")
         if not isinstance(raw_pause, dict):
@@ -321,6 +320,20 @@ async def update_settings(
         actor=actor,
     )
     return await read_settings(runtime)
+
+
+@router.get("/system/retention/status")
+async def retention_status(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, Any]:
+    return ok(await runtime.retention.status())
+
+
+@router.post("/system/retention/run")
+async def retention_run(
+    request: Request,
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    summary = await runtime.retention.run(trigger="manual", actor=get_actor(request))
+    return ok(summary)
 
 
 @router.post("/system/pause-all")
