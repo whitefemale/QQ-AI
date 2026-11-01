@@ -2,10 +2,11 @@
 """真实进程端到端冒烟测试（默认使用临时数据目录，不接触真实 QQ 或模型）。
 
 流程：
-    启动 uvicorn → 健康检查 → 演示环境初始化 → 群级模型绑定与删除保护 →
-    Mock 注入闭环 → 长期记忆注入 → AI 记忆候选提取与人工审核 → 非 @ 忽略 →
-    dry-run 不落库 → 全局暂停 → Provider 密钥脱敏与落盘检查 →
-    创建备份、校验、恢复预览、真实恢复 → 汇总结果。
+    启动 uvicorn → 健康检查 → 演示环境初始化 → 新群默认观察与人格预览不落库 →
+    群级模型绑定与删除保护 → Mock 注入闭环 → 手动确认批准/拒绝 →
+    长期记忆注入 → 记忆导出/来源/清理仅统计 → AI 记忆候选提取与人工审核 →
+    非 @ 忽略 → dry-run 不落库 → 全局暂停 → Provider 密钥脱敏与落盘检查 →
+    模型列表/连通性/生成测试与证据 → 创建备份、校验、恢复预览、真实恢复 → 汇总结果。
 
 用法（项目根目录，推荐使用后端虚拟环境的 Python）：
     backend\\.venv\\Scripts\\python.exe scripts\\smoke_test.py
@@ -20,6 +21,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -28,6 +30,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -63,6 +66,35 @@ class Api:
                 return response.status, response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read().decode("utf-8")
+        except urllib.error.URLError as exc:
+            raise SmokeFailure(f"无法连接后端 {path}: {exc.reason}") from exc
+
+    def fetch(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float = 30.0,
+    ) -> tuple[int, dict[str, str], str]:
+        """GET 原始响应，返回状态码、小写响应头与文本（含 BOM）。"""
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            method="GET",
+            headers=headers or {"Accept": "*/*"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return (
+                    response.status,
+                    {key.lower(): value for key, value in response.headers.items()},
+                    response.read().decode("utf-8", errors="replace"),
+                )
+        except urllib.error.HTTPError as exc:
+            return (
+                exc.code,
+                {key.lower(): value for key, value in exc.headers.items()},
+                exc.read().decode("utf-8", errors="replace"),
+            )
         except urllib.error.URLError as exc:
             raise SmokeFailure(f"无法连接后端 {path}: {exc.reason}") from exc
 
@@ -104,25 +136,62 @@ def _pick_port() -> int:
 
 
 def _env(temp: Path, port: int) -> dict[str, str]:
+    """构造完全隔离的后端环境，不读取仓库真实 ``.env`` 或本机重定向变量。"""
     data_dir = temp / "data"
     env = dict(os.environ)
+    for key in (
+        "AI_GROUP_FRIEND_ENV_FILE",
+        "AI_GROUP_FRIEND_RESOURCE_ROOT",
+        "DATA_DIR",
+        "CONNECTORS_DIR",
+        "DATABASE_URL",
+        "FRONTEND_DIST",
+        "CREDENTIAL_ENCRYPTION_KEY",
+        "APP_SECRET_KEY",
+        "APP_ENV",
+        "APP_HOST",
+        "APP_PORT",
+        "LOG_LEVEL",
+        "AUTO_MIGRATE",
+        "CORS_ORIGINS",
+        "ADMIN_API_TOKEN",
+        "ALLOW_REMOTE_ADMIN",
+        "ALLOWED_HOSTS",
+        "DEFAULT_LLM_PROVIDER",
+        "DEFAULT_LLM_BASE_URL",
+        "DEFAULT_LLM_MODEL",
+        "DEFAULT_LLM_API_KEY",
+    ):
+        env.pop(key, None)
     env.update(
         {
+            "AI_GROUP_FRIEND_ENV_FILE": str(temp / "missing.env"),
             "APP_ENV": "smoke",
             "APP_HOST": "127.0.0.1",
             "APP_PORT": str(port),
             "LOG_LEVEL": "WARNING",
             "DATA_DIR": str(data_dir),
+            "CONNECTORS_DIR": str(temp / "connectors"),
             "DATABASE_URL": f"sqlite+aiosqlite:///{(data_dir / 'smoke.db').as_posix()}",
             "CREDENTIAL_ENCRYPTION_KEY": base64.urlsafe_b64encode(os.urandom(32)).decode("ascii"),
             "APP_SECRET_KEY": secrets.token_urlsafe(48),
             "AUTO_MIGRATE": "true",
-            "FRONTEND_DIST": str(temp / "no-frontend"),
+            "FRONTEND_DIST": str(temp / "frontend"),
             "CORS_ORIGINS": "http://127.0.0.1:5173",
+            "ALLOW_REMOTE_ADMIN": "false",
+            "ADMIN_API_TOKEN": "",
             "PYTHONUTF8": "1",
         }
     )
     return env
+
+
+def _expected_version() -> str:
+    """从 ``backend/app/__init__.py`` 读取版本，避免在冒烟脚本里维护第二份版本号。"""
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', (BACKEND / "app" / "__init__.py").read_text(encoding="utf-8"))
+    if not match:
+        raise SmokeFailure("无法从 backend/app/__init__.py 读取版本号。")
+    return match.group(1)
 
 
 def _wait_ready(api: Api, process: subprocess.Popen[Any], log_path: Path, timeout: float = 75.0) -> None:
@@ -165,15 +234,49 @@ def _scan_for_secret(directory: Path, needle: str) -> list[str]:
     return hits
 
 
-def run(api: Api, temp: Path) -> None:
+def run(api: Api, temp: Path, expected_version: str) -> None:
     health = api.request("GET", "/api/health")
     _check(health["status"] == "ok", "健康检查通过")
-    _check(health["version"] == "0.1.0", "版本号可读取")
+    _check(health["version"] == expected_version, f"版本号可读取（{expected_version}）")
 
     ready = api.request("GET", "/api/ready")
     _check(ready["ready"] is True, "数据库就绪")
     _check(ready["credential_key_configured"] is True, "凭证加密密钥已配置")
     _check(ready["global_paused"] is False, "初始未处于全局暂停")
+
+    settings = api.request("GET", "/api/settings")
+    runtime = settings["runtime"]
+    _check(runtime["app_version"] == expected_version, "设置页版本与包版本一致")
+    _check(
+        Path(runtime["data_dir"]).resolve() == (temp / "data").resolve(),
+        "数据目录固定在临时目录，未读取本机 .env",
+    )
+    _check(
+        Path(runtime["connectors_dir"]).resolve() == (temp / "connectors").resolve(),
+        "连接器目录固定在临时目录，未扫描真实安装",
+    )
+    _check(runtime["allow_remote_admin"] is False, "冒烟环境未开启远程管理")
+    _check(settings["security"]["admin_token_configured"] is False, "冒烟环境未配置管理 Token")
+
+    html_status, html_headers, html_text = api.fetch("/")
+    _check(html_status == 200 and "<html" in html_text.lower(), "前端入口返回 HTML")
+    _check(html_headers.get("x-content-type-options") == "nosniff", "HTML 响应包含 nosniff")
+    _check(html_headers.get("x-frame-options") == "DENY", "HTML 响应禁止被嵌入框架")
+    _check(html_headers.get("referrer-policy") == "no-referrer", "HTML 响应不泄露 Referer")
+    permissions = html_headers.get("permissions-policy", "")
+    _check("camera=()" in permissions and "microphone=()" in permissions, "HTML 响应关闭摄像头与麦克风权限")
+    _check("clipboard-write=(self)" in permissions, "HTML 响应仅允许自身写入剪贴板")
+    csp = html_headers.get("content-security-policy", "")
+    _check("default-src 'self'" in csp and "frame-ancestors 'none'" in csp, "HTML 响应包含严格 CSP")
+    _check("script-src 'self'" in csp and "object-src 'none'" in csp, "CSP 禁止内联脚本与插件对象")
+
+    json_status, json_headers, _ = api.fetch("/api/health")
+    _check(json_status == 200, "健康检查 JSON 可读取")
+    _check(json_headers.get("x-content-type-options") == "nosniff", "JSON 响应包含 nosniff")
+    _check("content-security-policy" not in json_headers, "JSON 响应不添加 CSP")
+    docs_status, docs_headers, docs_text = api.fetch("/api/docs")
+    _check(docs_status == 200 and "swagger" in docs_text.lower(), "API 文档页可打开")
+    _check("content-security-policy" not in docs_headers, "Swagger 文档页不因 CSP 失效")
 
     capabilities = api.request("GET", "/api/capabilities")
     connections = {item["mode"]: item for item in capabilities["connections"]}
@@ -196,6 +299,59 @@ def run(api: Api, temp: Path) -> None:
     _check(features["usage_csv_export"]["state"] == "available", "用量 CSV 导出标记为可用")
     _check("anthropic_native" in capabilities["llm"]["available"], "Anthropic 原生模型接口标记为可用")
     _check("official" not in capabilities["llm"]["available"], "官方模型接入未被虚报为可用")
+    _check(features["managed_connector_install"]["state"] == "available", "受管连接器管理标记为可用")
+    _check(
+        "尚未验证" in features["managed_connector_install"]["note"],
+        "受管连接器说明明确真实安装器/QQ 收发尚未验证",
+    )
+
+    matrix = api.request("GET", "/api/extensions/capabilities")
+    contracts = {item["kind"]: item for item in matrix["contracts"]}
+    _check(
+        set(contracts) == {"chat_adapter", "llm_provider", "media_provider", "tool", "plugin"},
+        "扩展契约矩阵覆盖五类接口",
+    )
+    _check(contracts["plugin"]["execution"] == "not_executed", "插件契约明确不执行第三方代码")
+    _check(
+        any("不加载" in item or "不执行" in item for item in contracts["plugin"]["guarantees"]),
+        "插件契约承诺不加载第三方代码",
+    )
+    tool_names = {item["name"] for item in matrix["tools"]}
+    _check(tool_names == {"calculator", "current_datetime"}, "内置工具严格限定为计算器与当前时间")
+    _check(all(item["registration"] == "fixed_at_startup" for item in matrix["tools"]), "工具只允许启动时固定注册")
+    media_matrix = {item["capability"]: item for item in matrix["media"]}
+    _check(media_matrix["image.describe"]["execution"] == "job", "图像理解标记为任务队列可执行")
+    _check(media_matrix["audio.synthesize"]["execution"] == "contract_only", "语音合成诚实标记为仅接口契约")
+    _check(
+        all(item["source"] == "provider_registry" for item in media_matrix.values()),
+        "媒体能力状态来自 Provider 注册表",
+    )
+    _check(any("立即取消" in note for note in matrix["notes"]), "能力矩阵说明停用会立即取消任务")
+    enabled_vision = api.request("POST", "/api/media/providers/mock.vision/enable", {"enabled": True})
+    _check(enabled_vision["enabled"] is True and enabled_vision["is_mock"] is True, "Mock 视觉 Provider 显式启用")
+    _check(enabled_vision["cancelled_jobs"] == 0, "启用 Provider 不取消任何任务")
+    disabled_vision = api.request("POST", "/api/media/providers/mock.vision/enable", {"enabled": False})
+    _check(disabled_vision["enabled"] is False, "Mock 视觉 Provider 可停用")
+    _check("cancelled_capabilities" in disabled_vision, "停用响应如实返回取消的任务与能力")
+    media_caps = {item["capability"]: item for item in api.request("GET", "/api/media/capabilities")["items"]}
+    _check(media_caps["image.describe"]["next_step"], "未配置能力提供下一步说明")
+    _check(media_caps["video.describe"]["execution"] == "contract_only", "视频理解诚实标记为仅接口契约")
+
+    connector_caps = api.request("GET", "/api/connectors/capabilities")
+    _check(connector_caps["local_only"] is True, "连接器管理仅本机可用")
+    _check(connector_caps["real_qq_verified"] is False, "连接器页面未声称真实 QQ 已验证")
+    _check(connector_caps["supports"]["auto_update"] is False, "连接器不支持自动更新")
+    _check(connector_caps["supports"]["uninstall_or_delete"] is False, "连接器不提供自动卸载")
+    connectors = api.request("GET", "/api/connectors")
+    _check(connectors["installations"] == [], "冒烟测试使用隔离连接器目录，不扫描真实安装")
+    api.expect_error(
+        "POST",
+        "/api/connectors/install",
+        {"version": "v4.18.42"},
+        status=400,
+        code="CONNECTOR_CONFIRMATION_REQUIRED",
+    )
+    _check(True, "连接器安装需要精确确认词，未确认前不发起下载")
 
     demo = api.request("POST", "/api/demo/bootstrap", {})
     account = demo["account"]
@@ -204,8 +360,55 @@ def run(api: Api, temp: Path) -> None:
     group_id = group["id"]
     self_id = account.get("self_platform_user_id") or "10000"
     _check(account["adapter_type"] == "mock", "演示账号使用 Mock 连接器")
-    _check(group["reply_mode"] == "mention_only", "演示群默认仅 @ 回复")
+    _check(group["reply_mode"] == "mention_only", "演示群保留显式仅 @ 回复预设")
     _check(group["enabled"] is True, "演示群已加入白名单")
+
+    group_list = api.request("GET", "/api/groups")
+    reply_modes = {item["value"]: item for item in group_list["reply_modes"]}
+    for mode in ("observe", "mention_only", "manual_confirm", "always", "keyword"):
+        _check(mode in reply_modes, f"回复模式 {mode} 可查询")
+    _check(reply_modes["observe"]["label"] == "观察（默认）", "观察模式标注为默认")
+    _check(reply_modes["manual_confirm"]["label"] == "手动确认", "手动确认模式可查询")
+    _check(reply_modes["context"]["state"] == "planned", "上下文参与仍标记为规划中")
+    new_group = api.request(
+        "POST",
+        "/api/groups",
+        {
+            "account_id": account_id,
+            "platform_group_id": "987654321",
+            "name": "冒烟默认观察群",
+        },
+    )
+    _check(new_group["reply_mode"] == "observe", "新建群默认观察")
+    _check(new_group["enabled"] is False, "新建群默认不启用")
+    _check(new_group["max_reply_chars"] is None, "新建群未设置群级回复长度")
+    _check(new_group["max_reply_chars_effective"] > 0, "群级回复长度可回退全局有效值")
+    _check(new_group["context_message_limit"] is None, "新建群未设置群级上下文条数")
+    _check(new_group["context_message_limit_effective"] > 0, "上下文条数可回退全局有效值")
+
+    persona_id = group.get("persona_id")
+    _check(bool(persona_id), "演示群绑定人格")
+    versions_before = api.request("GET", f"/api/personas/{persona_id}/versions")["items"]
+    audit_before = api.request("GET", "/api/audit?action=persona.update&page_size=1")["total"]
+    preview = api.request(
+        "POST",
+        f"/api/personas/{persona_id}/preview",
+        {"notes": "冒烟预览不会保存"},
+    )
+    _check(preview["saved"] is False, "人格预览标记为未保存")
+    _check(any(item["field"] == "notes" for item in preview["changes"]), "人格预览返回字段差异")
+    _check(bool(preview["diff"]["fields"]), "人格预览返回结构化差异")
+    versions_after = api.request("GET", f"/api/personas/{persona_id}/versions")["items"]
+    audit_after = api.request("GET", "/api/audit?action=persona.update&page_size=1")["total"]
+    _check(len(versions_after) == len(versions_before), "人格预览不新增版本")
+    _check(audit_after == audit_before, "人格预览不写审计")
+    if versions_after:
+        version_detail = api.request(
+            "GET",
+            f"/api/personas/{persona_id}/versions/{versions_after[-1]['id']}",
+        )
+        _check(bool(version_detail["snapshot"]), "人格版本详情返回脱敏快照")
+        _check("diff" in version_detail, "人格版本详情返回差异")
 
     demo_provider = demo["provider"]
     routing_primary = api.request(
@@ -311,6 +514,50 @@ def run(api: Api, temp: Path) -> None:
     )
     _check("密码" in rejected["message"], "疑似凭证的记忆被拒绝并给出原因")
 
+    sources = api.request("GET", f"/api/memories/{memory['id']}/sources")
+    _check(isinstance(sources["items"], list), "记忆来源可查询")
+    _check(bool(sources["note"]), "记忆来源说明可查询")
+    sensitive_memory = api.request(
+        "POST",
+        "/api/memories",
+        {
+            "account_id": account_id,
+            "group_id": group_id,
+            "content": "冒烟敏感记忆仅用于导出排除验证",
+            "memory_type": "fact",
+            "sensitivity": "sensitive",
+            "confidence": 0.8,
+        },
+    )
+    export_status, export_text = api.raw("GET", f"/api/memories/export.csv?group_id={group_id}")
+    _check(export_status == 200, "记忆 CSV 导出返回 200")
+    _check(export_text.startswith("﻿"), "记忆 CSV 带 UTF-8 BOM")
+    _check("account_id" in export_text.splitlines()[0], "记忆 CSV 包含账号列")
+    _check(memory["content"] in export_text, "普通记忆出现在默认导出")
+    _check(sensitive_memory["content"] not in export_text, "默认导出排除敏感记忆")
+    _, export_all_text = api.raw(
+        "GET",
+        f"/api/memories/export.csv?group_id={group_id}&include_sensitive=true",
+    )
+    _check(sensitive_memory["content"] in export_all_text, "显式包含时可导出敏感记忆")
+    api.request("DELETE", f"/api/memories/{sensitive_memory['id']}")
+    export_audit = api.request("GET", "/api/audit?action=memory.export&page_size=1")
+    _check(export_audit["total"] >= 2, "记忆导出写入审计")
+    cleanup_dry = api.request(
+        "POST",
+        "/api/memories/cleanup",
+        {"mode": "expired", "dry_run": True},
+    )
+    _check(cleanup_dry["dry_run"] is True, "记忆清理支持仅统计")
+    _check(cleanup_dry["deleted"] == 0, "仅统计不会删除记忆")
+    cleanup_audit = api.request("GET", "/api/audit?action=memory.cleanup&page_size=1")
+    _check(cleanup_audit["total"] >= 1, "记忆清理仅统计也写审计")
+    memories_after_cleanup = api.request("GET", f"/api/memories?group_id={group_id}&page_size=200")
+    _check(
+        any(item["id"] == memory["id"] for item in memories_after_cleanup["items"]),
+        "仅统计清理不删除记忆",
+    )
+
     memories_before = api.request("GET", f"/api/memories?group_id={group_id}&page_size=200")
     for text in (
         "我们每周五下午同步一次项目进度。",
@@ -389,6 +636,81 @@ def run(api: Api, temp: Path) -> None:
     _check("inbound" in directions and "outbound" in directions, "消息日志同时包含入站与出站")
     outbox = api.request("GET", f"/api/outbox?group_id={group_id}")
     _check(any(item["status"] == "sent" for item in outbox["items"]), "发送队列状态为 sent")
+
+    manual_group = api.request(
+        "PATCH",
+        f"/api/groups/{group_id}",
+        {"reply_mode": "manual_confirm", "rate_limit": {"cooldown_seconds": 0}},
+    )
+    _check(manual_group["reply_mode"] == "manual_confirm", "群可切换为手动确认模式")
+    manual_event = api.request(
+        "POST",
+        f"/api/accounts/{account_id}/mock/events",
+        {
+            "group_internal_id": group_id,
+            "text": "@AI 群友 这条回复需要人工确认",
+            "mentions": [self_id],
+            "sender_id": "20001",
+            "sender_name": "冒烟测试群友",
+        },
+    )
+    _check(manual_event["sent"] is False, "手动确认模式下不自动发送")
+    _check(manual_event["result"]["action"] == "awaiting_approval", "手动确认回复标记为等待人工确认")
+    manual_outbox_id = manual_event["result"]["outbox_id"]
+    _check(bool(manual_outbox_id), "手动确认回复进入发送队列")
+    api.request("POST", "/api/outbox/dispatch-due", {})
+    manual_pending = api.request(
+        "GET",
+        f"/api/outbox?group_id={group_id}&status=pending_approval&page_size=200",
+    )
+    _check(
+        any(item["id"] == manual_outbox_id for item in manual_pending["items"]),
+        "派发到期消息不会发送待确认回复",
+    )
+    approved = api.request(
+        "POST",
+        f"/api/outbox/{manual_outbox_id}/approve",
+        {"content": "好的，已人工确认。"},
+    )
+    _check(approved["sent_immediately"] is True, "人工批准后立即尝试发送")
+    _check(approved["item"]["status"] == "sent", "人工批准后发送队列状态为 sent")
+    api.expect_error(
+        "POST",
+        f"/api/outbox/{manual_outbox_id}/approve",
+        {},
+        status=409,
+        code="CONFLICT",
+    )
+    _check(True, "重复批准待确认回复返回冲突")
+    second_event = api.request(
+        "POST",
+        f"/api/accounts/{account_id}/mock/events",
+        {
+            "group_internal_id": group_id,
+            "text": "@AI 群友 这条回复会被拒绝",
+            "mentions": [self_id],
+            "sender_id": "20001",
+            "sender_name": "冒烟测试群友",
+        },
+    )
+    _check(second_event["sent"] is False, "第二条待确认回复同样不自动发送")
+    rejected_outbox = api.request(
+        "POST",
+        f"/api/outbox/{second_event['result']['outbox_id']}/reject",
+        {"reason": "冒烟测试拒绝"},
+    )
+    _check(rejected_outbox["status"] == "rejected", "待确认回复可被人工拒绝")
+    outbox_audit = api.request("GET", "/api/audit?action=outbox.approve&page_size=200")
+    _check(
+        any(
+            item["details"].get("result") == "approved" and item.get("target_id") == manual_outbox_id
+            for item in outbox_audit["items"]
+        ),
+        "人工批准写入审计",
+    )
+    api.request("PATCH", f"/api/groups/{group_id}", {"reply_mode": "mention_only"})
+    _check(True, "手动确认流程结束后恢复演示群回复模式")
+
     usage = api.request("GET", "/api/usage")
     _check(usage["total"] >= 1, "Token 用量已记录")
     summary = api.request("GET", "/api/usage/summary?hours=24")
@@ -411,6 +733,40 @@ def run(api: Api, temp: Path) -> None:
         dashboard["usage_today"]["last_24h"]["requests"] == summary["requests"],
         "仪表盘今日用量与 24 小时汇总一致",
     )
+
+    mock_models = api.request("GET", f"/api/providers/{demo_provider['id']}/models")
+    _check(mock_models["state"] == "mock", "Mock Provider 模型列表标记为 mock")
+    _check(mock_models["supported"] is False, "Mock Provider 不伪造远端模型列表")
+    _check(mock_models["models"] == [], "Mock Provider 模型列表为空")
+    connectivity = api.request(
+        "POST",
+        f"/api/providers/{demo_provider['id']}/test",
+        {"operation_id": f"smoke-connectivity-{secrets.token_hex(4)}"},
+    )
+    _check(connectivity["outcome"] == "success", "Mock Provider 连通性测试成功")
+    _check(connectivity["is_mock"] is True, "连通性测试结果明确标记 Mock")
+    _check(connectivity["billable"] is False, "Mock 连通性测试不标记为计费调用")
+    _check(connectivity["usage"]["cost_status"] == "mock_zero", "Mock 测试费用标记为无外部费用")
+    _check("不代表真实 API 可用" in connectivity["message"], "Mock 测试说明不冒充真实 API 结果")
+    generated = api.request(
+        "POST",
+        f"/api/providers/{demo_provider['id']}/test-generation",
+        {
+            "operation_id": f"smoke-generation-{secrets.token_hex(4)}",
+            "prompt": "请只回复：冒烟生成成功",
+            "max_output_tokens": 16,
+            "temperature": 0.0,
+        },
+    )
+    _check(generated["kind"] == "generation", "真实生成测试返回 generation 类型")
+    _check(generated["outcome"] == "success" and bool(generated["text"]), "Mock 生成测试返回可展示文本")
+    _check(generated["is_mock"] is True and generated["billable"] is False, "Mock 生成测试不计费")
+    tested_provider = api.request("GET", f"/api/providers/{demo_provider['id']}")
+    _check(tested_provider["last_test"]["outcome"] == "success", "连通性测试证据已持久化")
+    _check(tested_provider["last_test"]["is_mock"] is True, "连通性证据保留 Mock 标记")
+    _check(tested_provider["last_generation"]["outcome"] == "success", "生成测试证据已持久化")
+    usage_after_tests = api.request("GET", "/api/usage")
+    _check(usage_after_tests["total"] >= usage["total"] + 2, "测试调用写入本地用量记录")
     mock_sent = api.request("GET", f"/api/accounts/{account_id}/mock/sent")
     _check(bool(mock_sent["items"]), "Mock 已发送列表可读取")
     recent = api.request("GET", "/api/events/recent")
@@ -427,6 +783,37 @@ def run(api: Api, temp: Path) -> None:
     )
     _check(ignored["sent"] is False, "非 @ 消息不会触发回复")
     _check(ignored["result"]["reason"] == "no_trigger", "非 @ 消息记录拦截原因 no_trigger")
+
+    message_export_query = urllib.parse.urlencode({"group_id": group_id})
+    message_status, message_headers, message_text = api.fetch(f"/api/messages/export.csv?{message_export_query}")
+    _check(message_status == 200, "消息 CSV 导出返回 200")
+    _check(message_text.startswith("﻿"), "消息 CSV 带 UTF-8 BOM")
+    _check(message_headers.get("cache-control") == "no-store", "消息 CSV 禁止缓存")
+    _check(message_headers.get("x-content-type-options") == "nosniff", "消息 CSV 禁止 MIME 嗅探")
+    _check("attachment" in message_headers.get("content-disposition", ""), "消息 CSV 以附件下载")
+    message_header = message_text.lstrip("﻿").splitlines()[0]
+    for column in ("content_text", "sender_name", "event_timestamp"):
+        _check(column in message_header, f"消息 CSV 包含 {column} 列")
+    for excluded in ("segments", "api_key", "secret", "prompt"):
+        _check(excluded not in message_header.lower(), f"消息 CSV 不包含 {excluded} 列")
+    _check("普通聊天，没有 @ 机器人" in message_text, "消息 CSV 包含真实消息正文")
+
+    filtered_query = urllib.parse.urlencode({"group_id": group_id, "search": "普通聊天"})
+    filtered_status, _, filtered_text = api.fetch(f"/api/messages/export.csv?{filtered_query}")
+    _check(filtered_status == 200, "带搜索条件的消息 CSV 导出返回 200")
+    filtered_rows = [line for line in filtered_text.lstrip("﻿").splitlines() if line.strip()]
+    _check(len(filtered_rows) == 2, "搜索条件只导出匹配的 1 条消息")
+    _check("普通聊天，没有 @ 机器人" in filtered_text, "搜索结果包含目标消息")
+    message_audit = api.request("GET", "/api/audit?action=message.export&page_size=10")
+    _check(message_audit["total"] == 2, "两次消息导出各写一条审计")
+    _check(
+        {item["details"].get("has_search") for item in message_audit["items"]} == {False, True},
+        "消息导出审计记录是否使用搜索",
+    )
+    for item in message_audit["items"]:
+        rendered = json.dumps(item["details"], ensure_ascii=False)
+        _check(item["details"].get("format") == "csv", "消息导出审计标记格式为 CSV")
+        _check("普通聊天" not in rendered and "没有 @" not in rendered, "消息导出审计不记录正文或搜索词")
 
     before_total = api.request("GET", "/api/messages?page_size=1")["total"]
     dry = api.request(
@@ -469,6 +856,23 @@ def run(api: Api, temp: Path) -> None:
     resumed = api.request("POST", "/api/system/resume")
     _check(resumed["global_pause"]["paused"] is False, "全局恢复成功")
 
+    metadata_rejected = api.expect_error(
+        "POST",
+        "/api/providers",
+        {
+            "name": "冒烟元数据地址（应被拒绝）",
+            "provider_type": "openai_compatible",
+            "base_url": "http://169.254.169.254/latest/meta-data",
+            "model": "smoke-model",
+            "api_key": "smoke-metadata-key",
+            "enabled": False,
+            "is_default": False,
+        },
+        status=400,
+        code="VALIDATION_ERROR",
+    )
+    _check("不允许的主机" in metadata_rejected["message"], "云元数据地址被拒绝并给出通用说明")
+
     fake_key = "smoke-secret-" + secrets.token_hex(12)
     provider = api.request(
         "POST",
@@ -487,6 +891,12 @@ def run(api: Api, temp: Path) -> None:
     _check(fake_key not in json.dumps(provider, ensure_ascii=False), "Provider 响应不含明文密钥")
     _check(bool(provider.get("api_key_masked")), "Provider 密钥以掩码返回")
     _check(provider["cost_tracking"] == "unconfigured", "未填写单价的 Provider 标记为单价未配置")
+    _check(provider["config_complete"] is True, "带 Key 的远端 Provider 配置完整")
+    cleared = api.request("PATCH", f"/api/providers/{provider['id']}", {"api_key": ""})
+    _check(cleared["api_key_configured"] is False, "显式清空后 API Key 已移除")
+    _check(cleared["config_complete"] is False, "清空 Key 后配置标记为不完整")
+    _check(cleared["last_test"] is None and cleared["last_generation"] is None, "清空 Key 后测试证据失效")
+    _check(fake_key not in json.dumps(cleared, ensure_ascii=False), "清空 Key 的响应不含明文")
     _, providers_text = api.raw("GET", "/api/providers")
     _check(fake_key not in providers_text, "Provider 列表不含明文密钥")
 
@@ -566,6 +976,19 @@ def run(api: Api, temp: Path) -> None:
     _check(preview["requires_pause"] is True, "恢复预览要求全局暂停")
     _check(preview["confirm_phrase"] == "RESTORE", "恢复确认短语为 RESTORE")
     _check(preview["current_state"]["accounts"] >= 1, "恢复预览可读取当前数据状态")
+    _check(
+        preview["schema"]["status"] in {"compatible", "unknown"},
+        "恢复预览返回 Schema 兼容状态",
+    )
+    _check(preview["schema"]["restore_allowed"] is True, "当前版本创建的备份允许恢复")
+    _check(
+        set(preview["app_version"]) == {"backup", "current"},
+        "恢复预览同时返回备份与当前程序版本",
+    )
+    _check(
+        any("恢复" in warning for warning in preview["warnings"]),
+        "恢复预览说明备份范围与限制",
+    )
     audit_before = api.request("GET", "/api/audit?page_size=200")
     actions_before = {item["action"] for item in audit_before["items"]}
     for action in ("backup.create", "provider.llm.create", "system.pause_all", "demo.bootstrap"):
@@ -696,6 +1119,159 @@ def run(api: Api, temp: Path) -> None:
     audit_export = api.request("GET", "/api/audit?action=usage.export&page_size=50")
     _check(audit_export["total"] >= 1, "CSV 导出动作写入审计日志")
 
+    # ---- 阶段 6：保留清理预览与 CLEANUP 确认 ----
+    messages_before_preview = api.request("GET", "/api/messages?page_size=1")["total"]
+    audit_before_preview = api.request("GET", "/api/audit?page_size=1")["total"]
+    retention_before = api.request("GET", "/api/system/retention/status")
+    retention_preview = api.request("GET", "/api/system/retention/preview")
+    _check(retention_preview["running"] is False, "保留预览显示当前无清理任务")
+    _check("counts" in retention_preview and "limits" in retention_preview, "保留预览返回计数与批次限制")
+    counts = retention_preview["counts"]
+    for key in (
+        "messages_expired",
+        "messages_will_delete",
+        "messages_remaining_after",
+        "media_expired",
+        "logs",
+        "memories",
+    ):
+        _check(isinstance(counts.get(key), int), f"保留预览包含整数计数 {key}")
+    _check(
+        counts["messages_will_delete"] <= retention_preview["limits"]["max_messages_per_run"],
+        "保留预览明确批次上限",
+    )
+    messages_after_preview = api.request("GET", "/api/messages?page_size=1")["total"]
+    audit_after_preview = api.request("GET", "/api/audit?page_size=1")["total"]
+    retention_after_preview = api.request("GET", "/api/system/retention/status")
+    _check(messages_after_preview == messages_before_preview, "保留预览不删除消息")
+    _check(audit_after_preview == audit_before_preview, "保留预览不写审计")
+    _check(
+        retention_after_preview["last_run"] == retention_before["last_run"],
+        "保留预览不更新上次运行记录",
+    )
+
+    api.expect_error(
+        "POST",
+        "/api/system/retention/run",
+        {},
+        status=400,
+        code="CONFIRMATION_REQUIRED",
+    )
+    _check(
+        api.request("GET", "/api/messages?page_size=1")["total"] == messages_before_preview,
+        "未确认的清理不会删除消息",
+    )
+    _check(
+        api.request("GET", "/api/audit?page_size=1")["total"] == audit_before_preview,
+        "未确认的清理不会写审计",
+    )
+    retention_run = api.request(
+        "POST",
+        "/api/system/retention/run",
+        {"confirm": "CLEANUP"},
+        timeout=60.0,
+    )
+    _check(retention_run["status"] == "completed", "输入 CLEANUP 后保留清理完成")
+    _check(retention_run["trigger"] == "manual", "保留清理记录手动触发")
+    _check(retention_run["counts"]["messages"] == 0, "新建的冒烟数据未超过保留期，未被误删")
+    retention_audit = api.request("GET", "/api/audit?action=retention.run&page_size=5")
+    _check(retention_audit["total"] >= 1, "保留清理写入审计")
+    _check(
+        api.request("GET", "/api/system/retention/status")["last_run"]["status"] == "completed",
+        "保留清理摘要可用于状态展示",
+    )
+
+    # ---- 阶段 5：接入向导与只读诊断 ----
+    audit_total_before = api.request("GET", "/api/audit?page_size=1")["total"]
+    onboarding = api.request("GET", "/api/onboarding")
+    diagnostics = api.request("GET", "/api/diagnostics")
+    audit_total_after = api.request("GET", "/api/audit?page_size=1")["total"]
+    _check(audit_total_after == audit_total_before, "接入向导与诊断 GET 不写审计")
+
+    _check(onboarding["schema_version"] == "onboarding.v1", "接入向导返回 onboarding.v1")
+    _check(
+        set(onboarding)
+        == {
+            "schema_version",
+            "checked_at",
+            "overall",
+            "ready_for_replies",
+            "mock_only",
+            "global_paused",
+            "steps",
+            "warnings",
+            "blockers",
+            "next_action",
+            "notes",
+        },
+        "接入向导顶层字段与约定一致",
+    )
+    step_keys = [item["key"] for item in onboarding["steps"]]
+    _check(
+        step_keys == ["backend", "connector", "qq_login", "connection_test", "model", "groups", "observe", "enable"],
+        "接入向导固定包含八个步骤",
+    )
+    states = {item["state"] for item in onboarding["steps"]}
+    _check(
+        states <= {"done", "action_required", "optional", "blocked", "mock_only", "not_verified"},
+        "接入向导步骤状态使用约定枚举",
+    )
+    _check(onboarding["overall"] == "ready_mock_only", "Mock 演示阶段整体状态为 ready_mock_only")
+    _check(onboarding["ready_for_replies"] is False, "Mock 演示不得声称真实回复已就绪")
+    _check(onboarding["mock_only"] is True, "接入向导明确标记 Mock 演示")
+    _check(
+        any(item["state"] == "mock_only" for item in onboarding["steps"]),
+        "至少一个步骤诚实标记为 mock_only",
+    )
+    onboarding_json = json.dumps(onboarding, ensure_ascii=False)
+    for value in (account_id, group["platform_group_id"], str(temp)):
+        _check(value not in onboarding_json, f"接入向导不包含标识或路径：{value[:24]}")
+
+    _check(diagnostics["schema_version"] == "diagnostics.v1", "诊断返回 diagnostics.v1")
+    _check(
+        set(diagnostics)
+        == {
+            "schema_version",
+            "generated_at",
+            "excluded",
+            "app",
+            "readiness",
+            "counts",
+            "accounts",
+            "connectors",
+            "providers",
+            "groups",
+            "messages",
+            "connection_test",
+            "recent_audit_actions",
+            "text",
+        },
+        "诊断顶层字段与 allowlist 一致",
+    )
+    _check(bool(diagnostics["excluded"]), "诊断列出默认排除项")
+    _check(diagnostics["connectors"]["real_qq_verified"] is False, "诊断未声称真实 QQ 已验证")
+    _check(diagnostics["connection_test"]["message_send_attempted"] is False, "诊断从不发送消息")
+    _check(
+        all(set(item) == {"action", "count"} for item in diagnostics["recent_audit_actions"]),
+        "审计摘要只含动作名与计数",
+    )
+    diagnostics_json = json.dumps(diagnostics, ensure_ascii=False)
+    diagnostics_text = diagnostics["text"]
+    for secret in (fake_key, anthropic_key):
+        _check(secret not in diagnostics_json and secret not in diagnostics_text, "诊断不含 Provider 明文密钥")
+    for value in (
+        account_id,
+        group["platform_group_id"],
+        "恢复后再次测试",
+        "冒烟测试拒绝",
+        str(temp),
+    ):
+        _check(
+            value not in diagnostics_json and value not in diagnostics_text,
+            f"诊断不含标识、消息正文或路径：{value[:24]}",
+        )
+    _check("Token" in diagnostics_text and "API Key" in diagnostics_text, "诊断文本明确列出排除的凭证类型")
+
 
 def _utf8_console() -> None:
     for stream in (sys.stdout, sys.stderr):
@@ -716,6 +1292,14 @@ def main() -> int:
         return 2
 
     temp = Path(tempfile.mkdtemp(prefix="aiqf-smoke-"))
+    frontend_dist = temp / "frontend"
+    frontend_dist.mkdir(parents=True, exist_ok=True)
+    # 最小 SPA 入口用于验证 HTML 安全头与 CSP；不涉及真实前端构建。
+    (frontend_dist / "index.html").write_text(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>冒烟页</title></head>"
+        "<body><div id=\"app\">smoke</div></body></html>",
+        encoding="utf-8",
+    )
     log_path = temp / "server.log"
     port = _pick_port()
     api = Api(f"http://127.0.0.1:{port}")
@@ -748,7 +1332,7 @@ def main() -> int:
             )
             _wait_ready(api, process, log_path)
             print("[ok] uvicorn 已启动并完成数据库迁移\n")
-            run(api, temp)
+            run(api, temp, _expected_version())
         success = True
     except SmokeFailure as exc:
         print(f"\n[失败] {exc}", file=sys.stderr)

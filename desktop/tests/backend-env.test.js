@@ -32,6 +32,17 @@ test('后端环境使用绝对数据目录与 SQLite 路径', () => {
   assert.equal(env.AUTO_MIGRATE, 'true')
 })
 
+test('桌面显式选择的连接器目录才传入 CONNECTORS_DIR', () => {
+  const repoRoot = path.resolve('D:/repo/ai-group-friend')
+  const base = { baseEnv: {}, repoRoot, dataDir: 'data', port: 8123 }
+
+  assert.equal(buildBackendEnv(base).CONNECTORS_DIR, undefined)
+
+  const selected = path.resolve('E:/aiqf-connectors')
+  assert.equal(buildBackendEnv({ ...base, connectorsDir: `  ${selected}  ` }).CONNECTORS_DIR, selected)
+  assert.equal(buildBackendEnv({ ...base, connectorsDir: '   ' }).CONNECTORS_DIR, undefined)
+})
+
 test('SQLite URL 使用正斜杠，不包含反斜杠', () => {
   const url = sqliteUrl('D:\\repo\\data\\ai_group_friend.db')
   assert.equal(url.startsWith('sqlite+aiosqlite:///'), true)

@@ -11,18 +11,21 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 
 from app.core.config import Settings
 from app.core.errors import AppError, ErrorCode
+from app.core.security import redact_text
+from app.core.sensitive import contains_sensitive_secret
 from app.core.time import ensure_utc, iso_utc, utcnow
 from app.db.session import Database
 from app.models.account import Account
 from app.models.group import Group, Member
 from app.models.memory import Memory, MemoryCandidate
+from app.models.message import Message
 from app.services.audit import write_audit
 
 MEMORY_TYPES = {
@@ -37,13 +40,6 @@ SENSITIVITIES = {"normal", "sensitive"}
 AUTO_INJECT_SENSITIVITIES = {"normal"}
 MAX_CONTENT_CHARS = 2000
 
-_SECRET_PATTERNS = (
-    re.compile(r"(?i)(密码|口令|验证码|支付密码|银行卡|身份证号|信用卡|cvv|password|passcode)\s*[:：=是为]\s*\S+"),
-    re.compile(r"(?<!\d)(?:\d[ -]?){16,19}(?!\d)"),
-    re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)"),
-    re.compile(r"(?i)\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}\b"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-)
 _CJK_RUN = re.compile(r"[㐀-鿿]+")
 _ASCII_WORD = re.compile(r"[a-z0-9_]{2,}")
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -96,13 +92,12 @@ def validate_memory_content(content: str) -> str:
             f"记忆内容最多 {MAX_CONTENT_CHARS} 个字符。",
             status_code=400,
         )
-    for pattern in _SECRET_PATTERNS:
-        if pattern.search(cleaned):
-            raise AppError(
-                ErrorCode.MEMORY_SENSITIVE_CONTENT,
-                "记忆内容疑似包含密码、验证码、证件号、银行卡号或密钥，已拒绝保存。请改为描述性内容。",
-                status_code=400,
-            )
+    if contains_sensitive_secret(cleaned):
+        raise AppError(
+            ErrorCode.MEMORY_SENSITIVE_CONTENT,
+            "记忆内容疑似包含密码、验证码、证件号、银行卡号或密钥，已拒绝保存。请改为描述性内容。",
+            status_code=400,
+        )
     return cleaned
 
 
@@ -171,6 +166,36 @@ def _relevance(query_tokens: set[str], content: str) -> int:
     if not query_tokens:
         return 0
     return len(query_tokens & _tokens(content))
+
+
+def _memory_conditions(
+    *,
+    account_id: str | None = None,
+    group_id: str | None = None,
+    member_id: str | None = None,
+    memory_type: str | None = None,
+    search: str | None = None,
+    include_expired: bool = True,
+    include_sensitive: bool = True,
+) -> list[Any]:
+    conditions: list[Any] = []
+    if account_id:
+        conditions.append(Memory.account_id == account_id)
+    if group_id:
+        conditions.append(Memory.group_id == group_id)
+    if member_id:
+        conditions.append(Memory.member_id == member_id)
+    if memory_type:
+        if memory_type not in MEMORY_TYPES:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "记忆类型筛选值无效。", status_code=400)
+        conditions.append(Memory.memory_type == memory_type)
+    if search and search.strip():
+        conditions.append(Memory.content.contains(search.strip()[:200]))
+    if not include_expired:
+        conditions.append(or_(Memory.expires_at.is_(None), Memory.expires_at > utcnow()))
+    if not include_sensitive:
+        conditions.append(Memory.sensitivity != "sensitive")
+    return conditions
 
 
 class MemoryService:
@@ -328,21 +353,14 @@ class MemoryService:
         page: int = 1,
         page_size: int = 50,
     ) -> dict[str, Any]:
-        conditions: list[Any] = []
-        if account_id:
-            conditions.append(Memory.account_id == account_id)
-        if group_id:
-            conditions.append(Memory.group_id == group_id)
-        if member_id:
-            conditions.append(Memory.member_id == member_id)
-        if memory_type:
-            if memory_type not in MEMORY_TYPES:
-                raise AppError(ErrorCode.VALIDATION_ERROR, "记忆类型筛选值无效。", status_code=400)
-            conditions.append(Memory.memory_type == memory_type)
-        if search and search.strip():
-            conditions.append(Memory.content.contains(search.strip()[:200]))
-        if not include_expired:
-            conditions.append(or_(Memory.expires_at.is_(None), Memory.expires_at > utcnow()))
+        conditions = _memory_conditions(
+            account_id=account_id,
+            group_id=group_id,
+            member_id=member_id,
+            memory_type=memory_type,
+            search=search,
+            include_expired=include_expired,
+        )
         size = min(max(1, page_size), 200)
         async with self.database.session() as session:
             total = await session.scalar(select(func.count(Memory.id)).where(*conditions))
@@ -364,6 +382,118 @@ class MemoryService:
             "page": page,
             "page_size": size,
         }
+
+    async def export_rows(
+        self,
+        *,
+        account_id: str | None = None,
+        group_id: str | None = None,
+        member_id: str | None = None,
+        memory_type: str | None = None,
+        search: str | None = None,
+        include_expired: bool = True,
+        include_sensitive: bool = False,
+    ) -> list[Memory]:
+        """导出用查询；默认排除敏感记忆，调用方负责 CSV 与审计。"""
+        from app.core.csv import CSV_ROW_LIMIT
+
+        conditions = _memory_conditions(
+            account_id=account_id,
+            group_id=group_id,
+            member_id=member_id,
+            memory_type=memory_type,
+            search=search,
+            include_expired=include_expired,
+            include_sensitive=include_sensitive,
+        )
+        async with self.database.session() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(Memory)
+                        .where(*conditions)
+                        .order_by(Memory.is_pinned.desc(), Memory.created_at.desc())
+                        .limit(CSV_ROW_LIMIT + 1)
+                    )
+                ).scalars()
+            )
+        return rows
+
+    async def sources(self, memory_id: str) -> dict[str, Any]:
+        """返回记忆来源消息的脱敏摘要；越权/已删除的统一标记 missing。"""
+        async with self.database.session() as session:
+            record = await session.get(Memory, memory_id)
+            if record is None:
+                raise AppError(ErrorCode.NOT_FOUND, "记忆不存在或已被删除。", status_code=404)
+            ids = [str(item) for item in (record.source_message_ids_json or [])]
+            if not ids:
+                return {"items": [], "note": "该记忆没有关联的来源消息。"}
+            conditions: list[Any] = [Message.id.in_(ids), Message.account_id == record.account_id]
+            if record.group_id is not None:
+                conditions.append(Message.group_id == record.group_id)
+            rows = list((await session.execute(select(Message).where(*conditions))).scalars())
+            messages = {row.id: row for row in rows}
+            group_ids = {row.group_id for row in rows if row.group_id}
+            group_names = {
+                group.id: group.name
+                for group in (await session.execute(select(Group).where(Group.id.in_(group_ids)))).scalars()
+            }
+        items: list[dict[str, Any]] = []
+        for message_id in ids:
+            message = messages.get(message_id)
+            if message is None:
+                items.append(
+                    {
+                        "id": message_id,
+                        "missing": True,
+                        "sender_name": None,
+                        "timestamp": None,
+                        "group_id": None,
+                        "group_name": None,
+                        "preview": "",
+                    }
+                )
+                continue
+            items.append(
+                {
+                    "id": message.id,
+                    "missing": False,
+                    "sender_name": message.sender_name,
+                    "timestamp": iso_utc(message.event_timestamp),
+                    "group_id": message.group_id,
+                    "group_name": group_names.get(message.group_id or ""),
+                    "preview": redact_text(message.content_text)[:200],
+                }
+            )
+        return {
+            "items": items,
+            "missing_count": sum(1 for item in items if item["missing"]),
+            "note": "只展示该记忆所属账号与群范围内的来源消息；已删除或越权的消息标记为缺失。",
+        }
+
+    async def cleanup(self, *, mode: str, days: int | None = None, dry_run: bool = False) -> dict[str, Any]:
+        """清理未固定记忆；dry_run 只统计。expired 与 older_than 语义固定。"""
+        now = utcnow()
+        conditions: list[Any] = [Memory.is_pinned.is_(False)]
+        if mode == "expired":
+            conditions.extend([Memory.expires_at.is_not(None), Memory.expires_at <= now])
+        elif mode == "older_than":
+            try:
+                value = int(days or 0)
+            except (TypeError, ValueError) as exc:
+                raise AppError(ErrorCode.VALIDATION_ERROR, "days 必须是整数。", status_code=400) from exc
+            if not 1 <= value <= 3650:
+                raise AppError(ErrorCode.VALIDATION_ERROR, "days 必须在 1 到 3650 之间。", status_code=400)
+            conditions.append(Memory.created_at < now - timedelta(days=value))
+        else:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "mode 必须为 expired 或 older_than。", status_code=400)
+        async with self.database.session() as session:
+            matched = int(await session.scalar(select(func.count(Memory.id)).where(*conditions)) or 0)
+            if dry_run or matched == 0:
+                return {"mode": mode, "dry_run": dry_run, "matched": matched, "deleted": 0}
+            await session.execute(delete(Memory).where(*conditions))
+            await session.commit()
+        return {"mode": mode, "dry_run": dry_run, "matched": matched, "deleted": matched}
 
     @staticmethod
     def public(record: Memory) -> dict[str, Any]:

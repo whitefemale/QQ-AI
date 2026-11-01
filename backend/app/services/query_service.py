@@ -9,6 +9,7 @@ from sqlalchemy import func, or_, select
 
 from app.budgets.service import BudgetService
 from app.core.config import Settings
+from app.core.csv import CSV_ROW_LIMIT
 from app.core.time import iso_utc, start_of_day_utc, utcnow
 from app.db.session import Database
 from app.models.account import Account
@@ -30,11 +31,9 @@ class MessageQueryService:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    async def list_messages(
-        self,
+    @staticmethod
+    def _message_conditions(
         *,
-        page: int = 1,
-        page_size: int = 50,
         account_id: str | None = None,
         group_id: str | None = None,
         conversation_id: str | None = None,
@@ -43,8 +42,7 @@ class MessageQueryService:
         search: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
-    ) -> dict[str, Any]:
-        size, offset = _page_bounds(page, page_size)
+    ) -> list[Any]:
         conditions: list[Any] = []
         if account_id:
             conditions.append(Message.account_id == account_id)
@@ -69,6 +67,33 @@ class MessageQueryService:
             conditions.append(Message.event_timestamp >= since)
         if until:
             conditions.append(Message.event_timestamp <= until)
+        return conditions
+
+    async def list_messages(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        account_id: str | None = None,
+        group_id: str | None = None,
+        conversation_id: str | None = None,
+        direction: str | None = None,
+        status: str | None = None,
+        search: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[str, Any]:
+        size, offset = _page_bounds(page, page_size)
+        conditions = self._message_conditions(
+            account_id=account_id,
+            group_id=group_id,
+            conversation_id=conversation_id,
+            direction=direction,
+            status=status,
+            search=search,
+            since=since,
+            until=until,
+        )
         async with self.database.session() as session:
             total = await session.scalar(select(func.count(Message.id)).where(*conditions))
             records = list(
@@ -120,6 +145,68 @@ class MessageQueryService:
             "page_size": size,
         }
 
+    async def export_messages(
+        self,
+        *,
+        account_id: str | None = None,
+        group_id: str | None = None,
+        conversation_id: str | None = None,
+        direction: str | None = None,
+        status: str | None = None,
+        search: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """按筛选条件导出消息元数据与正文；不含媒体 segments、提示词或凭证。"""
+        conditions = self._message_conditions(
+            account_id=account_id,
+            group_id=group_id,
+            conversation_id=conversation_id,
+            direction=direction,
+            status=status,
+            search=search,
+            since=since,
+            until=until,
+        )
+        async with self.database.session() as session:
+            records = list(
+                (
+                    await session.execute(
+                        select(Message)
+                        .where(*conditions)
+                        .order_by(Message.event_timestamp.asc())
+                        .limit(CSV_ROW_LIMIT + 1)
+                    )
+                ).scalars()
+            )
+            group_names = {item.id: item.name for item in (await session.execute(select(Group))).scalars()}
+            account_names = {item.id: item.display_name for item in (await session.execute(select(Account))).scalars()}
+        return [
+            {
+                "id": record.id,
+                "platform_message_id": record.platform_message_id,
+                "account_id": record.account_id,
+                "account_name": account_names.get(record.account_id),
+                "group_id": record.group_id,
+                "group_name": group_names.get(record.group_id or ""),
+                "conversation_id": record.conversation_id,
+                "conversation_type": record.conversation_type,
+                "sender_id": record.sender_id,
+                "sender_name": record.sender_name,
+                "is_self": record.is_self,
+                "direction": record.direction,
+                "content_text": record.content_text,
+                "event_timestamp": iso_utc(record.event_timestamp),
+                "processing_status": record.processing_status,
+                "trigger_reason": record.trigger_reason,
+                "model_latency_ms": record.model_latency_ms,
+                "input_tokens": record.input_tokens,
+                "output_tokens": record.output_tokens,
+                "created_at": iso_utc(record.created_at),
+            }
+            for record in records
+        ]
+
     async def list_outbox(
         self,
         *,
@@ -148,30 +235,38 @@ class MessageQueryService:
                 ).scalars()
             )
         return {
-            "items": [
-                {
-                    "id": record.id,
-                    "account_id": record.account_id,
-                    "group_id": record.group_id,
-                    "conversation_id": record.conversation_id,
-                    "conversation_type": record.conversation_type,
-                    "content": record.content,
-                    "status": record.status,
-                    "attempts": record.attempts,
-                    "max_attempts": record.max_attempts,
-                    "next_attempt_at": iso_utc(record.next_attempt_at),
-                    "last_error_code": record.last_error_code,
-                    "last_error_message": record.last_error_message,
-                    "sent_platform_message_id": record.sent_platform_message_id,
-                    "sent_at": iso_utc(record.sent_at),
-                    "created_at": iso_utc(record.created_at),
-                }
-                for record in records
-            ],
+            "items": [self.outbox_public(record) for record in records],
             "total": int(total or 0),
             "page": max(1, page),
             "page_size": size,
         }
+
+    @staticmethod
+    def outbox_public(record: OutboxMessage) -> dict[str, Any]:
+        return {
+            "id": record.id,
+            "account_id": record.account_id,
+            "group_id": record.group_id,
+            "conversation_id": record.conversation_id,
+            "conversation_type": record.conversation_type,
+            "origin_member_platform_user_id": record.origin_member_platform_user_id,
+            "reply_kind": record.reply_kind,
+            "content": record.content,
+            "status": record.status,
+            "attempts": record.attempts,
+            "max_attempts": record.max_attempts,
+            "next_attempt_at": iso_utc(record.next_attempt_at),
+            "last_error_code": record.last_error_code,
+            "last_error_message": record.last_error_message,
+            "sent_platform_message_id": record.sent_platform_message_id,
+            "sent_at": iso_utc(record.sent_at),
+            "created_at": iso_utc(record.created_at),
+        }
+
+    async def get_outbox(self, outbox_id: str) -> dict[str, Any] | None:
+        async with self.database.session() as session:
+            record = await session.get(OutboxMessage, outbox_id)
+            return self.outbox_public(record) if record is not None else None
 
     async def export_usage(
         self,
@@ -275,6 +370,7 @@ class MessageQueryService:
                     "currency": record.currency,
                     "status": record.status,
                     "error_code": record.error_code,
+                    "request_id": record.request_id,
                     "created_at": iso_utc(record.created_at),
                 }
                 for record in records

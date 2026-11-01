@@ -5,6 +5,7 @@ import {
   api,
   downloadApiFile,
   filenameFromDisposition,
+  getAdminToken,
   setAdminToken,
 } from '@/api/client'
 
@@ -70,6 +71,24 @@ describe('request timeout', () => {
     await downloadApiFile('/usage/export.csv', { timeoutMs: 1000 })
 
     expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
+describe('admin token storage', () => {
+  it('keeps the admin token in sessionStorage only', () => {
+    localStorage.clear()
+    sessionStorage.clear()
+
+    setAdminToken('admin-secret')
+
+    expect(sessionStorage.getItem('aiqf.adminToken')).toBe('admin-secret')
+    expect(localStorage.getItem('aiqf.adminToken')).toBeNull()
+    expect(localStorage.length).toBe(0)
+    expect(getAdminToken()).toBe('admin-secret')
+
+    setAdminToken(null)
+    expect(sessionStorage.getItem('aiqf.adminToken')).toBeNull()
+    expect(getAdminToken()).toBe('')
   })
 })
 

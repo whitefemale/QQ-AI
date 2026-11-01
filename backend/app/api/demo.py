@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from app.api.deps import get_actor, get_runtime
-from app.core.errors import AppError, ErrorCode
 from app.core.response import ok
 from app.runtime import AppRuntime
 from app.services.audit import write_audit
@@ -28,12 +27,3 @@ async def bootstrap_demo(
         actor=get_actor(request),
     )
     return ok(result)
-
-
-@router.post("/demo/reset-hint")
-async def demo_reset_hint() -> dict[str, Any]:
-    raise AppError(
-        ErrorCode.OPERATION_PLANNED,
-        "一键清空演示数据尚未实现。请在对应页面逐项删除演示账号、群与人格。",
-        status_code=501,
-    )

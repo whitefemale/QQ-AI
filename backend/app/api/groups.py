@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.api.deps import as_payload, get_runtime
+from app.api.deps import as_payload, get_actor, get_runtime, require_confirmation
 from app.core.response import ok
 from app.pipeline.policy import DEFAULT_RATE_LIMITS
 from app.runtime import AppRuntime
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query, Request
 
 router = APIRouter()
 
@@ -27,12 +27,35 @@ async def list_groups(
             "reply_modes": [
                 {
                     "value": "observe",
-                    "label": "仅观察",
-                    "note": "记录消息但不回复，适合先观察群氛围。",
+                    "label": "观察（默认）",
+                    "note": "只记录消息和做安全判断，不生成回复；新建与导入的群默认使用此模式。",
                 },
-                {"value": "mention_only", "label": "仅 @ 回复（推荐）", "note": "默认模式，最保守。"},
-                {"value": "keyword", "label": "关键词触发", "note": "命中关键词时回复。"},
-                {"value": "context", "label": "上下文参与", "note": "较主动，仍受频率与连续回复限制。"},
+                {
+                    "value": "mention_only",
+                    "label": "仅 @ 回复",
+                    "note": "仅在群成员 @ AI，或回复 AI 消息时生成回复。",
+                },
+                {
+                    "value": "manual_confirm",
+                    "label": "手动确认",
+                    "note": "触发条件与仅 @ 相同，但回复只进入待确认队列，绝不自动发送。",
+                },
+                {
+                    "value": "always",
+                    "label": "自动回复",
+                    "note": "对所有通过硬规则的消息生成回复，仍受预算、频率与输出审查限制。",
+                },
+                {
+                    "value": "keyword",
+                    "label": "关键词触发（高级）",
+                    "note": "命中关键词，或被 @ / 回复 AI 消息时生成回复。",
+                },
+                {
+                    "value": "context",
+                    "label": "上下文参与",
+                    "state": "planned",
+                    "note": "规划中，当前版本保存时会被拒绝；可用「仅 @ 回复」或「关键词触发」。",
+                },
                 {
                     "value": "scheduled",
                     "label": "定时话题",
@@ -41,7 +64,7 @@ async def list_groups(
                 },
             ],
             "rate_limit_defaults": DEFAULT_RATE_LIMITS,
-            "note": "群默认不启用；白名单为空时不会回复任何群。",
+            "note": ("群默认不启用；白名单为空时不会回复任何群。新建/导入群默认观察，已有群不会被自动改写回复模式。"),
             "llm_routing_note": (
                 "主/备用模型为可选的群级绑定；未绑定时使用全局默认 Provider。"
                 "备用模型仅在主模型发生可回退的调用错误时尝试一次，不会绕过预算、暂停或权限限制。"
@@ -87,10 +110,14 @@ async def import_connector_groups(
     data = as_payload(payload)
     account_id = str(data.get("account_id") or "")
     instance_id = str(data.get("instance_id") or "")
+    confirmed = data.get("confirm_self_user_id")
+    if confirmed is not None and not isinstance(confirmed, str):
+        confirmed = ""
+    await runtime.accounts.require_confirmed_identity(account_id, instance_id, confirmed)
     fetched = await runtime.accounts.fetch_connector_groups(account_id, instance_id)
     result = await runtime.groups.import_groups(account_id, fetched["groups"])
     result["fetched_at"] = fetched["fetched_at"]
-    result["note"] = "导入的群默认关闭 AI 回复；请逐群确认后再启用。"
+    result["note"] = "新导入的群默认关闭 AI 回复且为观察模式；已有群保留原配置，请逐群确认后再启用。"
     return ok(result)
 
 
@@ -109,8 +136,18 @@ async def update_group(
 
 
 @router.delete("/groups/{group_id}")
-async def delete_group(group_id: str, runtime: AppRuntime = Depends(get_runtime)) -> dict[str, Any]:
-    await runtime.groups.delete_group(group_id)
+async def delete_group(
+    group_id: str,
+    request: Request,
+    confirm: str | None = Query(default=None),
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    require_confirmation(
+        confirm,
+        "DELETE",
+        "删除群会删除群配置与记忆，并取消待发送消息；历史消息会保留但不再关联该群。请输入 DELETE 以确认。",
+    )
+    await runtime.groups.delete_group(group_id, actor=get_actor(request))
     return ok({"deleted": True, "id": group_id})
 
 

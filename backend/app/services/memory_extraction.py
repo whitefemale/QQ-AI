@@ -39,6 +39,7 @@ from app.services.memory_service import (
     validate_confidence,
     validate_memory_content,
     validate_memory_type,
+    validate_sensitivity,
 )
 
 logger = logging.getLogger(__name__)
@@ -421,6 +422,7 @@ class MemoryExtractionService:
             content = validate_memory_content(str(data.get("content", candidate.content)))
             memory_type = validate_memory_type(data.get("memory_type", candidate.memory_type))
             confidence = validate_confidence(data.get("confidence"), candidate.confidence)
+            sensitivity = validate_sensitivity(data.get("sensitivity", "normal"))
             existing_contents = (
                 await session.execute(
                     select(Memory.content).where(
@@ -448,7 +450,7 @@ class MemoryExtractionService:
                 content=content,
                 source_message_ids_json=list(candidate.source_message_ids_json or []),
                 confidence=confidence,
-                sensitivity="normal",
+                sensitivity=sensitivity,
                 is_pinned=False,
             )
             session.add(memory)

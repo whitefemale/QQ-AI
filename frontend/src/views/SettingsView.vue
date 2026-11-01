@@ -95,11 +95,21 @@
               <el-descriptions :column="2" border size="small" class="desktop-desc">
                 <el-descriptions-item label="桌面版本">{{ desktopInfo.desktopVersion || '—' }}</el-descriptions-item>
                 <el-descriptions-item label="后端版本">{{ desktopBackend.version || '—' }}</el-descriptions-item>
+                <el-descriptions-item label="后端进程健康">
+                  <StateTag :state="desktopHealthState" :label="desktopHealthLabel" />
+                  <div class="muted health-detail">{{ desktopHealthDetail }}</div>
+                </el-descriptions-item>
+                <el-descriptions-item label="最近健康检查">
+                  {{ formatTime(desktopBackend.health?.lastCheckAt) }}
+                </el-descriptions-item>
                 <el-descriptions-item label="服务地址">
                   <span class="mono">{{ desktopBackend.port ? `http://127.0.0.1:${desktopBackend.port}` : '未启动' }}</span>
                 </el-descriptions-item>
                 <el-descriptions-item label="进程模式">
                   {{ desktopBackend.managed ? '桌面版管理' : '外部后端（不管理）' }}
+                </el-descriptions-item>
+                <el-descriptions-item label="运行模式">
+                  {{ desktopInfo.packaged ? '安装版（自带运行时）' : '源码版（需本机 Python/Node）' }}
                 </el-descriptions-item>
                 <el-descriptions-item label="数据目录" :span="2">
                   <span class="mono desktop-path">{{ desktopInfo.dataDir }}</span>
@@ -115,21 +125,36 @@
                     <div class="option-label">启动时自动启动后端</div>
                     <div class="option-hint">关闭后，桌面窗口会停在启动页，由你手动启动。</div>
                   </div>
-                  <el-switch :model-value="desktopAutoStart" @change="onAutoStartChange" />
+                  <el-switch
+                    :model-value="desktopAutoStart"
+                    :loading="desktopToggleLoading.autoStartBackend"
+                    @change="onAutoStartChange"
+                  />
                 </div>
                 <div class="desktop-option">
                   <div>
                     <div class="option-label">关闭窗口时最小化到托盘</div>
                     <div class="option-hint">关闭窗口不退出应用；可从托盘菜单彻底退出并停止后端。</div>
+                    <div v-if="desktopInfo && !desktopTrayAvailable" class="option-warning">
+                      当前系统托盘不可用，关闭窗口将退出应用并停止受管后端。
+                    </div>
                   </div>
-                  <el-switch :model-value="desktopCloseToTray" @change="onCloseToTrayChange" />
+                  <el-switch
+                    :model-value="desktopCloseToTray"
+                    :loading="desktopToggleLoading.closeToTray"
+                    @change="onCloseToTrayChange"
+                  />
                 </div>
                 <div class="desktop-option">
                   <div>
                     <div class="option-label">启动时显示主窗口</div>
                     <div class="option-hint">关闭后桌面版在后台启动，可从托盘恢复窗口。</div>
                   </div>
-                  <el-switch :model-value="desktopShowWindow" @change="onShowWindowChange" />
+                  <el-switch
+                    :model-value="desktopShowWindow"
+                    :loading="desktopToggleLoading.showWindowOnStart"
+                    @change="onShowWindowChange"
+                  />
                 </div>
               </div>
 
@@ -160,7 +185,12 @@
                 <el-button @click="openDesktopReleasesAction">打开发布页</el-button>
               </div>
               <p class="form-tip">
-                桌面版不包含自动更新，请从 GitHub Releases 手动下载新版本。运行桌面版仍需本机安装 Python 3.12+ 与 Node 20+；退出桌面版会停止由它启动的后端。
+                <template v-if="desktopInfo.packaged">
+                  安装版自带后端与界面运行时，无需另装 Python/Node。桌面版不包含自动更新，请从 GitHub Releases 手动下载新版本；退出桌面版会停止由它启动的后端。卸载默认保留用户数据，数据删除方式见发布说明。
+                </template>
+                <template v-else>
+                  桌面版不包含自动更新，请从 GitHub Releases 手动下载新版本。源码版需本机安装 Python 3.12+ 与 Node 20+；退出桌面版会停止由它启动的后端。
+                </template>
               </p>
             </template>
           </template>
@@ -254,12 +284,17 @@
             <el-form-item label="媒体保留天数">
               <el-input-number v-model="retention.media_retention_days" :min="1" :max="3650" />
             </el-form-item>
+            <el-form-item label="记忆保留天数">
+              <el-input-number v-model="retention.memory_retention_days" :min="0" :max="3650" />
+              <span class="form-tip" style="margin-left: 10px">0 = 不自动删除；只清理超过期限且未固定的记忆。</span>
+            </el-form-item>
             <el-form-item>
               <el-button type="primary" :loading="savingRetention" @click="saveRetention">保存保留策略</el-button>
-              <el-button type="danger" plain :loading="retentionRunBusy" @click="runRetentionNow">立即清理一次</el-button>
+              <el-button type="danger" plain :loading="retentionRunBusy" @click="runRetentionNow">预览并立即清理</el-button>
             </el-form-item>
           </el-form>
           <p class="form-tip">
+            手动清理会先展示只读预览，再要求输入 CLEANUP 确认；预览不写审计也不改变数据。
             日志清理只处理 logs 目录下的 app.log.* 轮转文件，当前 app.log 始终保留。人格证据与记忆来源会先被擦除再删除消息；
             记忆正文本身不会被改写。所有清理动作写入本地审计。
           </p>
@@ -280,7 +315,7 @@
             :closable="false"
             show-icon
             title="备份仅包含 SQLite 数据库，不包含媒体文件、日志和加密密钥。"
-            description="凭证密文只有在使用同一 CREDENTIAL_ENCRYPTION_KEY 时才能解密。恢复前必须启用全局暂停。"
+            description="凭证密文只有在使用同一 CREDENTIAL_ENCRYPTION_KEY 时才能解密。恢复前必须启用全局暂停，并通过 Schema 兼容性校验；旧版本备份会被拒绝。"
           />
           <el-table v-loading="loading" :data="backups" size="small">
             <el-table-column label="文件" min-width="240">
@@ -309,8 +344,17 @@
               <template #default="{ row }">
                 <div class="row-actions">
                   <el-button size="small" :loading="verifyingId === row.id" @click="verifyBackup(row)">校验</el-button>
-                  <el-button size="small" @click="downloadBackup(row)">下载</el-button>
-                  <el-button size="small" type="warning" plain @click="previewRestore(row)">恢复预览</el-button>
+                  <el-button
+                    size="small"
+                    :loading="downloadingId === row.id"
+                    :disabled="downloadingId !== null && downloadingId !== row.id"
+                    @click="downloadBackup(row)"
+                  >
+                    下载
+                  </el-button>
+                  <el-button size="small" type="warning" plain :loading="previewingId === row.id" @click="previewRestore(row)">
+                    恢复预览
+                  </el-button>
                   <el-button size="small" type="danger" text @click="deleteBackup(row)">删除</el-button>
                 </div>
               </template>
@@ -338,6 +382,10 @@
               <li>人格成长默认隔离在当前群；跨群学习默认关闭。</li>
               <li>删除来源消息会清理对应特征证据，证据不足的稳定特征会降级。</li>
             </ul>
+            <div class="row-actions privacy-actions">
+              <el-button size="small" @click="router.push('/diagnostics')">打开诊断与日志</el-button>
+              <span class="muted">复制脱敏摘要在诊断页完成；本页不拼接诊断文本。</span>
+            </div>
           </div>
         </div>
       </el-tab-pane>
@@ -399,6 +447,63 @@
       </el-tab-pane>
     </el-tabs>
 
+    <el-dialog v-model="retentionDialog" title="清理预览" width="680px" :close-on-click-modal="false">
+      <template v-if="retentionPreview">
+        <el-alert
+          type="warning"
+          :closable="false"
+          show-icon
+          title="预览只统计，不删除数据；执行后无法恢复。"
+          description="实际清理先在当前时刻重新计算，执行期间写入的新消息不会影响本次统计的准确性；结果以运行为准。"
+        />
+        <el-descriptions :column="2" border size="small" class="mt">
+          <el-descriptions-item label="超期消息">
+            {{ retentionPreview.counts.messages_expired }} 条
+          </el-descriptions-item>
+          <el-descriptions-item label="本次将删除">
+            {{ retentionPreview.counts.messages_will_delete }} 条
+          </el-descriptions-item>
+          <el-descriptions-item label="超出批次上限">
+            <StateTag :state="retentionPreview.truncated ? 'warning' : 'available'" :label="retentionPreview.truncated ? '是，剩余留待下次' : '否'" />
+          </el-descriptions-item>
+          <el-descriptions-item label="剩余超期消息">
+            {{ retentionPreview.counts.messages_remaining_after }} 条
+          </el-descriptions-item>
+          <el-descriptions-item label="含媒体引用的超期消息">
+            {{ retentionPreview.counts.messages_with_media }} 条
+          </el-descriptions-item>
+          <el-descriptions-item label="过期媒体">{{ retentionPreview.counts.media_expired }} 个</el-descriptions-item>
+          <el-descriptions-item label="轮转日志">{{ retentionPreview.counts.logs }} 个文件</el-descriptions-item>
+          <el-descriptions-item label="超期长期记忆">
+            {{ retentionPreview.memory_retention_enabled ? `${retentionPreview.counts.memories} 条` : '未开启记忆清理' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="单次批次上限" :span="2">
+            {{ retentionPreview.limits.batch_size }} 条 × {{ retentionPreview.limits.max_batches }} 批 = 最多
+            {{ retentionPreview.limits.max_messages_per_run }} 条消息
+          </el-descriptions-item>
+        </el-descriptions>
+        <div class="warning-block">
+          <div v-for="(note, index) in retentionPreview.notes" :key="index">· {{ note }}</div>
+        </div>
+        <el-form label-width="120px" class="mt">
+          <el-form-item label="确认短语">
+            <el-input v-model="retentionConfirm" :placeholder="`请输入 ${CLEANUP_PHRASE}`" />
+          </el-form-item>
+        </el-form>
+      </template>
+      <template #footer>
+        <el-button @click="retentionDialog = false">取消</el-button>
+        <el-button
+          type="danger"
+          :disabled="!retentionPreview || retentionConfirm.trim() !== CLEANUP_PHRASE"
+          :loading="retentionRunBusy"
+          @click="doRetentionRun"
+        >
+          执行清理（不可恢复）
+        </el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="restoreDialog" title="恢复预览" width="660px" :close-on-click-modal="false">
       <template v-if="restorePreview">
         <el-alert
@@ -407,9 +512,28 @@
           show-icon
           :title="restorePreview.verification.checksum_ok && restorePreview.verification.integrity_ok ? '备份校验通过' : '备份校验失败，不能恢复'"
         />
+        <el-alert
+          v-if="!restorePreview.schema.restore_allowed"
+          class="mt"
+          type="error"
+          :closable="false"
+          show-icon
+          title="备份 Schema 与当前程序不兼容，已禁止恢复。"
+          :description="restorePreview.schema.message"
+        />
         <el-descriptions :column="2" border size="small" class="mt">
           <el-descriptions-item label="文件">{{ restorePreview.backup.filename }}</el-descriptions-item>
-          <el-descriptions-item label="Schema">{{ restorePreview.verification.schema_version }}</el-descriptions-item>
+          <el-descriptions-item label="Schema 状态">
+            <StateTag :state="restoreSchemaState" :label="restoreSchemaLabel" />
+          </el-descriptions-item>
+          <el-descriptions-item label="备份 Schema">
+            <span class="mono">{{ restorePreview.schema.backup_revision || '未知' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="当前程序 head">
+            <span class="mono">{{ restorePreview.schema.head_revision || '未知' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="备份程序版本">{{ restorePreview.app_version.backup || '未知' }}</el-descriptions-item>
+          <el-descriptions-item label="当前程序版本">{{ restorePreview.app_version.current || '未知' }}</el-descriptions-item>
           <el-descriptions-item label="当前账号数">{{ restorePreview.current_state.accounts }}</el-descriptions-item>
           <el-descriptions-item label="全局暂停">
             <StateTag :state="restorePreview.paused ? 'paused' : 'available'" :label="restorePreview.paused ? '已暂停（满足要求）' : '未暂停'" />
@@ -438,7 +562,7 @@
         <el-button @click="restoreDialog = false">取消</el-button>
         <el-button
           type="danger"
-          :disabled="!restorePreview || !restorePreview.paused || restoreConfirm !== restorePreview.confirm_phrase"
+          :disabled="!restorePreview || !restorePreview.paused || !restorePreview.schema.restore_allowed || restoreConfirm !== restorePreview.confirm_phrase"
           :loading="restoring"
           @click="doRestore"
         >
@@ -452,7 +576,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 
-import { api, errorMessage, getAdminToken } from '@/api/client'
+import { api, downloadApiFile, errorMessage } from '@/api/client'
 import {
   desktopErrorMessage,
   getDesktopInfo,
@@ -467,37 +591,23 @@ import {
   type DesktopFolderKind,
   type DesktopInfo,
 } from '@/api/desktop'
-import type { AppSettings, BackupRecord } from '@/api/types'
+import type {
+  AppSettings,
+  BackupRecord,
+  BackupRestorePreview,
+  BackupVerifyResult,
+  RetentionPreview,
+} from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
 import { useAppStore } from '@/stores/app'
+import { CLEANUP_PHRASE, DELETE_PHRASE, typedConfirm } from '@/utils/confirmation'
 import { formatBytes, formatTime, truncate } from '@/utils/format'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRouter } from 'vue-router'
 
 interface BackupView extends BackupRecord {
   manifest?: { note?: string; tables?: Record<string, number>; [key: string]: unknown }
-}
-
-interface VerifyResult {
-  filename: string
-  size_bytes: number
-  sha256: string
-  checksum_ok: boolean
-  integrity_ok: boolean
-  integrity_message: string
-  schema_version: string
-  tables: Record<string, number>
-  verified_at: string
-}
-
-interface RestorePreview {
-  backup: BackupView
-  verification: VerifyResult
-  current_state: { accounts: number }
-  requires_pause: boolean
-  paused: boolean
-  confirm_phrase: string
-  warnings: string[]
 }
 
 interface AuditRecord {
@@ -512,6 +622,7 @@ interface AuditRecord {
   created_at: string
 }
 
+const router = useRouter()
 const appStore = useAppStore()
 const activeTab = ref('general')
 const loading = ref(false)
@@ -525,6 +636,11 @@ const desktopShowWindow = ref(true)
 const desktopDataDir = ref('')
 const desktopBusy = ref(false)
 const savingDesktopDir = ref(false)
+const desktopToggleLoading = reactive({
+  autoStartBackend: false,
+  closeToTray: false,
+  showWindowOnStart: false,
+})
 let unsubscribeDesktop: (() => void) | null = null
 
 const EMPTY_BACKEND: DesktopBackendInfo = {
@@ -534,8 +650,35 @@ const EMPTY_BACKEND: DesktopBackendInfo = {
   managed: true,
   version: '',
   error: '',
+  health: {
+    state: 'unknown',
+    lastCheckAt: null,
+    latencyMs: null,
+    consecutiveFailures: 0,
+    message: '',
+  },
 }
 const desktopBackend = computed(() => desktopInfo.value?.backend ?? EMPTY_BACKEND)
+const desktopHealthState = computed(() => {
+  const state = desktopBackend.value.health.state
+  if (state === 'healthy') return 'available'
+  if (state === 'degraded') return 'warning'
+  return 'unknown'
+})
+const desktopHealthLabel = computed(() => {
+  const state = desktopBackend.value.health.state
+  if (state === 'healthy') return '正常'
+  if (state === 'degraded') return '连续失败但进程仍在'
+  return '未知'
+})
+const desktopHealthDetail = computed(() => {
+  const health = desktopBackend.value.health
+  const latency = health.latencyMs === null ? '' : ` · ${health.latencyMs} ms`
+  const failures = health.consecutiveFailures ? ` · 连续失败 ${health.consecutiveFailures} 次` : ''
+  const message = health.message ? ` · ${health.message}` : ''
+  return `后端 HTTP 可达性，不代表 QQ 连接或模型能力${latency}${failures}${message}`
+})
+const desktopTrayAvailable = computed(() => desktopInfo.value?.tray.available ?? true)
 const desktopState = computed(() => {
   const status = desktopBackend.value.status
   if (status === 'error') return 'error'
@@ -560,10 +703,14 @@ const retention = reactive({
   message_retention_days: 90,
   log_retention_days: 30,
   media_retention_days: 30,
+  memory_retention_days: 0,
 })
 const savingRetention = ref(false)
 const savingRetentionAuto = ref(false)
 const retentionRunBusy = ref(false)
+const retentionPreview = ref<RetentionPreview | null>(null)
+const retentionDialog = ref(false)
+const retentionConfirm = ref('')
 const retentionStatus = computed(() => settings.value?.retention_status ?? null)
 const retentionEnabled = computed(() => Boolean(retentionStatus.value?.auto.enabled))
 const retentionRunning = computed(() => Boolean(retentionStatus.value?.running))
@@ -594,7 +741,22 @@ const retentionCountsLabel = computed(() => {
     `日志 ${Number(counts.logs ?? 0)} 个文件`,
     `人格证据 ${Number(counts.persona_traits_updated ?? 0)} 项`,
     `记忆来源 ${Number(counts.memories_scrubbed ?? 0)} 条`,
+    `长期记忆 ${Number(counts.memories_deleted ?? 0)} 条`,
   ].join(' · ')
+})
+const restoreSchemaState = computed(() => {
+  const status = restorePreview.value?.schema.status
+  if (status === 'compatible') return 'available'
+  if (status === 'unknown') return 'warning'
+  if (status === 'incompatible') return 'error'
+  return 'unknown'
+})
+const restoreSchemaLabel = computed(() => {
+  const status = restorePreview.value?.schema.status
+  if (status === 'compatible') return '与当前程序兼容'
+  if (status === 'unknown') return '未知（可恢复但需谨慎）'
+  if (status === 'incompatible') return '不兼容，已禁止恢复'
+  return '未知'
 })
 const pauseReason = ref('管理员手动暂停')
 const pausing = ref(false)
@@ -603,8 +765,10 @@ const backups = ref<BackupView[]>([])
 const backupNote = ref('')
 const creatingBackup = ref(false)
 const verifyingId = ref<string | null>(null)
+const downloadingId = ref<string | null>(null)
+const previewingId = ref<string | null>(null)
 const restoreDialog = ref(false)
-const restorePreview = ref<RestorePreview | null>(null)
+const restorePreview = ref<BackupRestorePreview | null>(null)
 const restoreConfirm = ref('')
 const restoring = ref(false)
 
@@ -643,6 +807,7 @@ async function loadSettings(): Promise<void> {
     message_retention_days: Number(data.retention.message_retention_days ?? 90),
     log_retention_days: Number(data.retention.log_retention_days ?? 30),
     media_retention_days: Number(data.retention.media_retention_days ?? 30),
+    memory_retention_days: Number(data.retention.memory_retention_days ?? 0),
   })
   await appStore.refresh()
 }
@@ -674,17 +839,25 @@ function desktopToggleRef(key: DesktopToggleKey) {
 }
 
 async function changeDesktopSetting(key: DesktopToggleKey, value: boolean): Promise<void> {
+  if (desktopToggleLoading[key]) return
   const target = desktopToggleRef(key)
   const previous = target.value
   target.value = value
+  desktopToggleLoading[key] = true
   try {
     const result = await updateDesktopSettings({ [key]: value } as Partial<DesktopSettings>)
     if (desktopInfo.value) {
       desktopInfo.value = { ...desktopInfo.value, settings: result.settings }
     }
+    ElMessage.success('桌面版设置已保存。')
+    if (result.restartRequired) {
+      ElMessage.info('该设置将在重启桌面应用后生效。')
+    }
   } catch (err) {
     target.value = previous
     ElMessage.error(desktopErrorMessage(err))
+  } finally {
+    desktopToggleLoading[key] = false
   }
 }
 
@@ -842,7 +1015,7 @@ async function pauseForRestore(): Promise<void> {
     await appStore.pauseAll('恢复备份前的安全暂停')
     await loadSettings()
     if (restorePreview.value) {
-      restorePreview.value = await api<RestorePreview>(`/backups/${restorePreview.value.backup.id}/restore/preview`, {
+      restorePreview.value = await api<BackupRestorePreview>(`/backups/${restorePreview.value.backup.id}/restore/preview`, {
         method: 'POST',
       })
     }
@@ -899,20 +1072,32 @@ async function onAutoRetentionChange(value: string | number | boolean): Promise<
 }
 
 async function runRetentionNow(): Promise<void> {
+  retentionRunBusy.value = true
   try {
-    await ElMessageBox.confirm(
-      '立即清理会永久删除超过保留期限的本地消息、媒体与轮转日志，无法恢复。人格证据与记忆来源会先被擦除。确定继续？',
-      '立即清理',
-      { type: 'warning', confirmButtonText: '执行清理', cancelButtonText: '取消' },
-    )
-  } catch {
+    retentionPreview.value = await api<RetentionPreview>('/system/retention/preview')
+    retentionConfirm.value = ''
+    retentionDialog.value = true
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  } finally {
+    retentionRunBusy.value = false
+  }
+}
+
+async function doRetentionRun(): Promise<void> {
+  const preview = retentionPreview.value
+  if (!preview) return
+  if (retentionConfirm.value.trim() !== CLEANUP_PHRASE) {
+    ElMessage.warning(`请输入 ${CLEANUP_PHRASE} 以确认。`)
     return
   }
   retentionRunBusy.value = true
   try {
     const summary = await api<{ status: string; error: string | null }>('/system/retention/run', {
       method: 'POST',
+      body: { confirm: CLEANUP_PHRASE },
     })
+    retentionDialog.value = false
     await loadSettings()
     if (summary.status === 'completed') {
       ElMessage.success('本地清理已完成，详情见上方上次清理结果。')
@@ -948,7 +1133,7 @@ async function createBackup(): Promise<void> {
 async function verifyBackup(backup: BackupView): Promise<void> {
   verifyingId.value = backup.id
   try {
-    const result = await api<VerifyResult>(`/backups/${backup.id}/verify`, { method: 'POST' })
+    const result = await api<BackupVerifyResult>(`/backups/${backup.id}/verify`, { method: 'POST' })
     if (result.checksum_ok && result.integrity_ok) {
       ElMessage.success(`校验通过：${result.tables ? Object.keys(result.tables).length : 0} 张表。`)
     } else {
@@ -963,33 +1148,43 @@ async function verifyBackup(backup: BackupView): Promise<void> {
 }
 
 async function downloadBackup(backup: BackupView): Promise<void> {
+  if (downloadingId.value !== null) return
+  downloadingId.value = backup.id
   try {
-    const token = getAdminToken()
-    const headers: Record<string, string> = token ? { 'X-Admin-Token': token } : {}
-    const response = await fetch(`/api/backups/${backup.id}/download`, { headers })
-    if (!response.ok) {
-      throw new Error(`下载失败（HTTP ${response.status}）`)
-    }
-    const blob = await response.blob()
-    const url = URL.createObjectURL(blob)
+    const file = await downloadApiFile(`/backups/${backup.id}/download`, { timeoutMs: 120_000 })
+    const url = URL.createObjectURL(file.blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = backup.filename
+    link.download = file.filename || backup.filename
+    link.style.display = 'none'
+    document.body.appendChild(link)
     link.click()
-    URL.revokeObjectURL(url)
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    ElMessage.success(`已开始下载 ${file.filename || backup.filename}。`)
   } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : '下载失败')
+    ElMessage.error(errorMessage(err))
+  } finally {
+    downloadingId.value = null
   }
 }
 
 async function previewRestore(backup: BackupView): Promise<void> {
+  if (previewingId.value !== null) return
+  previewingId.value = backup.id
   try {
-    restorePreview.value = await api<RestorePreview>(`/backups/${backup.id}/restore/preview`, { method: 'POST' })
+    restorePreview.value = await api<BackupRestorePreview>(`/backups/${backup.id}/restore/preview`, {
+      method: 'POST',
+      timeoutMs: 60_000,
+    })
     restoreConfirm.value = ''
     restoreDialog.value = true
+    ElMessage.success('恢复预览已加载；尚未执行恢复。')
     await loadBackups()
   } catch (err) {
     ElMessage.error(errorMessage(err))
+  } finally {
+    previewingId.value = null
   }
 }
 
@@ -1021,17 +1216,14 @@ async function doRestore(): Promise<void> {
 }
 
 async function deleteBackup(backup: BackupView): Promise<void> {
+  const confirmed = await typedConfirm(
+    `删除备份「${backup.filename}」会同时删除备份文件与记录，之后无法再用它恢复数据库。`,
+    DELETE_PHRASE,
+    '删除备份',
+  )
+  if (!confirmed) return
   try {
-    await ElMessageBox.confirm(
-      `确定删除备份「${backup.filename}」？备份文件和记录都会删除。`,
-      '删除备份',
-      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-  try {
-    await api(`/backups/${backup.id}`, { method: 'DELETE' })
+    await api(`/backups/${backup.id}`, { method: 'DELETE', query: { confirm: DELETE_PHRASE } })
     ElMessage.success('备份已删除。')
     await loadBackups()
   } catch (err) {
@@ -1173,6 +1365,24 @@ onBeforeUnmount(() => {
   color: var(--app-muted);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.option-warning {
+  margin-top: 6px;
+  color: var(--app-warning, #b45309);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.health-detail {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.privacy-actions {
+  margin-top: 12px;
+  align-items: center;
 }
 
 .desktop-data-dir {

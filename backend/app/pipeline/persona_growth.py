@@ -13,11 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.core.config import Settings
 from app.core.errors import AppError, ErrorCode
@@ -54,6 +55,20 @@ _SENSITIVE_MARKERS = (
     "疾病",
     "手机号",
 )
+
+# 成长只能描述“我怎样表达”，绝不能改写平台安全边界。
+_RULE_OVERRIDE = re.compile(
+    r"(忽略|绕过|关闭|修改|覆盖|取消|禁用|无视).{0,20}"
+    r"(安全规则|系统提示|提示词|白名单|管理员权限|管理员|权限|预算|群规|工具权限|限制)"
+    r"|(ignore|bypass|disable|override|modify).{0,30}"
+    r"(safety|system prompt|whitelist|admin|permission|budget|group rule|tool access|restriction)",
+    re.IGNORECASE,
+)
+
+
+def _violates_rule_boundary(text: str) -> bool:
+    return bool(_RULE_OVERRIDE.search(str(text or "")))
+
 
 _GROWTH_SYSTEM = """你就是本地「AI 群友」平台中的这个 AI 群友本人。现在请以第一人称“我”回顾自己在最近对话中的表现，
 写出一份关于自己的、克制的自我认知提案。你不是分析别人的旁观者，而是在描述“我最近是怎样说话、怎样接话的”。
@@ -404,12 +419,27 @@ class PersonaGrowthService:
             diff_summary = event.diff_summary or ""
 
         if not approve:
+            proposed_keys = {
+                str(item.get("trait_key") or "")
+                for item in proposal.get("proposed_traits") or []
+                if isinstance(item, dict) and item.get("trait_key")
+            }
             async with self.database.session() as session:
                 current = await session.get(PersonaEvolutionEvent, event_id)
                 if current is not None:
                     current.result = "rejected"
                     current.error_message = "管理员拒绝了该成长提案。"
                     current.reviewed_at = utcnow()
+                    if proposed_keys:
+                        # 兼容历史版本曾经物化的候选行；新提案不会产生 staged trait。
+                        await session.execute(
+                            delete(PersonaTrait).where(
+                                PersonaTrait.persona_id == persona_id,
+                                PersonaTrait.trait_key.in_(proposed_keys),
+                                PersonaTrait.status == "candidate",
+                                PersonaTrait.locked_by_user.is_(False),
+                            )
+                        )
                     await session.commit()
             await write_audit(
                 self.database,
@@ -520,7 +550,7 @@ class PersonaGrowthService:
             persona = await session.get(Persona, persona_id)
             if persona is None:
                 raise AppError(ErrorCode.PERSONA_NOT_FOUND, "人格不存在。", status_code=404)
-            old_snapshot = await self.store._snapshot(session, persona)
+            old_stable = await self.store._snapshot(session, persona, trait_status="stable")
             if self_description:
                 if is_locked(persona, "self_description"):
                     skipped.append("self_description")
@@ -599,7 +629,7 @@ class PersonaGrowthService:
                         summary=(str(sanitized.get("summary") or "") or reason)[:500],
                         diff_summary=str(sanitized.get("diff_summary") or "")[:600] or None,
                         proposal_json=_proposal_for_storage(sanitized),
-                        old_state_json=_state_summary(old_snapshot),
+                        old_state_json=old_stable,
                         new_state_json={},
                         evidence_summary=_evidence_summary(evidence),
                         confidence=_max_confidence(sanitized),
@@ -625,6 +655,7 @@ class PersonaGrowthService:
             persona.last_growth_at = utcnow()
             await session.flush()
             new_snapshot = await self.store._snapshot(session, persona)
+            new_stable = await self.store._snapshot(session, persona, trait_status="stable")
             version = await self.store._add_version(
                 session,
                 persona,
@@ -638,8 +669,8 @@ class PersonaGrowthService:
                 reviewed = await session.get(PersonaEvolutionEvent, reviewed_event_id)
                 if reviewed is not None:
                     reviewed.result = "applied"
-                    reviewed.old_state_json = _state_summary(old_snapshot)
-                    reviewed.new_state_json = _state_summary(new_snapshot)
+                    reviewed.old_state_json = old_stable
+                    reviewed.new_state_json = new_stable
                     reviewed.diff_summary = str(sanitized.get("diff_summary") or "")[:600] or None
                     reviewed.reviewed_at = utcnow()
                     reviewed.error_message = ("跳过锁定字段：" + "、".join(skipped)) if skipped else None
@@ -656,8 +687,8 @@ class PersonaGrowthService:
                     summary=(str(sanitized.get("summary") or "") or "自我成长更新")[:500],
                     diff_summary=str(sanitized.get("diff_summary") or "")[:600] or None,
                     proposal_json=_proposal_for_storage(sanitized),
-                    old_state_json=_state_summary(old_snapshot),
-                    new_state_json=_state_summary(new_snapshot),
+                    old_state_json=old_stable,
+                    new_state_json=new_stable,
                     evidence_summary=_evidence_summary(evidence),
                     confidence=_max_confidence(sanitized),
                     result="applied",
@@ -712,42 +743,9 @@ class PersonaGrowthService:
         if self_description and is_locked(persona, "self_description"):
             locked_note = "待审核；锁定的自我描述不会被应用。"
         async with self.database.session() as session:
-            for trait in traits:
-                if is_locked(persona, trait.trait_key):
-                    continue
-                existing = await session.scalar(
-                    select(PersonaTrait).where(
-                        PersonaTrait.persona_id == persona.id,
-                        PersonaTrait.trait_key == trait.trait_key,
-                        PersonaTrait.source_scope == trait.source_scope,
-                    )
-                )
-                if existing is not None and (existing.status == "stable" or existing.locked_by_user):
-                    continue
-                now = utcnow()
-                if existing is None:
-                    session.add(
-                        PersonaTrait(
-                            persona_id=persona.id,
-                            trait_key=trait.trait_key,
-                            trait_value=trait.trait_value,
-                            category=trait.category,
-                            confidence=trait.confidence,
-                            evidence_count=len(trait.evidence_ids),
-                            evidence_message_ids_json=list(trait.evidence_ids),
-                            source_scope=trait.source_scope,
-                            status="candidate",
-                            first_observed_at=now,
-                            last_observed_at=now,
-                        )
-                    )
-                else:
-                    existing.trait_value = trait.trait_value
-                    existing.category = trait.category
-                    existing.confidence = trait.confidence
-                    existing.evidence_message_ids_json = list(trait.evidence_ids)
-                    existing.evidence_count = len(trait.evidence_ids)
-                    existing.last_observed_at = now
+            # 旧状态只取 stable 特征，绝不把历史 candidate 行算入待审核差异。
+            old_state = await self.store._snapshot(session, persona, trait_status="stable")
+            new_state = _project_traits(old_state, traits, self_description, persona)
             event = PersonaEvolutionEvent(
                 persona_id=persona.id,
                 batch_id=new_id(),
@@ -757,8 +755,8 @@ class PersonaGrowthService:
                 summary=(str(sanitized.get("summary") or "") or "人格成长提案")[:500],
                 diff_summary=str(sanitized.get("diff_summary") or "")[:600] or None,
                 proposal_json=_proposal_for_storage(sanitized),
-                old_state_json={},
-                new_state_json={},
+                old_state_json=old_state,
+                new_state_json=new_state,
                 evidence_summary=_evidence_summary(evidence),
                 confidence=_max_confidence(sanitized),
                 result="pending_review",
@@ -1004,12 +1002,16 @@ class PersonaGrowthService:
                 errors.append(f"特征 {key or index} 跨群引用证据，但未开启跨群学习。")
             if any(marker in value for marker in _SENSITIVE_MARKERS):
                 errors.append(f"特征 {key or index} 涉及不允许推断的敏感信息。")
+            if _violates_rule_boundary(value):
+                errors.append(f"特征 {key or index} 试图改写平台安全规则、权限或群规，已拒绝。")
             all_evidence.update(evidence_ids)
         if description:
             if not isinstance(description, str) or len(description.strip()) < 2 or len(description) > 1500:
                 errors.append("自我描述长度必须在 2~1500 字之间。")
             if any(marker in str(description) for marker in _SENSITIVE_MARKERS):
                 errors.append("自我描述涉及不允许推断的敏感信息。")
+            if _violates_rule_boundary(str(description)):
+                errors.append("自我描述试图改写平台安全规则、权限或群规，已拒绝。")
             description_conversations = {
                 evidence_map[item].conversation_id for item in all_evidence if item in evidence_map
             }
@@ -1122,6 +1124,65 @@ def _normalize_traits(
     return traits
 
 
+def _project_traits(
+    stable_snapshot: dict[str, Any],
+    traits: list[NormalizedTrait],
+    self_description: str | None,
+    persona: Persona,
+) -> dict[str, Any]:
+    """把批准后将生效的结果投影到 stable 快照；锁定字段/特征不进入新状态。"""
+    projected = deepcopy(stable_snapshot)
+    if self_description and not is_locked(persona, "self_description"):
+        projected["self_description"] = self_description
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in projected.get("traits") or []:
+        if isinstance(item, dict):
+            entries[(str(item.get("trait_key") or ""), str(item.get("source_scope") or "global"))] = dict(item)
+    for trait in traits:
+        if is_locked(persona, trait.trait_key):
+            continue
+        key = (trait.trait_key, trait.source_scope)
+        existing = entries.get(key)
+        if existing is not None and existing.get("locked_by_user"):
+            continue
+        if existing is not None:
+            evidence_ids = list(
+                dict.fromkeys(
+                    [
+                        *(existing.get("evidence_message_ids") or []),
+                        *trait.evidence_ids,
+                    ]
+                )
+            )
+            existing.update(
+                {
+                    "trait_value": trait.trait_value,
+                    "category": trait.category,
+                    "confidence": max(float(existing.get("confidence") or 0.0), trait.confidence),
+                    "evidence_count": len(evidence_ids),
+                    "evidence_message_ids": evidence_ids,
+                    "status": "stable",
+                }
+            )
+            entries[key] = existing
+        else:
+            entries[key] = {
+                "trait_key": trait.trait_key,
+                "trait_value": trait.trait_value,
+                "category": trait.category,
+                "confidence": trait.confidence,
+                "evidence_count": len(trait.evidence_ids),
+                "evidence_message_ids": list(trait.evidence_ids),
+                "source_scope": trait.source_scope,
+                "status": "stable",
+                "locked_by_user": False,
+                "first_observed_at": None,
+                "last_observed_at": None,
+            }
+    projected["traits"] = [entries[key] for key in sorted(entries)]
+    return projected
+
+
 def _proposed_description(sanitized: dict[str, Any]) -> str | None:
     value = sanitized.get("self_description")
     if not isinstance(value, str):
@@ -1165,12 +1226,4 @@ def _proposal_for_storage(sanitized: dict[str, Any]) -> dict[str, Any]:
         "summary": str(sanitized.get("summary") or "")[:500],
         "diff_summary": str(sanitized.get("diff_summary") or "")[:600] or None,
         "scope": sanitized.get("scope"),
-    }
-
-
-def _state_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "mode": snapshot.get("mode"),
-        "trait_count": len(snapshot.get("traits") or []),
-        "description_length": len(str(snapshot.get("self_description") or "")),
     }

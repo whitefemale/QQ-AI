@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import Settings
@@ -13,6 +13,8 @@ from app.core.time import get_zone, iso_utc, parse_hhmm, utcnow
 from app.db.session import Database
 from app.models.account import Account
 from app.models.group import Group, Member
+from app.models.memory import Memory, MemoryCandidate
+from app.models.message import Message, OutboxMessage
 from app.models.persona import Persona
 from app.models.provider import LLMProvider
 from app.pipeline.policy import DEFAULT_RATE_LIMITS, SUPPORTED_REPLY_MODES
@@ -76,6 +78,8 @@ def sanitize_rate_limits(value: Any) -> dict[str, int]:
         "max_replies_per_hour": (1, 1000),
         "max_replies_per_day": (1, 10000),
         "max_consecutive_replies": (1, 50),
+        "max_replies_per_member_per_hour": (1, 1000),
+        "max_replies_per_member_per_day": (1, 10000),
     }
     for key, (minimum, maximum) in bounds.items():
         if key not in value:
@@ -90,6 +94,22 @@ def sanitize_rate_limits(value: Any) -> dict[str, int]:
             ) from exc
         merged[key] = min(max(number, minimum), maximum)
     return merged
+
+
+def _optional_int(value: Any, label: str, minimum: int, maximum: int) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, f"{label}必须为整数。", status_code=400) from exc
+    if not minimum <= number <= maximum:
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            f"{label}必须在 {minimum} 到 {maximum} 之间。",
+            status_code=400,
+        )
+    return number
 
 
 class GroupService:
@@ -184,6 +204,10 @@ class GroupService:
             "enabled": group.enabled,
             "paused": group.paused,
             "reply_mode": group.reply_mode,
+            "max_reply_chars": group.max_reply_chars,
+            "max_reply_chars_effective": group.max_reply_chars or self.settings.max_reply_chars,
+            "context_message_limit": group.context_message_limit,
+            "context_message_limit_effective": group.context_message_limit or self.settings.context_message_limit,
             "persona_id": group.persona_id,
             "persona_name": persona_name,
             "llm_provider_id": group.llm_provider_id,
@@ -253,7 +277,8 @@ class GroupService:
             raise AppError(ErrorCode.VALIDATION_ERROR, "请选择账号。", status_code=400)
         if not platform_group_id:
             raise AppError(ErrorCode.VALIDATION_ERROR, "请填写群号。", status_code=400)
-        reply_mode = str(payload.get("reply_mode") or "mention_only")
+        # 新群默认观察：不会生成任何回复；已有群不会被静默改写。
+        reply_mode = str(payload.get("reply_mode") or "observe")
         if reply_mode not in SUPPORTED_REPLY_MODES:
             raise AppError(ErrorCode.VALIDATION_ERROR, "回复模式无效。", status_code=400)
         timezone_name = _clean(payload.get("timezone"), 64) or self.settings.default_timezone
@@ -272,6 +297,8 @@ class GroupService:
                 name=_clean(payload.get("name"), _MAX_NAME) or None,
                 enabled=_bool(payload.get("enabled"), False),
                 reply_mode=reply_mode,
+                max_reply_chars=_optional_int(payload.get("max_reply_chars"), "群级回复字数上限", 50, 2000),
+                context_message_limit=_optional_int(payload.get("context_message_limit"), "群级上下文条数", 1, 100),
                 persona_id=_clean(payload.get("persona_id"), 64) or None,
                 llm_provider_id=llm_provider_id,
                 llm_fallback_provider_id=llm_fallback_provider_id,
@@ -354,6 +381,12 @@ class GroupService:
                 if reply_mode not in SUPPORTED_REPLY_MODES:
                     raise AppError(ErrorCode.VALIDATION_ERROR, "回复模式无效。", status_code=400)
                 group.reply_mode = reply_mode
+            if "max_reply_chars" in payload:
+                group.max_reply_chars = _optional_int(payload.get("max_reply_chars"), "群级回复字数上限", 50, 2000)
+            if "context_message_limit" in payload:
+                group.context_message_limit = _optional_int(
+                    payload.get("context_message_limit"), "群级上下文条数", 1, 100
+                )
             if "persona_id" in payload:
                 persona_id = _clean(payload.get("persona_id"), 64) or None
                 await self._persona_name(session, persona_id)
@@ -407,12 +440,51 @@ class GroupService:
         )
         return data
 
-    async def delete_group(self, group_id: str) -> None:
+    async def delete_group(self, group_id: str, *, actor: str = "local-admin") -> None:
+        """删除群配置；历史消息保留但解除关联，待发送消息取消。"""
         async with self.database.session() as session:
             group = await session.get(Group, group_id)
             if group is None:
                 raise AppError(ErrorCode.NOT_FOUND, "群不存在或尚未登记。", status_code=404)
             name = group.name or group.platform_group_id
+            counts = {
+                "messages_retained": int(
+                    await session.scalar(select(func.count(Message.id)).where(Message.group_id == group_id)) or 0
+                ),
+                "memories_deleted": int(
+                    await session.scalar(select(func.count(Memory.id)).where(Memory.group_id == group_id)) or 0
+                ),
+                "memory_candidates_deleted": int(
+                    await session.scalar(
+                        select(func.count(MemoryCandidate.id)).where(MemoryCandidate.group_id == group_id)
+                    )
+                    or 0
+                ),
+            }
+            pending = int(
+                await session.scalar(
+                    select(func.count(OutboxMessage.id)).where(
+                        OutboxMessage.group_id == group_id,
+                        OutboxMessage.status.in_(("pending", "pending_approval")),
+                    )
+                )
+                or 0
+            )
+            if pending:
+                # 删除群后 group_id 会被置空；必须先取消，否则 worker 仍会按 conversation_id 发送。
+                await session.execute(
+                    update(OutboxMessage)
+                    .where(
+                        OutboxMessage.group_id == group_id,
+                        OutboxMessage.status.in_(("pending", "pending_approval")),
+                    )
+                    .values(
+                        status="cancelled",
+                        next_attempt_at=None,
+                        last_error_code=ErrorCode.POLICY_BLOCKED,
+                        last_error_message="群已删除，待发送消息已取消。",
+                    )
+                )
             await session.delete(group)
             await session.commit()
         await write_audit(
@@ -420,7 +492,8 @@ class GroupService:
             action="group.delete",
             target_type="group",
             target_id=group_id,
-            details={"name": name},
+            details={**counts, "outbox_cancelled": pending, "name": name},
+            actor=actor,
         )
 
     async def import_groups(self, account_id: str, groups: list[dict[str, Any]]) -> dict[str, Any]:
@@ -449,7 +522,7 @@ class GroupService:
                             platform_group_id=platform_id,
                             name=name,
                             enabled=False,
-                            reply_mode="mention_only",
+                            reply_mode="observe",
                             timezone=self.settings.default_timezone,
                         )
                     )

@@ -16,7 +16,7 @@ from app.models.governance import BudgetPolicy
 from app.models.group import Group
 from app.models.provider import LLMProvider, LLMUsage
 from app.pipeline.llm_gateway import LLMGateway
-from app.schemas.llm import ConnectionTestResult, LLMRequest, LLMResponse
+from app.schemas.llm import LLMRequest, LLMResponse
 from sqlalchemy import select
 
 
@@ -35,9 +35,6 @@ class ScriptedAdapter(BaseLLMProvider):
         if self.error is not None:
             raise self.error
         return LLMResponse(text="路由测试回复", input_tokens=7, output_tokens=5)
-
-    async def test_connection(self) -> ConnectionTestResult:
-        return ConnectionTestResult(ok=True, message="ok")
 
 
 @dataclass
@@ -84,9 +81,10 @@ async def build_routing_env(
             model="primary-model",
             enabled=primary_enabled,
         )
+        # 备用模型必须是真实类型：真实主模型失败时不允许回退到 Mock 伪装成功。
         fallback = LLMProvider(
             name="备用模型",
-            provider_type="mock",
+            provider_type="openai_compatible",
             model="fallback-model",
             enabled=fallback_enabled,
         )
@@ -285,6 +283,37 @@ async def test_budget_exhaustion_does_not_fall_back(
     assert excinfo.value.code == ErrorCode.BUDGET_EXCEEDED
     assert primary.calls == 0
     assert fallback.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_real_primary_failure_never_falls_back_to_mock(
+    database: Database,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = await build_routing_env(database, settings)
+    async with database.session() as session:
+        fallback = await session.get(LLMProvider, env.fallback.id)
+        assert fallback is not None
+        fallback.provider_type = "mock"
+        fallback.model = "mock-model"
+        await session.commit()
+
+    primary = ScriptedAdapter(
+        env.primary.id,
+        error=AppError(ErrorCode.LLM_TIMEOUT, "模拟主模型超时。", status_code=504),
+    )
+    fallback_adapter = ScriptedAdapter(env.fallback.id)
+    install_adapters(monkeypatch, env.gateway, {env.primary.id: primary, env.fallback.id: fallback_adapter})
+
+    with pytest.raises(AppError) as excinfo:
+        await env.gateway.generate(request(), group_id=env.group.id)
+
+    error = excinfo.value
+    assert error.code == ErrorCode.PROVIDER_FALLBACK_MOCK_FORBIDDEN
+    assert error.status_code == 409
+    assert primary.calls == 1
+    assert fallback_adapter.calls == 0
 
 
 @pytest.mark.asyncio

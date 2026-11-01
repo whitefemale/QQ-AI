@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
@@ -9,9 +10,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError, ErrorCode
-from app.core.time import utcnow
+from app.core.security import redact_text
+from app.core.time import iso_utc, utcnow
 from app.db.session import Database
 from app.models.group import Group
+from app.models.message import Message
 from app.models.persona import (
     DEFAULT_PERSONA_THRESHOLDS,
     Persona,
@@ -30,6 +33,218 @@ TRAIT_STATUSES = frozenset({"candidate", "stable", "rejected"})
 SELF_DESCRIPTION_FIELD = "self_description"
 _MAX_DESCRIPTION = 4000
 _MAX_OVERLAY = 2000
+
+# 预览、版本差异与保存共用同一组字段；不要在这里加入 traits。
+CONFIG_FIELDS: tuple[tuple[str, str], ...] = (
+    ("name", "名称"),
+    ("mode", "人格模式"),
+    ("template_key", "模板"),
+    ("self_description", "自我描述"),
+    ("authored_fields", "设定字段"),
+    ("system_prompt_overlay", "系统提示覆盖"),
+    ("growth_policy", "成长策略"),
+    ("growth_enabled", "启用自动成长"),
+    ("learning_scope", "学习范围"),
+    ("thresholds", "成长门槛"),
+    ("locked_fields", "锁定字段"),
+    ("enabled", "启用"),
+    ("notes", "备注"),
+)
+FIELD_LABELS = dict(CONFIG_FIELDS)
+_PERSONA_FIELDS = [field for field, _label in CONFIG_FIELDS]
+
+
+def project_persona_update(
+    snapshot: dict[str, Any],
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """纯投影：校验 PATCH 字段并返回更新后的快照，不读写数据库。
+
+    保存路径与预览接口都调用本函数，避免“预览一套、保存另一套”。
+    """
+    after = deepcopy(snapshot)
+    if "name" in payload:
+        name = _clean_str(payload.get("name"), 64)
+        if not name:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "人格名称不能为空。", status_code=400)
+        after["name"] = name
+    if "mode" in payload:
+        mode = str(payload.get("mode") or "").strip()
+        if mode not in PERSONA_MODES:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "人格模式无效。", status_code=400)
+        after["mode"] = mode
+    if "template_key" in payload:
+        template_key = _clean_str(payload.get("template_key"), 64) or None
+        if template_key is not None and template_key not in PERSONA_TEMPLATES:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "人格模板不存在。", status_code=400)
+        after["template_key"] = template_key
+    if after.get("mode") == "template" and after.get("template_key") not in PERSONA_TEMPLATES:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "模板模式必须选择有效模板。", status_code=400)
+    if "self_description" in payload:
+        after["self_description"] = _clean_str(payload.get("self_description"), _MAX_DESCRIPTION) or None
+    if "authored_fields" in payload:
+        after["authored_fields"] = _clean_authored(payload.get("authored_fields"))
+    if "system_prompt_overlay" in payload:
+        after["system_prompt_overlay"] = _clean_str(payload.get("system_prompt_overlay"), _MAX_OVERLAY)
+    if "growth_policy" in payload:
+        policy = str(payload.get("growth_policy") or "").strip()
+        if policy not in GROWTH_POLICIES:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "成长策略无效。", status_code=400)
+        after["growth_policy"] = policy
+    if "growth_enabled" in payload:
+        after["growth_enabled"] = bool(payload.get("growth_enabled"))
+    if "learning_scope" in payload:
+        scope = str(payload.get("learning_scope") or "").strip()
+        if scope not in LEARNING_SCOPES:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "学习范围无效。", status_code=400)
+        after["learning_scope"] = scope
+    if "thresholds" in payload:
+        after["thresholds"] = sanitize_thresholds(payload.get("thresholds"))
+    if "locked_fields" in payload:
+        after["locked_fields"] = _clean_list(payload.get("locked_fields"))
+    if "enabled" in payload:
+        after["enabled"] = bool(payload.get("enabled"))
+    if "notes" in payload:
+        after["notes"] = _clean_str(payload.get("notes"), 2000) or None
+
+    changes: list[dict[str, Any]] = []
+    for field in _PERSONA_FIELDS:
+        if field not in snapshot and field not in after:
+            continue
+        before_value = snapshot.get(field)
+        after_value = after.get(field)
+        if before_value != after_value:
+            changes.append(
+                {
+                    "field": field,
+                    "label": FIELD_LABELS[field],
+                    "before": _display_value(before_value),
+                    "after": _display_value(after_value),
+                }
+            )
+    return after, changes
+
+
+def apply_snapshot_config(persona: Persona, snapshot: dict[str, Any]) -> None:
+    """把投影结果写回 ORM 对象；只处理配置字段，特征由版本/成长流程管理。"""
+    if "name" in snapshot:
+        persona.name = str(snapshot.get("name") or persona.name)[:64]
+    if "mode" in snapshot:
+        persona.mode = str(snapshot.get("mode") or persona.mode)[:32]
+    if "template_key" in snapshot:
+        value = snapshot.get("template_key")
+        persona.template_key = str(value)[:64] if value else None
+    if "self_description" in snapshot:
+        value = snapshot.get("self_description")
+        persona.self_description = str(value)[:_MAX_DESCRIPTION] if value else None
+    if "authored_fields" in snapshot:
+        persona.authored_fields_json = _clean_authored(snapshot.get("authored_fields"))
+    if "system_prompt_overlay" in snapshot:
+        value = snapshot.get("system_prompt_overlay")
+        persona.system_prompt_overlay = str(value)[:_MAX_OVERLAY] if value else None
+    if "growth_policy" in snapshot:
+        persona.growth_policy = str(snapshot.get("growth_policy") or persona.growth_policy)[:16]
+    if "growth_enabled" in snapshot:
+        persona.growth_enabled = bool(snapshot.get("growth_enabled"))
+    if "learning_scope" in snapshot:
+        persona.learning_scope = str(snapshot.get("learning_scope") or persona.learning_scope)[:32]
+    if "thresholds" in snapshot:
+        persona.thresholds_json = sanitize_thresholds(snapshot.get("thresholds"))
+    if "locked_fields" in snapshot:
+        persona.locked_fields_json = _clean_list(snapshot.get("locked_fields"))
+    if "enabled" in snapshot:
+        persona.enabled = bool(snapshot.get("enabled"))
+    if "notes" in snapshot:
+        value = snapshot.get("notes")
+        persona.notes = str(value)[:2000] if value else None
+
+
+def snapshot_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """比较两个 `_snapshot` 结构；只返回可展示的差异，不包含消息正文。"""
+    fields: list[dict[str, Any]] = []
+    for field in _PERSONA_FIELDS:
+        # 旧版本快照可能缺少后来新增的字段；缺失时不做比较，避免伪造差异。
+        if field not in before or field not in after:
+            continue
+        old_value = before.get(field)
+        new_value = after.get(field)
+        if old_value != new_value:
+            fields.append(
+                {
+                    "field": field,
+                    "label": FIELD_LABELS[field],
+                    "before": _display_value(old_value),
+                    "after": _display_value(new_value),
+                }
+            )
+    old_traits = _trait_map(before)
+    new_traits = _trait_map(after)
+    added: list[dict[str, Any]] = []
+    changed: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    for key in sorted(set(old_traits) | set(new_traits)):
+        old_item = old_traits.get(key)
+        new_item = new_traits.get(key)
+        if old_item is None and new_item is not None:
+            added.append(new_item)
+        elif new_item is None and old_item is not None:
+            removed.append(old_item)
+        elif old_item != new_item:
+            changed.append({"trait_key": key[0], "source_scope": key[1], "before": old_item, "after": new_item})
+    scopes = sorted(
+        {str(item.get("source_scope") or "global") for item in [*added, *(entry["after"] for entry in changed)]}
+    )
+    impact = {
+        "field_changes": len(fields),
+        "traits_added": len(added),
+        "traits_changed": len(changed),
+        "traits_removed": len(removed),
+        "description_changed": any(item["field"] == "self_description" for item in fields),
+        "scopes": scopes,
+        "locked_fields": list(after.get("locked_fields") or before.get("locked_fields") or []),
+        "skipped_locked": [],
+    }
+    return {"fields": fields, "traits": {"added": added, "changed": changed, "removed": removed}, "impact": impact}
+
+
+def sanitized_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """版本详情不返回证据消息 ID；只保留可审核的配置与特征摘要。"""
+    result = deepcopy(snapshot)
+    traits = result.get("traits")
+    if isinstance(traits, list):
+        for item in traits:
+            if isinstance(item, dict):
+                item.pop("evidence_message_ids", None)
+    return result
+
+
+def _trait_map(snapshot: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in snapshot.get("traits") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("trait_key") or "")
+        scope = str(item.get("source_scope") or "global")
+        result[(key, scope)] = {
+            "trait_key": key,
+            "trait_value": str(item.get("trait_value") or ""),
+            "category": item.get("category"),
+            "confidence": round(float(item.get("confidence") or 0.0), 2),
+            "evidence_count": int(item.get("evidence_count") or 0),
+            "source_scope": scope,
+            "status": item.get("status"),
+        }
+    return result
+
+
+def _display_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): str(item)[:500] for key, item in list(value.items())[:30]}
+    if isinstance(value, list):
+        return [str(item)[:200] for item in value[:50]]
+    if isinstance(value, str):
+        return value[:2000]
+    return value
 
 
 def _scrub_evidence_refs(value: Any, message_ids: set[str]) -> tuple[Any, bool]:
@@ -147,6 +362,24 @@ def version_public(version: PersonaVersion) -> dict[str, Any]:
 
 
 def event_public(event: PersonaEvolutionEvent) -> dict[str, Any]:
+    old_state = dict(event.old_state_json or {})
+    new_state = dict(event.new_state_json or {})
+    proposal = dict(event.proposal_json or {})
+    diff = snapshot_diff(old_state, new_state)
+    impact = diff["impact"]
+    locked = {str(item) for item in (old_state.get("locked_fields") or new_state.get("locked_fields") or [])}
+    skipped: list[str] = []
+    for trait in proposal.get("proposed_traits") or []:
+        if not isinstance(trait, dict):
+            continue
+        key = str(trait.get("trait_key") or "")
+        if key and (key in locked or f"trait:{key}" in locked) and key not in skipped:
+            skipped.append(key)
+    if proposal.get("self_description") and (
+        SELF_DESCRIPTION_FIELD in locked or f"trait:{SELF_DESCRIPTION_FIELD}" in locked
+    ):
+        skipped.append(SELF_DESCRIPTION_FIELD)
+    impact["skipped_locked"] = skipped
     return {
         "id": event.id,
         "persona_id": event.persona_id,
@@ -163,7 +396,11 @@ def event_public(event: PersonaEvolutionEvent) -> dict[str, Any]:
         "error_message": event.error_message,
         "reviewed_at": event.reviewed_at.isoformat() if event.reviewed_at else None,
         "created_at": event.created_at.isoformat() if event.created_at else None,
-        "proposal": dict(event.proposal_json or {}),
+        "proposal": proposal,
+        "old_state": sanitized_snapshot(old_state),
+        "new_state": sanitized_snapshot(new_state),
+        "diff": diff,
+        "impact": impact,
     }
 
 
@@ -233,6 +470,110 @@ class PersonaStore:
             {"id": group.id, "name": group.name, "platform_group_id": group.platform_group_id} for group in groups
         ]
         return public
+
+    async def preview_update(self, persona_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """纯读取投影；不打开写事务、不写版本、不写审计。"""
+        async with self.database.session() as session:
+            persona = await session.get(Persona, persona_id)
+            if persona is None:
+                raise AppError(ErrorCode.PERSONA_NOT_FOUND, "人格不存在。", status_code=404)
+            before = await self._snapshot(session, persona)
+        after, changes = project_persona_update(before, payload)
+        before_view = sanitized_snapshot(before)
+        after_view = sanitized_snapshot(after)
+        return {
+            "saved": False,
+            "before": before_view,
+            "after": after_view,
+            "changes": changes,
+            "diff": snapshot_diff(before, after),
+            "note": "预览不会写入数据库；确认后仍需保存才会生成新版本。",
+        }
+
+    async def version_detail(self, persona_id: str, version_id: str) -> dict[str, Any]:
+        async with self.database.session() as session:
+            persona = await session.get(Persona, persona_id)
+            if persona is None:
+                raise AppError(ErrorCode.PERSONA_NOT_FOUND, "人格不存在。", status_code=404)
+            version = await session.get(PersonaVersion, version_id)
+            if version is None or version.persona_id != persona_id:
+                raise AppError(ErrorCode.NOT_FOUND, "人格版本不存在。", status_code=404)
+            current = await self._snapshot(session, persona)
+            public = version_public(version)
+            stored = dict(version.snapshot_json or {})
+        return {
+            **public,
+            "snapshot": sanitized_snapshot(stored),
+            "current": sanitized_snapshot(current),
+            "diff": snapshot_diff(current, stored),
+            "note": "差异方向为「当前状态 → 该版版本」；回滚会生成一个新版本，不会删除历史。",
+        }
+
+    async def event_evidence(self, persona_id: str, event_id: str) -> dict[str, Any]:
+        """只返回提案引用且属于该人格绑定群的消息预览。"""
+        async with self.database.session() as session:
+            event = await session.get(PersonaEvolutionEvent, event_id)
+            if event is None or event.persona_id != persona_id:
+                raise AppError(ErrorCode.NOT_FOUND, "人格成长事件不存在。", status_code=404)
+            proposal = dict(event.proposal_json or {})
+            ids: list[str] = []
+            for trait in proposal.get("proposed_traits") or []:
+                if not isinstance(trait, dict):
+                    continue
+                for item in trait.get("evidence_message_ids") or []:
+                    value = str(item)
+                    if value and value not in ids:
+                        ids.append(value)
+            if not ids:
+                return {"items": [], "note": "该提案没有可查看的消息证据。"}
+            bound = list((await session.execute(select(Group).where(Group.persona_id == persona_id))).scalars())
+            bound_ids = [group.id for group in bound]
+            group_names = {group.id: group.name for group in bound}
+            messages: dict[str, Message] = {}
+            if bound_ids:
+                rows = (
+                    await session.execute(
+                        select(Message).where(
+                            Message.id.in_(ids),
+                            Message.group_id.in_(bound_ids),
+                            Message.direction == "inbound",
+                            Message.is_self.is_(False),
+                        )
+                    )
+                ).scalars()
+                messages = {row.id: row for row in rows}
+        items: list[dict[str, Any]] = []
+        for message_id in ids:
+            record = messages.get(message_id)
+            if record is None:
+                items.append(
+                    {
+                        "id": message_id,
+                        "missing": True,
+                        "sender_name": None,
+                        "timestamp": None,
+                        "group_id": None,
+                        "group_name": None,
+                        "preview": "",
+                    }
+                )
+                continue
+            items.append(
+                {
+                    "id": record.id,
+                    "missing": False,
+                    "sender_name": record.sender_name,
+                    "timestamp": iso_utc(record.event_timestamp),
+                    "group_id": record.group_id,
+                    "group_name": group_names.get(record.group_id or ""),
+                    "preview": redact_text(record.content_text)[:200],
+                }
+            )
+        return {
+            "items": items,
+            "missing_count": sum(1 for item in items if item["missing"]),
+            "note": "只展示该人格绑定群范围内的证据消息；已删除或越权的消息标记为缺失。",
+        }
 
     async def create_persona(self, payload: dict[str, Any], *, actor: str = "local-admin") -> dict[str, Any]:
         name = _clean_str(payload.get("name"), 64)
@@ -320,50 +661,8 @@ class PersonaStore:
             if persona is None:
                 raise AppError(ErrorCode.PERSONA_NOT_FOUND, "人格不存在。", status_code=404)
             old_snapshot = await self._snapshot(session, persona)
-
-            if "name" in payload:
-                name = _clean_str(payload.get("name"), 64)
-                if not name:
-                    raise AppError(ErrorCode.VALIDATION_ERROR, "人格名称不能为空。", status_code=400)
-                persona.name = name
-            if "mode" in payload:
-                mode = str(payload.get("mode") or "").strip()
-                if mode not in PERSONA_MODES:
-                    raise AppError(ErrorCode.VALIDATION_ERROR, "人格模式无效。", status_code=400)
-                persona.mode = mode
-            if "template_key" in payload:
-                template_key = _clean_str(payload.get("template_key"), 64) or None
-                if template_key is not None and template_key not in PERSONA_TEMPLATES:
-                    raise AppError(ErrorCode.VALIDATION_ERROR, "人格模板不存在。", status_code=400)
-                persona.template_key = template_key
-            if persona.mode == "template" and persona.template_key not in PERSONA_TEMPLATES:
-                raise AppError(ErrorCode.VALIDATION_ERROR, "模板模式必须选择有效模板。", status_code=400)
-            if "self_description" in payload:
-                persona.self_description = _clean_str(payload.get("self_description"), _MAX_DESCRIPTION) or None
-            if "authored_fields" in payload:
-                persona.authored_fields_json = _clean_authored(payload.get("authored_fields"))
-            if "system_prompt_overlay" in payload:
-                persona.system_prompt_overlay = _clean_str(payload.get("system_prompt_overlay"), _MAX_OVERLAY)
-            if "growth_policy" in payload:
-                policy = str(payload.get("growth_policy") or "").strip()
-                if policy not in GROWTH_POLICIES:
-                    raise AppError(ErrorCode.VALIDATION_ERROR, "成长策略无效。", status_code=400)
-                persona.growth_policy = policy
-            if "growth_enabled" in payload:
-                persona.growth_enabled = bool(payload.get("growth_enabled"))
-            if "learning_scope" in payload:
-                scope = str(payload.get("learning_scope") or "").strip()
-                if scope not in LEARNING_SCOPES:
-                    raise AppError(ErrorCode.VALIDATION_ERROR, "学习范围无效。", status_code=400)
-                persona.learning_scope = scope
-            if "thresholds" in payload:
-                persona.thresholds_json = sanitize_thresholds(payload.get("thresholds"))
-            if "locked_fields" in payload:
-                persona.locked_fields_json = _clean_list(payload.get("locked_fields"))
-            if "enabled" in payload:
-                persona.enabled = bool(payload.get("enabled"))
-            if "notes" in payload:
-                persona.notes = _clean_str(payload.get("notes"), 2000) or None
+            projected, changes = project_persona_update(old_snapshot, payload)
+            apply_snapshot_config(persona, projected)
 
             await session.flush()
             new_snapshot = await self._snapshot(session, persona)
@@ -377,7 +676,10 @@ class PersonaStore:
             action="persona.update",
             target_type="persona",
             target_id=persona_id,
-            details={"changed_fields": sorted(payload.keys()), "old": _snapshot_summary(old_snapshot)},
+            details={
+                "changed_fields": [item["field"] for item in changes] or sorted(payload.keys()),
+                "old": _snapshot_summary(old_snapshot),
+            },
             actor=actor,
         )
         return public
@@ -622,15 +924,7 @@ class PersonaStore:
             if not version.restorable:
                 raise AppError(ErrorCode.PERSONA_VERSION_NOT_RESTORABLE, "该版本不可回滚。", status_code=409)
             snapshot = dict(version.snapshot_json or {})
-            persona.mode = str(snapshot.get("mode") or persona.mode)
-            persona.template_key = snapshot.get("template_key")
-            persona.self_description = snapshot.get("self_description")
-            persona.authored_fields_json = dict(snapshot.get("authored_fields") or {})
-            persona.system_prompt_overlay = snapshot.get("system_prompt_overlay")
-            persona.growth_policy = str(snapshot.get("growth_policy") or persona.growth_policy)
-            persona.learning_scope = str(snapshot.get("learning_scope") or persona.learning_scope)
-            persona.thresholds_json = dict(snapshot.get("thresholds") or {})
-            persona.locked_fields_json = list(snapshot.get("locked_fields") or [])
+            apply_snapshot_config(persona, snapshot)
             await session.execute(delete(PersonaTrait).where(PersonaTrait.persona_id == persona_id))
             for item in snapshot.get("traits") or []:
                 session.add(
@@ -779,11 +1073,23 @@ class PersonaStore:
             "updated_at": persona.updated_at.isoformat() if persona.updated_at else None,
         }
 
-    async def _snapshot(self, session: AsyncSession, persona: Persona) -> dict[str, Any]:
+    async def _snapshot(
+        self,
+        session: AsyncSession,
+        persona: Persona,
+        *,
+        trait_status: str | None = None,
+    ) -> dict[str, Any]:
+        query = select(PersonaTrait).where(PersonaTrait.persona_id == persona.id)
+        if trait_status:
+            query = query.where(PersonaTrait.status == trait_status)
         traits = list(
-            (await session.execute(select(PersonaTrait).where(PersonaTrait.persona_id == persona.id))).scalars()
+            (await session.execute(query.order_by(PersonaTrait.trait_key, PersonaTrait.source_scope))).scalars()
         )
         return {
+            "name": persona.name,
+            "enabled": persona.enabled,
+            "notes": persona.notes,
             "mode": persona.mode,
             "template_key": persona.template_key,
             "self_description": persona.self_description,

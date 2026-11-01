@@ -60,11 +60,15 @@ class ContextBuilder:
         message: CanonicalMessage,
         *,
         conversation_type: str,
+        group_id: str | None = None,
+        context_limit: int | None = None,
         media_notes: list[str] | None = None,
     ) -> ContextBundle:
-        limit = max(1, min(self.settings.context_message_limit, 100))
+        limit = max(1, min(context_limit or self.settings.context_message_limit, 100))
         records = await self.message_service.recent_for_conversation(
             message.conversation_id,
+            account_id=message.account_id,
+            group_id=group_id,
             limit=limit,
             before=message.timestamp,
         )

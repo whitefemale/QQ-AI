@@ -147,6 +147,17 @@ def test_localhost_http_endpoint_is_converted_to_ws() -> None:
     assert http_url == "http://127.0.0.1:3000"
 
 
+def test_https_endpoint_is_converted_to_wss() -> None:
+    ws_url, http_url = validate_onebot_endpoints("https://127.0.0.1:3001", "https://127.0.0.1:3000", allow_remote=False)
+    assert ws_url == "wss://127.0.0.1:3001"
+    assert http_url == "https://127.0.0.1:3000"
+
+
+def test_uppercase_https_endpoint_is_converted_to_wss() -> None:
+    ws_url, _ = validate_onebot_endpoints("HTTPS://127.0.0.1:3001", None, allow_remote=False)
+    assert ws_url == "wss://127.0.0.1:3001"
+
+
 def test_invalid_scheme_is_rejected() -> None:
     with pytest.raises(AppError) as excinfo:
         validate_onebot_endpoints("ftp://127.0.0.1:3001", None, allow_remote=False)
@@ -224,6 +235,9 @@ def _http_adapter(handler: Any) -> tuple[OneBot11Adapter, httpx.AsyncClient]:
     )
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     adapter._http = client
+    # 发送只发生在已验证身份的活动连接上；HTTP 动作测试直接构造该状态。
+    adapter.status = "online"
+    adapter._identity_verified = True
     return adapter, client
 
 
@@ -245,6 +259,28 @@ async def test_http_send_group_message() -> None:
         body = json.loads(request.content)
         assert body["group_id"] == 100001
         assert body["message"] == [{"type": "text", "data": {"text": "HTTP 回复"}}]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize("text", ["", "   ", "\n\t"])
+@pytest.mark.asyncio
+async def test_http_rejects_blank_text_before_any_request(text: str) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"status": "ok", "retcode": 0, "data": {"message_id": 1}})
+
+    adapter, client = _http_adapter(handler)
+    try:
+        assert adapter.last_sent_at is None
+        with pytest.raises(AppError) as excinfo:
+            await adapter.send_text("100001", text)
+        assert excinfo.value.code == ErrorCode.SEND_FAILED
+        assert excinfo.value.status_code == 400
+        assert captured == []
+        assert adapter.last_sent_at is None
     finally:
         await client.aclose()
 

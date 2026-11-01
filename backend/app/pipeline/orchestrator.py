@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -27,12 +26,16 @@ from app.pipeline.events import EventBus
 from app.pipeline.llm_gateway import LLMGateway, LLMResult
 from app.pipeline.media_context import build_media_notes
 from app.pipeline.outbox import OutboxService
+from app.pipeline.output_guard import inspect_output
 from app.pipeline.policy import (
     PolicyDecision,
     PolicyEngine,
     PolicyInput,
     build_rate_snapshot,
+    effective_context_limit,
+    effective_max_reply_chars,
     effective_self_id,
+    quiet_hours_decision,
 )
 from app.pipeline.prompt import BuiltPrompt, PromptBuilder
 from app.schemas.llm import LLMRequest, LLMToolCall
@@ -43,9 +46,6 @@ from app.services.persona_service import load_persona_snapshot
 from app.services.settings_store import get_global_pause
 
 logger = logging.getLogger(__name__)
-
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_MASS_MENTION = re.compile(r"@(?:全体成员|所有人|all(?![A-Za-z0-9_]))", re.IGNORECASE)
 
 
 @dataclass
@@ -229,6 +229,8 @@ class MessagePipeline:
             context = await self.context_builder.build(
                 message,
                 conversation_type=message.conversation_type,
+                group_id=group.id if group else None,
+                context_limit=effective_context_limit(group, self.settings.context_message_limit),
                 media_notes=notes,
             )
             persona = await load_persona_snapshot(
@@ -268,9 +270,11 @@ class MessagePipeline:
                 group=group,
                 record_id=internal_id,
             )
-            reply_text = sanitize_reply(generated, self.settings.max_reply_chars)
-            if not reply_text:
-                raise AppError(ErrorCode.LLM_INVALID_RESPONSE, "模型没有生成可发送的回复。", status_code=502)
+            inspection = inspect_output(
+                generated,
+                effective_max_reply_chars(group, self.settings.max_reply_chars),
+            )
+            reply_text = inspection.text
         except AppError as exc:
             await self._fail(internal_id, exc.code, exc.message, dry_run=dry_run)
             return PipelineResult(
@@ -291,6 +295,26 @@ class MessagePipeline:
                 detail=f"生成回复时发生异常（{type(exc).__name__}）。",
                 message_id=internal_id,
                 error_code=ErrorCode.INTERNAL_ERROR,
+            )
+
+        if inspection.blocked:
+            if not dry_run:
+                await self._mark_output_blocked(internal_id, inspection.reason, llm_result)
+            return PipelineResult(
+                False,
+                "intercept",
+                inspection.reason or "output_blocked",
+                detail="生成内容未通过输出审查，未发送、未入队。",
+                message_id=internal_id,
+                provider_id=llm_result.provider_id,
+                model=llm_result.model,
+                is_mock=llm_result.is_mock,
+                latency_ms=llm_result.latency_ms,
+                error_code={
+                    "sensitive_output": ErrorCode.SENSITIVE_OUTPUT,
+                    "empty_output": ErrorCode.OUTPUT_EMPTY,
+                    "output_too_long": ErrorCode.OUTPUT_TOO_LONG,
+                }.get(inspection.reason or "", ErrorCode.POLICY_BLOCKED),
             )
 
         if dry_run:
@@ -319,7 +343,7 @@ class MessagePipeline:
                 memory_ids=memory_selection.ids,
             )
 
-        blocked = await self._final_send_gate(group)
+        blocked = await self._final_send_gate(group, now)
         if blocked is not None:
             if record is not None:
                 await self.message_service.mark(
@@ -334,6 +358,7 @@ class MessagePipeline:
                 )
             return await self._decision_result(internal_id, blocked, dry_run=dry_run, llm_result=llm_result)
 
+        manual_confirm = group is not None and group.reply_mode == "manual_confirm"
         outbox = await self.outbox.enqueue(
             account_id=message.account_id,
             group_id=group.id if group else None,
@@ -341,19 +366,26 @@ class MessagePipeline:
             conversation_id=message.conversation_id,
             conversation_type=message.conversation_type,
             reply_to_message_id=message.message_id,
+            origin_member_platform_user_id=message.sender_id,
+            reply_kind="reply",
             content=reply_text,
             idempotency_key=f"reply:{internal_id}",
+            status="pending_approval" if manual_confirm else "pending",
         )
-        self.policy.record_reply(message.conversation_id)
-        final_status = "queued"
-        if send and adapter is not None:
-            sent = await self.outbox.send(outbox.id, adapter)
-            final_status = {
-                "sent": "replied",
-                "unknown": "send_unknown",
-                "failed": "send_failed",
-                "pending": "queued",
-            }.get(sent.status, "queued")
+        if manual_confirm:
+            # 待审核草稿不代表已回复：不增加连续回复计数，也不会自动发送。
+            final_status = "awaiting_approval"
+        else:
+            self.policy.record_reply(message.conversation_id)
+            final_status = "queued"
+            if send and adapter is not None:
+                sent = await self.outbox.send(outbox.id, adapter)
+                final_status = {
+                    "sent": "replied",
+                    "unknown": "send_unknown",
+                    "failed": "send_failed",
+                    "pending": "queued",
+                }.get(sent.status, "queued")
         if record is not None:
             await self.message_service.mark(
                 record.id,
@@ -383,6 +415,17 @@ class MessagePipeline:
                 "memory_count": len(memory_selection.items),
             },
         )
+        if manual_confirm:
+            self.events.publish(
+                "reply.awaiting_approval",
+                {
+                    "message_id": internal_id,
+                    "group_id": group.id if group else None,
+                    "outbox_id": outbox.id,
+                    "preview": reply_text[:120],
+                    "message": "该群为手动确认模式：回复已进入待确认队列，不会自动发送。",
+                },
+            )
         return PipelineResult(
             True,
             "replied" if final_status == "replied" else final_status,
@@ -456,6 +499,37 @@ class MessagePipeline:
             return PipelineResult(False, "error", "command_failed", detail=exc.message, error_code=exc.code)
         if not result.handled or not result.reply:
             return None
+        inspection = inspect_output(
+            result.reply,
+            effective_max_reply_chars(group, self.settings.max_reply_chars),
+        )
+        if inspection.blocked:
+            reason = inspection.reason or "output_blocked"
+            if message_id is not None:
+                await self.message_service.mark(
+                    message_id,
+                    status="intercepted",
+                    trigger_reason=reason,
+                    error_code=_output_error_code(reason),
+                    error_message="命令回复未通过输出审查，已阻止发送。",
+                )
+            self.events.publish(
+                "message.intercepted",
+                {
+                    "message_id": message_id,
+                    "reason": reason,
+                    "detail": "命令回复未通过输出审查，已阻止发送。",
+                },
+            )
+            return PipelineResult(
+                False,
+                "intercept",
+                reason,
+                detail="命令回复未通过输出审查，已阻止发送。",
+                message_id=message_id,
+                error_code=_output_error_code(reason),
+            )
+        command_reply = inspection.text
         outbox = await self.outbox.enqueue(
             account_id=message.account_id,
             group_id=group.id,
@@ -463,7 +537,9 @@ class MessagePipeline:
             conversation_id=message.conversation_id,
             conversation_type=message.conversation_type,
             reply_to_message_id=message.message_id,
-            content=result.reply,
+            origin_member_platform_user_id=message.sender_id,
+            reply_kind="command",
+            content=command_reply,
             idempotency_key=f"command:{message.account_id}:{message.message_id}",
         )
         status = "queued"
@@ -495,7 +571,7 @@ class MessagePipeline:
             True,
             "command" if status == "command" else status,
             result.reason or f"command_{parsed.name}",
-            reply=result.reply,
+            reply=command_reply,
             outbox_id=outbox.id,
             message_id=message_id,
         )
@@ -591,10 +667,11 @@ class MessagePipeline:
             return []
         return [tool.name for tool in self.tool_registry.list_tools()]
 
-    async def _final_send_gate(self, group: Group | None) -> PolicyDecision | None:
+    async def _final_send_gate(self, group: Group | None, now: datetime) -> PolicyDecision | None:
         pause = await get_global_pause(self.database)
         if pause.get("paused"):
             return PolicyDecision("intercept", "global_paused", "生成期间全局紧急暂停被启用，已阻止发送。")
+        current = group
         if group is not None:
             async with self.database.session() as session:
                 current = await session.get(Group, group.id)
@@ -602,7 +679,38 @@ class MessagePipeline:
                 return PolicyDecision("intercept", "group_disabled", "生成期间该群被关闭，已阻止发送。")
             if current.paused:
                 return PolicyDecision("intercept", "group_paused", "生成期间该群被暂停，已阻止发送。")
+        quiet = quiet_hours_decision(current, now)
+        if quiet is not None:
+            quiet.detail = "生成期间进入安静时段，已阻止发送。"
+            return quiet
         return None
+
+    async def _mark_output_blocked(
+        self,
+        message_id: str | None,
+        reason: str | None,
+        llm_result: LLMResult,
+    ) -> None:
+        code = _output_error_code(reason)
+        detail = {
+            "sensitive_output": "生成内容疑似包含密码、验证码、证件号或密钥，已阻止发送。",
+            "empty_output": "生成内容清洗后为空，已阻止发送。",
+        }.get(reason or "", "生成内容未通过输出审查，已阻止发送。")
+        if message_id is not None:
+            await self.message_service.mark(
+                message_id,
+                status="intercepted",
+                trigger_reason=reason,
+                error_code=code,
+                error_message=detail,
+                model_latency_ms=llm_result.latency_ms,
+                input_tokens=llm_result.response.input_tokens,
+                output_tokens=llm_result.response.output_tokens,
+            )
+        self.events.publish(
+            "message.intercepted",
+            {"message_id": message_id, "reason": reason, "detail": detail},
+        )
 
     async def _record_decision(self, message_id: str | None, decision: PolicyDecision) -> None:
         if message_id is None:
@@ -656,13 +764,9 @@ class MessagePipeline:
         logger.warning("流水线处理失败", extra={"error_code": code})
 
 
-def sanitize_reply(text: str, max_chars: int) -> str:
-    """回复审查：去控制字符、去除全员 @、限制长度，避免把 Markdown 原样发出。"""
-    cleaned = _CONTROL_CHARS.sub("", text or "")
-    cleaned = _MASS_MENTION.sub("大家", cleaned)
-    cleaned = re.sub(r"```[a-zA-Z0-9_-]*\n?", "", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    cleaned = redact_text(cleaned)
-    if len(cleaned) > max_chars:
-        cleaned = cleaned[: max(0, max_chars - 1)].rstrip() + "…"
-    return cleaned.strip()
+def _output_error_code(reason: str | None) -> str:
+    return {
+        "sensitive_output": ErrorCode.SENSITIVE_OUTPUT,
+        "empty_output": ErrorCode.OUTPUT_EMPTY,
+        "output_too_long": ErrorCode.OUTPUT_TOO_LONG,
+    }.get(reason or "", ErrorCode.POLICY_BLOCKED)

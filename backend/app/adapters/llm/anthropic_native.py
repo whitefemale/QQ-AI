@@ -7,22 +7,31 @@
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
 import httpx
 
 from app.adapters.llm.base import BaseLLMProvider
+from app.adapters.llm.http_utils import (
+    RETRY_SAFETY_NONE,
+    RETRY_SAFETY_SAFE,
+    http_error_details,
+    parse_retry_after,
+    transport_error,
+)
 from app.core.errors import AppError, ErrorCode
-from app.core.security import redact_text
-from app.schemas.llm import ConnectionTestResult, LLMRequest, LLMResponse, LLMToolCall
+from app.core.time import iso_utc, utcnow
+from app.schemas.llm import LLMModelInfo, LLMRequest, LLMResponse, LLMToolCall, ModelListResult
 
 DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
+MAX_MODEL_PAGES = 5
+MAX_MODEL_LIST_ITEMS = 500
 
 
 class AnthropicNativeProvider(BaseLLMProvider):
     provider_type = "anthropic_native"
+    supports_model_list = True
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -34,9 +43,14 @@ class AnthropicNativeProvider(BaseLLMProvider):
         if not self.api_key:
             raise AppError(ErrorCode.LLM_NOT_CONFIGURED, "尚未配置模型 API Key。", status_code=400)
 
-    def _get_client(self, timeout_seconds: float) -> httpx.AsyncClient:
+    def _require_model_list_config(self) -> None:
+        if not self.api_key:
+            raise AppError(ErrorCode.LLM_NOT_CONFIGURED, "尚未配置模型 API Key。", status_code=400)
+
+    def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=timeout_seconds)
+            # 不跟随重定向，避免 x-api-key 被转发到未配置的主机。
+            self._client = httpx.AsyncClient(follow_redirects=False)
         return self._client
 
     def _endpoint(self) -> str:
@@ -45,30 +59,42 @@ class AnthropicNativeProvider(BaseLLMProvider):
             return base + "/messages"
         return base + "/v1/messages"
 
+    def _models_endpoint(self) -> str:
+        base = (self.base_url or DEFAULT_BASE_URL).rstrip("/")
+        if base.endswith("/v1"):
+            return base + "/models"
+        return base + "/v1/models"
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "x-api-key": self.api_key or "",
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+
     def _classify_response(self, response: httpx.Response) -> AppError:
-        body = redact_text(response.text[:500]) if response.text else ""
-        details = {"status_code": response.status_code, "body": body}
-        lowered = body.lower()
+        retry_after = parse_retry_after(response.headers.get("retry-after"))
+        lowered = (response.text or "").lower()
         if response.status_code in (401, 403):
             return AppError(
                 ErrorCode.LLM_AUTH_FAILED,
                 "Anthropic API 认证失败，请检查 API Key。",
                 status_code=502,
-                details=details,
+                details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
             )
         if response.status_code == 404:
             return AppError(
                 ErrorCode.LLM_MODEL_NOT_FOUND,
                 "Anthropic 模型或接口不存在，请检查 Base URL 与模型 ID。",
                 status_code=502,
-                details=details,
+                details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
             )
         if response.status_code == 413 or (response.status_code == 400 and "prompt is too long" in lowered):
             return AppError(
                 ErrorCode.LLM_INVALID_RESPONSE,
                 "上下文超出 Anthropic 模型长度限制，请缩短上下文或更换模型。",
                 status_code=502,
-                details=details,
+                details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
             )
         if response.status_code == 400 and (
             "credit balance" in lowered or "insufficient" in lowered or "quota" in lowered
@@ -77,9 +103,22 @@ class AnthropicNativeProvider(BaseLLMProvider):
                 ErrorCode.LLM_QUOTA_EXCEEDED,
                 "Anthropic 账户额度不足，请检查账单与用量限额。",
                 status_code=502,
-                details=details,
+                details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
             )
         if response.status_code == 429:
+            details = http_error_details(
+                response,
+                retry_safety=RETRY_SAFETY_NONE,
+                retry_after_seconds=retry_after,
+            )
+            if "quota" in lowered or "insufficient" in lowered:
+                return AppError(
+                    ErrorCode.LLM_QUOTA_EXCEEDED,
+                    "Anthropic 账户额度不足，请检查账单与用量限额。",
+                    status_code=502,
+                    details=details,
+                )
+            details["retry_safety"] = RETRY_SAFETY_SAFE
             return AppError(
                 ErrorCode.LLM_RATE_LIMITED,
                 "Anthropic 请求被限流，请稍后再试或降低频率。",
@@ -92,7 +131,11 @@ class AnthropicNativeProvider(BaseLLMProvider):
                 ErrorCode.LLM_NETWORK_ERROR,
                 "Anthropic 服务暂时不可用。",
                 status_code=502,
-                details=details,
+                details=http_error_details(
+                    response,
+                    retry_safety=RETRY_SAFETY_SAFE,
+                    retry_after_seconds=retry_after,
+                ),
                 retryable=True,
             )
         if response.status_code == 400:
@@ -100,13 +143,13 @@ class AnthropicNativeProvider(BaseLLMProvider):
                 ErrorCode.LLM_INVALID_RESPONSE,
                 "Anthropic 请求参数无效，请检查模型 ID 与提示词长度。",
                 status_code=502,
-                details=details,
+                details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
             )
         return AppError(
             ErrorCode.LLM_INVALID_RESPONSE,
             "Anthropic 接口返回错误。",
             status_code=502,
-            details=details,
+            details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
         )
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
@@ -125,37 +168,16 @@ class AnthropicNativeProvider(BaseLLMProvider):
         if tools:
             payload["tools"] = tools
 
-        headers = {
-            "x-api-key": self.api_key or "",
-            "anthropic-version": ANTHROPIC_VERSION,
-            "content-type": "application/json",
-        }
-        client = self._get_client(request.timeout_seconds or self.timeout_seconds)
+        timeout = request.timeout_seconds or self.timeout_seconds
         try:
-            response = await client.post(self._endpoint(), json=payload, headers=headers)
-        except httpx.TimeoutException as exc:
-            raise AppError(
-                ErrorCode.LLM_TIMEOUT,
-                "Anthropic 模型请求超时。",
-                status_code=504,
-                retryable=True,
-            ) from exc
-        except httpx.TransportError as exc:
-            raise AppError(
-                ErrorCode.LLM_NETWORK_ERROR,
-                "无法连接 Anthropic 服务，请检查网络与 Base URL。",
-                status_code=502,
-                details={"reason": type(exc).__name__},
-                retryable=True,
-            ) from exc
+            response = await self._get_client().post(
+                self._endpoint(),
+                json=payload,
+                headers=self._headers(),
+                timeout=timeout,
+            )
         except httpx.HTTPError as exc:
-            raise AppError(
-                ErrorCode.LLM_NETWORK_ERROR,
-                "Anthropic 请求发生网络错误。",
-                status_code=502,
-                details={"reason": type(exc).__name__},
-                retryable=True,
-            ) from exc
+            raise transport_error(exc, label="Anthropic") from exc
 
         if response.status_code >= 400:
             raise self._classify_response(response)
@@ -208,37 +230,105 @@ class AnthropicNativeProvider(BaseLLMProvider):
             raw={"model": data.get("model"), "type": data.get("type")},
         )
 
-    async def test_connection(self) -> ConnectionTestResult:
-        started = time.perf_counter()
-        try:
-            response = await self.generate(
-                LLMRequest(
-                    model=self.model,
-                    messages=[{"role": "user", "content": "请只回复 OK"}],
-                    temperature=0,
-                    max_output_tokens=8,
-                    timeout_seconds=min(self.timeout_seconds, 20.0),
-                    purpose="test",
+    async def list_models(self, timeout_seconds: float | None = None) -> ModelListResult:
+        self._require_model_list_config()
+        timeout = timeout_seconds or self.timeout_seconds
+        models: list[LLMModelInfo] = []
+        seen: set[str] = set()
+        truncated = False
+        after_id: str | None = None
+        for page in range(MAX_MODEL_PAGES):
+            params: dict[str, Any] = {"limit": 100}
+            if after_id:
+                params["after_id"] = after_id
+            try:
+                response = await self._get_client().get(
+                    self._models_endpoint(),
+                    headers=self._headers(),
+                    params=params,
+                    timeout=timeout,
                 )
-            )
-        except AppError as exc:
-            return ConnectionTestResult(
-                ok=False,
-                message=exc.message,
-                error_code=exc.code,
-                details={
-                    **exc.details,
-                    "elapsed_ms": round((time.perf_counter() - started) * 1000),
-                },
-            )
-        return ConnectionTestResult(
-            ok=True,
-            message="Anthropic 模型连接成功。",
-            details={
-                "model": self.model,
-                "elapsed_ms": round((time.perf_counter() - started) * 1000),
-                "reply_preview": response.text[:80],
-            },
+            except httpx.HTTPError as exc:
+                raise transport_error(exc, label="Anthropic") from exc
+
+            if response.status_code in (404, 405, 501):
+                if models:
+                    return ModelListResult(
+                        supported=False,
+                        state="unsupported",
+                        models=models,
+                        current_model_listed=(self.model in seen) if self.model else None,
+                        truncated=True,
+                        fetched_at=iso_utc(utcnow()),
+                        message="Anthropic 在分页过程中未提供后续模型列表。",
+                    )
+                return ModelListResult(
+                    supported=False,
+                    state="unsupported",
+                    message="该 Anthropic 端点未提供模型列表接口，请手动填写模型 ID。",
+                )
+            if response.status_code >= 400:
+                raise self._classify_response(response)
+
+            try:
+                data = response.json()
+            except json.JSONDecodeError as exc:
+                raise AppError(
+                    ErrorCode.LLM_INVALID_RESPONSE,
+                    "Anthropic 模型列表返回了无法解析的响应。",
+                    status_code=502,
+                ) from exc
+            if not isinstance(data, dict):
+                raise AppError(
+                    ErrorCode.LLM_INVALID_RESPONSE,
+                    "Anthropic 模型列表响应格式无效。",
+                    status_code=502,
+                )
+            items = data.get("data")
+            if not isinstance(items, list):
+                raise AppError(
+                    ErrorCode.LLM_INVALID_RESPONSE,
+                    "Anthropic 模型列表响应缺少 data 数组。",
+                    status_code=502,
+                )
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                model_id = str(item.get("id") or "").strip()
+                if not model_id or model_id in seen:
+                    continue
+                if len(models) >= MAX_MODEL_LIST_ITEMS:
+                    truncated = True
+                    break
+                seen.add(model_id)
+                models.append(
+                    LLMModelInfo(
+                        id=model_id[:128],
+                        display_name=str(item.get("display_name") or model_id)[:200],
+                        created_at=str(item.get("created_at") or "")[:64] or None,
+                        owned_by=str(item.get("type") or "")[:128] or "anthropic",
+                    )
+                )
+            if truncated:
+                break
+            has_more = bool(data.get("has_more"))
+            last_id = data.get("last_id")
+            if not has_more or not isinstance(last_id, str) or not last_id:
+                break
+            # last_id 必然是刚读取过的模型 ID，不能因为它已在 seen 中而误判分页结束。
+            if last_id == after_id:
+                break
+            after_id = last_id
+            if page == MAX_MODEL_PAGES - 1:
+                truncated = True
+        return ModelListResult(
+            supported=True,
+            state="available",
+            models=models,
+            current_model_listed=(self.model in seen) if self.model else None,
+            truncated=truncated,
+            fetched_at=iso_utc(utcnow()),
+            note=("模型列表来自 Anthropic 实时接口；最多读取 5 页/500 条。是否可调用仍以实际生成测试为准。"),
         )
 
     async def close(self) -> None:

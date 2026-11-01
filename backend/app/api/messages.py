@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from app.api.deps import as_payload, get_actor, get_runtime
+from app.core.csv import build_csv_bytes
 from app.core.errors import AppError, ErrorCode
 from app.core.response import ok
 from app.core.time import ensure_utc, iso_utc, utcnow
@@ -35,6 +36,46 @@ USAGE_CSV_COLUMNS = [
     "estimated_cost",
     "currency",
     "request_id",
+]
+
+MESSAGE_CSV_COLUMNS = [
+    "id",
+    "platform_message_id",
+    "account_id",
+    "account_name",
+    "group_id",
+    "group_name",
+    "conversation_id",
+    "conversation_type",
+    "sender_id",
+    "sender_name",
+    "is_self",
+    "direction",
+    "content_text",
+    "event_timestamp",
+    "processing_status",
+    "trigger_reason",
+    "model_latency_ms",
+    "input_tokens",
+    "output_tokens",
+    "created_at",
+]
+
+MEMORY_CSV_COLUMNS = [
+    "id",
+    "account_id",
+    "group_id",
+    "member_id",
+    "memory_type",
+    "content",
+    "sensitivity",
+    "confidence",
+    "is_pinned",
+    "expires_at",
+    "source_message_ids",
+    "created_at",
+    "updated_at",
+    "auto_injectable",
 ]
 
 
@@ -81,6 +122,68 @@ async def list_messages(
     )
 
 
+@router.get("/messages/export.csv")
+async def export_messages_csv(
+    request: Request,
+    account_id: str | None = None,
+    group_id: str | None = None,
+    conversation_id: str | None = None,
+    direction: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    runtime: AppRuntime = Depends(get_runtime),
+) -> Response:
+    """导出消息记录；包含消息正文与发送者标识，不含媒体、提示词或任何凭证。"""
+    if direction and direction not in {"inbound", "outbound"}:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "direction 必须为 inbound 或 outbound。", status_code=400)
+    if since is not None and until is not None and ensure_utc(since) > ensure_utc(until):
+        raise AppError(ErrorCode.VALIDATION_ERROR, "导出开始时间不能晚于结束时间。", status_code=400)
+    rows = await runtime.queries.export_messages(
+        account_id=account_id,
+        group_id=group_id,
+        conversation_id=conversation_id,
+        direction=direction,
+        status=status,
+        search=search,
+        since=since,
+        until=until,
+    )
+    content = build_csv_bytes(
+        MESSAGE_CSV_COLUMNS,
+        [[row.get(column) for column in MESSAGE_CSV_COLUMNS] for row in rows],
+    )
+    filename = f"messages-{utcnow().strftime('%Y%m%d-%H%M%S')}.csv"
+    await write_audit(
+        runtime.database,
+        action="message.export",
+        target_type="message",
+        details={
+            "format": "csv",
+            "rows": len(rows),
+            "account_id": account_id,
+            "group_id": group_id,
+            "conversation_id": conversation_id,
+            "direction": direction,
+            "status": status,
+            "since": iso_utc(since),
+            "until": iso_utc(until),
+            "has_search": bool(search and search.strip()),
+        },
+        actor=get_actor(request),
+    )
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @router.get("/outbox")
 async def list_outbox(
     page: int = Query(1, ge=1),
@@ -112,6 +215,57 @@ async def dispatch_due(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, 
         )
     processed = await runtime.outbox.send_due(runtime.manager.resolve)
     return ok({"processed": processed, "note": "仅重试明确可重试的失败消息；未知状态不会重发。"})
+
+
+@router.post("/outbox/{outbox_id}/approve")
+async def approve_outbox(
+    outbox_id: str,
+    request: Request,
+    payload: dict[str, Any] | None = Body(default=None),
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    """人工批准待确认回复；可编辑内容，重新审查后立即尝试发送一次。"""
+    data = as_payload(payload)
+    record = await runtime.outbox.get(outbox_id)
+    if record is None:
+        raise AppError(ErrorCode.NOT_FOUND, "发送队列消息不存在。", status_code=404)
+    adapter = runtime.manager.resolve(record.account_id, record.adapter_instance_id)
+    content = data.get("content") if "content" in data else None
+    updated = await runtime.outbox.approve(
+        outbox_id,
+        content=None if content is None else str(content),
+        adapter=adapter,
+        actor=get_actor(request),
+    )
+    item = await runtime.queries.get_outbox(updated.id)
+    return ok(
+        {
+            "item": item,
+            "sent_immediately": updated.status == "sent",
+            "note": (
+                "已批准并尝试发送。"
+                if updated.status == "sent"
+                else "已批准，但当前没有可用连接；消息保留在发送队列，由队列 worker 按正常规则处理。"
+            ),
+        }
+    )
+
+
+@router.post("/outbox/{outbox_id}/reject")
+async def reject_outbox(
+    outbox_id: str,
+    request: Request,
+    payload: dict[str, Any] | None = Body(default=None),
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    data = as_payload(payload)
+    updated = await runtime.outbox.reject(
+        outbox_id,
+        reason=str(data.get("reason") or "") or None,
+        actor=get_actor(request),
+    )
+    item = await runtime.queries.get_outbox(updated.id)
+    return ok({"item": item, "status": updated.status})
 
 
 @router.get("/usage")
@@ -422,7 +576,12 @@ async def approve_memory_candidate(
         },
         actor=get_actor(request),
     )
-    result["note"] = "已批准为普通敏感度正式记忆；是否注入仍取决于群是否开启长期记忆、记忆是否过期及当前消息相关性。"
+    if result["memory"]["sensitivity"] == "sensitive":
+        result["note"] = "已批准为敏感记忆；敏感记忆不会自动注入提示词，仅可在控制台查看与管理。"
+    else:
+        result["note"] = (
+            "已批准为普通敏感度正式记忆；是否注入仍取决于群是否开启长期记忆、记忆是否过期及当前消息相关性。"
+        )
     return ok(result)
 
 
@@ -443,6 +602,128 @@ async def reject_memory_candidate(
     )
     result["note"] = "候选已拒绝，不会写入正式记忆；记录保留用于审计。"
     return ok(result)
+
+
+@router.get("/memories/export.csv")
+async def export_memories_csv(
+    request: Request,
+    account_id: str | None = None,
+    group_id: str | None = None,
+    member_id: str | None = None,
+    memory_type: str | None = None,
+    search: str | None = None,
+    include_expired: bool = True,
+    include_sensitive: bool = False,
+    runtime: AppRuntime = Depends(get_runtime),
+) -> Response:
+    """导出记忆 CSV；默认排除 sensitive 记忆，审计不记录正文。"""
+    records = await runtime.memories.export_rows(
+        account_id=account_id,
+        group_id=group_id,
+        member_id=member_id,
+        memory_type=memory_type,
+        search=search,
+        include_expired=include_expired,
+        include_sensitive=include_sensitive,
+    )
+    rows = []
+    for record in records:
+        public = runtime.memories.public(record)
+        rows.append(
+            [
+                public["id"],
+                public["account_id"],
+                public["group_id"],
+                public["member_id"],
+                public["memory_type"],
+                public["content"],
+                public["sensitivity"],
+                public["confidence"],
+                public["is_pinned"],
+                public["expires_at"],
+                ";".join(public["source_message_ids"]),
+                public["created_at"],
+                public["updated_at"],
+                public["auto_injectable"],
+            ]
+        )
+    content = build_csv_bytes(MEMORY_CSV_COLUMNS, rows)
+    filename = f"memories-{utcnow().strftime('%Y%m%d-%H%M%S')}.csv"
+    await write_audit(
+        runtime.database,
+        action="memory.export",
+        target_type="memory",
+        details={
+            "format": "csv",
+            "rows": len(records),
+            "include_sensitive": include_sensitive,
+            "include_expired": include_expired,
+            "account_id": account_id,
+            "group_id": group_id,
+            "member_id": member_id,
+            "memory_type": memory_type,
+            "has_search": bool(search and search.strip()),
+        },
+        actor=get_actor(request),
+    )
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Memory-Export-Includes-Sensitive": "true" if include_sensitive else "false",
+        },
+    )
+
+
+@router.post("/memories/cleanup")
+async def cleanup_memories(
+    request: Request,
+    payload: dict[str, Any] | None = Body(default=None),
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    data = as_payload(payload)
+    mode = str(data.get("mode") or "expired")
+    days = data.get("days")
+    try:
+        days_value = None if days is None else int(days)
+    except (TypeError, ValueError) as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "days 必须是整数。", status_code=400) from exc
+    dry_run = bool(data.get("dry_run", False))
+    if not dry_run and str(data.get("confirm") or "") != "CLEANUP":
+        raise AppError(
+            ErrorCode.CONFIRMATION_REQUIRED,
+            "真实清理会永久删除记忆，请输入 CLEANUP 以确认。",
+            status_code=400,
+        )
+    result = await runtime.memories.cleanup(
+        mode=mode,
+        days=days_value,
+        dry_run=dry_run,
+    )
+    await write_audit(
+        runtime.database,
+        action="memory.cleanup",
+        target_type="memory",
+        details={
+            "mode": result["mode"],
+            "days": days,
+            "dry_run": dry_run,
+            "matched": result["matched"],
+            "deleted": result["deleted"],
+            "only_unpinned": True,
+        },
+        actor=get_actor(request),
+    )
+    result["note"] = "仅统计，未删除任何记忆。" if dry_run else "已删除未固定的匹配记忆；固定记忆不会被清理。"
+    return ok(result)
+
+
+@router.get("/memories/{memory_id}/sources")
+async def get_memory_sources(memory_id: str, runtime: AppRuntime = Depends(get_runtime)) -> dict[str, Any]:
+    return ok(await runtime.memories.sources(memory_id))
 
 
 @router.get("/memories/{memory_id}")
@@ -526,13 +807,13 @@ async def policy_explain(runtime: AppRuntime = Depends(get_runtime)) -> dict[str
                 "全局紧急暂停",
                 "群静默时段",
                 "成员静音",
-                "冷却与频率限制",
+                "冷却与频率限制（群级与每人）",
                 "群命令",
-                "触发决策（默认仅 @）",
+                "触发决策（新建群默认观察；手动确认模式只入待审队列）",
                 "上下文与人格提示词",
                 "模型调用与工具轮次",
-                "回复审查",
-                "发送队列与幂等发送",
+                "回复审查（敏感内容、长度、空文本）",
+                "发送队列与幂等发送（待审核消息绝不自动发送）",
             ],
             "global_pause": pause,
             "now": iso_utc(utcnow()),

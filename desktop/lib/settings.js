@@ -1,5 +1,7 @@
 'use strict'
 
+const path = require('node:path')
+
 /** 桌面版设置的默认值。设置只保存在 Electron userData 中，不入数据库、不上传。 */
 const DEFAULT_SETTINGS = Object.freeze({
   autoStartBackend: true,
@@ -7,10 +9,12 @@ const DEFAULT_SETTINGS = Object.freeze({
   showWindowOnStart: true,
   firstRunCompleted: false,
   dataDir: '',
+  connectorsDir: '',
 })
 
 const BOOLEAN_KEYS = ['autoStartBackend', 'closeToTray', 'showWindowOnStart', 'firstRunCompleted']
-const ALLOWED_KEYS = new Set([...BOOLEAN_KEYS, 'dataDir'])
+const PATH_KEYS = ['dataDir', 'connectorsDir']
+const ALLOWED_KEYS = new Set([...BOOLEAN_KEYS, ...PATH_KEYS])
 const MAX_DATA_DIR_LENGTH = 1000
 
 function normalizeSettings(raw) {
@@ -21,6 +25,14 @@ function normalizeSettings(raw) {
   }
   if (typeof source.dataDir === 'string' && source.dataDir.length <= MAX_DATA_DIR_LENGTH) {
     result.dataDir = source.dataDir.trim()
+  }
+  // 连接器根目录只接受空值（仓库默认）或绝对路径；相对路径会让后端解析结果漂移。
+  if (
+    typeof source.connectorsDir === 'string' &&
+    source.connectorsDir.length <= MAX_DATA_DIR_LENGTH &&
+    (source.connectorsDir.trim() === '' || path.isAbsolute(source.connectorsDir.trim()))
+  ) {
+    result.connectorsDir = source.connectorsDir.trim()
   }
   return result
 }
@@ -35,10 +47,14 @@ function validatePatch(patch) {
     if (!ALLOWED_KEYS.has(key)) {
       throw new Error(`不支持的设置项：${key}`)
     }
-    if (key === 'dataDir') {
-      if (typeof value !== 'string') throw new Error('dataDir 必须是字符串。')
-      if (value.length > MAX_DATA_DIR_LENGTH) throw new Error('dataDir 过长。')
-      clean[key] = value.trim()
+    if (PATH_KEYS.includes(key)) {
+      if (typeof value !== 'string') throw new Error(`${key} 必须是字符串。`)
+      if (value.length > MAX_DATA_DIR_LENGTH) throw new Error(`${key} 过长。`)
+      const trimmed = value.trim()
+      if (key === 'connectorsDir' && trimmed !== '' && !path.isAbsolute(trimmed)) {
+        throw new Error('connectorsDir 必须是绝对路径或空值。')
+      }
+      clean[key] = trimmed
     } else {
       if (typeof value !== 'boolean') throw new Error(`${key} 必须是布尔值。`)
       clean[key] = value

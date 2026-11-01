@@ -323,9 +323,15 @@ async def test_review_policy_creates_candidate_then_approval_applies(
     assert outcome.applied is False
     detail = await env.store.detail(env.persona_id)
     assert detail["self_description"] == ""
-    assert detail["candidate_trait_count"] == 1
+    # 待审核提案不再物化为 candidate trait，批准时才写入 stable。
+    assert detail["candidate_trait_count"] == 0
     assert detail["stable_trait_count"] == 0
     assert detail["latest_version"] == 2  # 创建 + 更新成长策略
+    pending = next(item for item in await env.store.list_events(env.persona_id) if item["id"] == outcome.event_id)
+    assert not pending["old_state"]["self_description"]
+    assert pending["new_state"]["self_description"]
+    assert pending["diff"]["fields"]
+    assert pending["impact"]["traits_added"] == 1
 
     approved = await env.growth.review(outcome.event_id or "", approve=True)
 

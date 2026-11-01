@@ -25,11 +25,16 @@ class RedactionFilter(logging.Filter):
             record.args = ()
         if record.exc_text:
             record.exc_text = redact_text(record.exc_text)
-        for key in ("message", "detail", "error", "token", "key"):
+        for key in ("message", "detail", "error"):
             if hasattr(record, key):
                 value = getattr(record, key)
                 if isinstance(value, str):
                     setattr(record, key, redact_text(value))
+        # 这些字段本身就是凭证：无论内容形状如何都整体替换，避免短 Token 未被正则命中。
+        for key in ("token", "key", "api_key", "password", "secret", "authorization"):
+            value = getattr(record, key, None)
+            if isinstance(value, str) and value:
+                setattr(record, key, "[REDACTED]")
         return True
 
 

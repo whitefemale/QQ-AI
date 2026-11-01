@@ -5,9 +5,22 @@ const { execFile, spawn } = require('node:child_process')
 
 const { findFreePort, isPortFree } = require('./ports')
 const { buildBackendEnv } = require('./backend-env')
-const { probeExistingBackend, waitForHealth } = require('./health')
+const { probeExistingBackend, readHealth, waitForHealth } = require('./health')
 
 const MAX_LOG_LINES = 240
+const HEALTH_INTERVAL_MS = 12000
+const HEALTH_TIMEOUT_MS = 1500
+const HEALTH_DEGRADE_AFTER = 3
+
+function initialHealth() {
+  return {
+    state: 'unknown',
+    lastCheckAt: null,
+    latencyMs: null,
+    consecutiveFailures: 0,
+    message: '',
+  }
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -24,7 +37,13 @@ class BackendManager extends EventEmitter {
     repoRoot,
     backendDir,
     pythonPath,
+    backendMode = 'source',
+    backendExecutable = '',
+    frontendDist = '',
+    envFile = '',
+    installerExecutable = '',
     dataDir,
+    connectorsDir = '',
     logger,
     envBase = process.env,
     spawnImpl = spawn,
@@ -34,12 +53,24 @@ class BackendManager extends EventEmitter {
     startupTimeoutMs = 60000,
     killTimeoutMs = 6000,
     maxLogLines = MAX_LOG_LINES,
+    healthIntervalMs = HEALTH_INTERVAL_MS,
+    healthTimeoutMs = HEALTH_TIMEOUT_MS,
+    healthProbe = null,
+    setIntervalImpl = setInterval,
+    clearIntervalImpl = clearInterval,
+    now = () => Date.now(),
   }) {
     super()
     this.repoRoot = repoRoot
     this.backendDir = backendDir
     this.pythonPath = pythonPath
+    this.backendMode = backendMode === 'bundled' ? 'bundled' : 'source'
+    this.backendExecutable = backendExecutable
+    this.frontendDist = frontendDist
+    this.envFile = envFile
+    this.installerExecutable = installerExecutable
     this.dataDir = dataDir
+    this.connectorsDir = connectorsDir
     this.logger = logger
     this.envBase = envBase
     this.spawnImpl = spawnImpl
@@ -49,12 +80,23 @@ class BackendManager extends EventEmitter {
     this.startupTimeoutMs = startupTimeoutMs
     this.killTimeoutMs = killTimeoutMs
     this.maxLogLines = maxLogLines
+    this.healthIntervalMs = healthIntervalMs
+    this.healthTimeoutMs = healthTimeoutMs
+    this.setIntervalImpl = setIntervalImpl
+    this.clearIntervalImpl = clearIntervalImpl
+    this.now = now
+    this.healthProbe =
+      healthProbe ??
+      (async (port) =>
+        (await readHealth(port, { fetchImpl: this.fetchImpl, timeoutMs: this.healthTimeoutMs })) !== null)
 
     this.child = null
     this._exitPromise = null
     this._stopRequested = false
     this._starting = null
     this._logs = []
+    this._healthTimer = null
+    this._healthProbeInFlight = false
     this.info = {
       status: 'stopped',
       port: null,
@@ -62,11 +104,12 @@ class BackendManager extends EventEmitter {
       managed: true,
       version: '',
       error: '',
+      health: initialHealth(),
     }
   }
 
   getInfo() {
-    return { ...this.info }
+    return { ...this.info, health: { ...this.info.health } }
   }
 
   tail(count = 40) {
@@ -75,7 +118,86 @@ class BackendManager extends EventEmitter {
 
   _set(patch) {
     this.info = { ...this.info, ...patch }
+    if (
+      patch.health === undefined &&
+      (this.info.status === 'starting' || this.info.status === 'stopped' || this.info.status === 'error')
+    ) {
+      this.info = { ...this.info, health: initialHealth() }
+    }
+    const running = this.info.status === 'running' || this.info.status === 'external'
+    if (running) this._startHealthMonitor()
+    else this._stopHealthMonitor()
     this.emit('state', this.getInfo())
+  }
+
+  _setHealth(patch) {
+    this.info = { ...this.info, health: { ...this.info.health, ...patch } }
+    // 健康探测只更新 health，绝不改动 status。
+    this.emit('state', this.getInfo())
+  }
+
+  _startHealthMonitor() {
+    if (this._healthTimer) return
+    this._healthTimer = this.setIntervalImpl(() => {
+      void this.checkHealth()
+    }, this.healthIntervalMs)
+    if (this._healthTimer && typeof this._healthTimer.unref === 'function') {
+      this._healthTimer.unref()
+    }
+  }
+
+  _stopHealthMonitor() {
+    if (this._healthTimer) {
+      this.clearIntervalImpl(this._healthTimer)
+      this._healthTimer = null
+    }
+  }
+
+  /** 单飞健康探测；重叠 tick 直接跳过，避免堆积请求。 */
+  async checkHealth() {
+    if (this._healthProbeInFlight) return this.getInfo()
+    const status = this.info.status
+    const port = this.info.port
+    if ((status !== 'running' && status !== 'external') || !port) return this.getInfo()
+
+    this._healthProbeInFlight = true
+    const startedAt = this.now()
+    try {
+      const ok = await this.healthProbe(port)
+      if (ok) {
+        this._setHealth({
+          state: 'healthy',
+          lastCheckAt: new Date().toISOString(),
+          latencyMs: Math.max(0, this.now() - startedAt),
+          consecutiveFailures: 0,
+          message: '',
+        })
+      } else {
+        this._recordHealthFailure('健康检查未返回有效响应。')
+      }
+    } catch (error) {
+      this._recordHealthFailure(error instanceof Error ? error.message : String(error))
+    } finally {
+      this._healthProbeInFlight = false
+    }
+    return this.getInfo()
+  }
+
+  _recordHealthFailure(message) {
+    const failures = this.info.health.consecutiveFailures + 1
+    const degraded = failures >= HEALTH_DEGRADE_AFTER
+    this._setHealth({
+      state: degraded ? 'degraded' : this.info.health.state,
+      lastCheckAt: new Date().toISOString(),
+      latencyMs: null,
+      consecutiveFailures: failures,
+      message: degraded
+        ? `连续 ${failures} 次健康检查失败：${message}`
+        : `健康检查失败 ${failures} 次（未改变后端状态）。`,
+    })
+    if (degraded && this.logger) {
+      this.logger.warn(`后端健康检查连续失败 ${failures} 次，后端进程状态仍为 ${this.info.status}。`)
+    }
   }
 
   _appendLog(line) {
@@ -152,31 +274,49 @@ class BackendManager extends EventEmitter {
       repoRoot: this.repoRoot,
       dataDir: this.dataDir,
       port,
+      connectorsDir: this.connectorsDir,
+      frontendDist: this.frontendDist,
+      envFile: this.envFile,
+      installerExecutable: this.installerExecutable,
     })
-    const args = [
-      '-m',
-      'uvicorn',
-      'app.main:app',
-      '--host',
-      '127.0.0.1',
-      '--port',
-      String(port),
-      '--log-level',
-      'info',
-    ]
-    this._appendLog(`启动后端：${this.pythonPath} ${args.join(' ')}`)
+    let command
+    let args
+    if (this.backendMode === 'bundled') {
+      // 打包版没有 Python；固定可执行文件，主机/端口由环境变量传入。
+      if (!this.backendExecutable) {
+        this._set({ status: 'error', error: '安装包缺少内置后端可执行文件。' })
+        throw new Error(this.info.error)
+      }
+      command = this.backendExecutable
+      args = []
+    } else {
+      command = this.pythonPath
+      args = [
+        '-m',
+        'uvicorn',
+        'app.main:app',
+        '--host',
+        '127.0.0.1',
+        '--port',
+        String(port),
+        '--log-level',
+        'info',
+      ]
+    }
+    this._appendLog(`启动后端：${command}${args.length ? ` ${args.join(' ')}` : ''}`)
     this._appendLog(`数据目录：${this.dataDir}`)
 
     let child
     try {
-      child = this.spawnImpl(this.pythonPath, args, {
+      child = this.spawnImpl(command, args, {
         cwd: this.backendDir,
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })
     } catch (error) {
-      this._set({ status: 'error', error: `无法启动 Python：${error.message}` })
+      const target = this.backendMode === 'bundled' ? '内置后端' : 'Python'
+      this._set({ status: 'error', error: `无法启动${target}：${error.message}` })
       throw new Error(this.info.error)
     }
 

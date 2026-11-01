@@ -13,11 +13,14 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.adapters.qq.base import BaseQQAdapter
-from app.adapters.qq.mock import MockQQAdapter
-from app.adapters.qq.onebot11 import OneBot11Adapter
+from app.adapters.qq.factory import (
+    QQAdapterFactory,
+    QQAdapterRequest,
+    build_default_qq_adapter_factory,
+)
 from app.core.config import Settings
 from app.core.errors import AppError, ErrorCode
 from app.core.security import CredentialCipher
@@ -31,13 +34,30 @@ from app.pipeline.orchestrator import MessagePipeline, PipelineResult
 from app.pipeline.outbox import OutboxService
 from app.pipeline.persona_growth import PersonaGrowthService
 from app.pipeline.self_inquiry import detect_self_inquiry
+from app.schemas.connection import ConnectionDiagnostics
 from app.schemas.message import CanonicalMessage
 from app.schemas.persona import GrowthInteraction
+from app.services.connection_diagnostics import failed_report, run_connection_diagnostics
 from app.services.settings_store import get_global_pause
 
 logger = logging.getLogger(__name__)
 
 _CONNECT_TIMEOUT_SECONDS = 20.0
+_RUNTIME_STATUSES = ("online", "connected_unverified", "reconnecting", "connecting", "error")
+
+
+async def reset_stale_runtime_statuses(database: Database) -> None:
+    """启动时把上次进程残留的运行时状态降级为未连接。"""
+    async with database.session() as session:
+        await session.execute(
+            update(AdapterInstance)
+            .where(AdapterInstance.status.in_(_RUNTIME_STATUSES))
+            .values(status="disconnected", last_error_code=None, last_error_message=None)
+        )
+        await session.execute(
+            update(Account).where(Account.status.in_(_RUNTIME_STATUSES)).values(status="disconnected")
+        )
+        await session.commit()
 
 
 class AdapterManager:
@@ -51,6 +71,7 @@ class AdapterManager:
         outbox: OutboxService,
         events: EventBus,
         growth: PersonaGrowthService | None = None,
+        adapter_factory: QQAdapterFactory | None = None,
     ) -> None:
         self.database = database
         self.settings = settings
@@ -59,6 +80,7 @@ class AdapterManager:
         self.outbox = outbox
         self.events = events
         self.growth = growth
+        self.adapter_factory = adapter_factory or build_default_qq_adapter_factory()
         self._adapters: dict[str, BaseQQAdapter] = {}
         self._listeners: dict[str, asyncio.Task[None]] = {}
         self._instance_locks: dict[str, asyncio.Lock] = {}
@@ -78,38 +100,19 @@ class AdapterManager:
         token: str | None = None
         if instance.token_encrypted:
             token = self.cipher.decrypt(instance.token_encrypted)
-        if mode == "mock":
-            return MockQQAdapter(
-                instance_id=instance.id,
-                account_id=account.id,
-                endpoint=instance.endpoint,
-                self_id=account.self_platform_user_id or "10000",
-            )
-        if mode == "onebot11":
-            if not instance.endpoint:
-                raise AppError(
-                    ErrorCode.ADAPTER_CONNECT_FAILED,
-                    "请填写 OneBot 11 WebSocket 地址（例如 ws://127.0.0.1:3001）。",
-                    status_code=400,
-                )
-            return OneBot11Adapter(
+        if mode == "official_bot":
+            mode = "official"
+        return self.adapter_factory.build(
+            mode,
+            QQAdapterRequest(
                 instance_id=instance.id,
                 account_id=account.id,
                 endpoint=instance.endpoint,
                 api_endpoint=instance.api_endpoint,
                 token=token,
                 allow_remote=instance.allow_remote,
-            )
-        if mode in {"official", "official_bot"}:
-            raise AppError(
-                ErrorCode.OPERATION_PLANNED,
-                "官方 QQ 机器人接入尚未实现，当前版本仅预留接口。",
-                status_code=501,
-            )
-        raise AppError(
-            ErrorCode.ADAPTER_CONNECT_FAILED,
-            f"未知的连接方式「{mode}」。",
-            status_code=400,
+                self_id=account.self_platform_user_id,
+            ),
         )
 
     async def _load_pair(self, instance_id: str) -> tuple[AdapterInstance, Account]:
@@ -186,10 +189,8 @@ class AdapterManager:
         async with self._instance_lock(instance_id):
             cached = self._adapters.get(instance_id)
             if cached is not None:
-                if self._is_online(cached):
-                    return cached
-                if isinstance(cached, OneBot11Adapter) and cached.status == "reconnecting":
-                    # 后台监督任务正在指数退避重连，避免重复建立连接。
+                # 身份未验证或正在重连时也保留活动传输，避免重复建连。
+                if cached.status in {"online", "connected_unverified", "reconnecting"}:
                     return cached
             instance, account = await self._load_pair(instance_id)
             if not account.enabled:
@@ -230,7 +231,14 @@ class AdapterManager:
                     details={"reason": type(exc).__name__},
                 ) from exc
             self._start_listener(adapter)
-            await self._persist_status(instance_id, account.id, adapter.status, None, None)
+            # 保留身份验证失败等由适配器写入的错误，不能用 None 覆盖。
+            await self._persist_status(
+                instance_id,
+                account.id,
+                adapter.status,
+                adapter.last_error_code,
+                adapter.last_error_message,
+            )
             return adapter
 
     async def disconnect_instance(self, instance_id: str) -> None:
@@ -427,9 +435,8 @@ class AdapterManager:
 
     @staticmethod
     def _is_online(adapter: BaseQQAdapter) -> bool:
-        if isinstance(adapter, OneBot11Adapter):
-            return adapter.online
-        return adapter.status == "online"
+        # 适配器可自行提供 online 属性（如 OneBot 身份验证）；否则使用通用状态。
+        return bool(getattr(adapter, "online", False)) or adapter.status == "online"
 
     def resolve(self, account_id: str, instance_id: str | None) -> BaseQQAdapter | None:
         return self.online_adapter(account_id, instance_id)
@@ -449,33 +456,55 @@ class AdapterManager:
         token: str | None,
         allow_remote: bool,
     ) -> dict[str, Any]:
-        """测试未保存的配置；连接后立即断开，不发送任何消息。"""
-        adapter = self._build_ephemeral(
-            connection_mode=connection_mode,
-            endpoint=endpoint,
-            api_endpoint=api_endpoint,
-            token=token,
-            allow_remote=allow_remote,
-        )
+        """测试未保存的配置并返回分项诊断；连接后立即断开，不发送任何消息。"""
         started = utcnow()
+        token_configured = bool(token and token.strip())
+        adapter: BaseQQAdapter | None = None
         try:
+            adapter = self._build_ephemeral(
+                connection_mode=connection_mode,
+                endpoint=endpoint,
+                api_endpoint=api_endpoint,
+                token=token,
+                allow_remote=allow_remote,
+            )
             await asyncio.wait_for(adapter.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
-            login = await adapter.get_login_info()
-            groups = await adapter.get_group_list()
+            diagnostics: ConnectionDiagnostics = await run_connection_diagnostics(
+                adapter,
+                connection_mode=connection_mode,
+                started_at=started,
+                token_configured=token_configured,
+            )
+            return diagnostics.model_dump(mode="json")
+        except TimeoutError:
+            return failed_report(
+                connection_mode=connection_mode,
+                started_at=started,
+                error_code=ErrorCode.ADAPTER_CONNECT_FAILED,
+                error_message="连接超时，请检查连接器是否已启动。",
+            ).model_dump(mode="json")
+        except AppError as exc:
+            return failed_report(
+                connection_mode=connection_mode,
+                started_at=started,
+                error_code=exc.code,
+                error_message=exc.message,
+                config_error=adapter is None,
+            ).model_dump(mode="json")
+        except Exception as exc:
+            logger.exception("连接测试时发生异常")
+            return failed_report(
+                connection_mode=connection_mode,
+                started_at=started,
+                error_code=ErrorCode.ADAPTER_CONNECT_FAILED,
+                error_message=f"连接测试时发生异常（{type(exc).__name__}）。",
+            ).model_dump(mode="json")
         finally:
-            try:
-                await adapter.disconnect()
-            except Exception:
-                pass
-        return {
-            "ok": True,
-            "connection_mode": connection_mode,
-            "login": login,
-            "groups": groups[:50],
-            "group_count": len(groups),
-            "tested_at": started.isoformat(),
-            "latency_ms": int((utcnow() - started).total_seconds() * 1000),
-        }
+            if adapter is not None:
+                try:
+                    await adapter.disconnect()
+                except Exception:
+                    pass
 
     def _build_ephemeral(
         self,
@@ -486,32 +515,23 @@ class AdapterManager:
         token: str | None,
         allow_remote: bool,
     ) -> BaseQQAdapter:
-        if connection_mode == "mock":
-            return MockQQAdapter(instance_id="test-instance", account_id="test-account")
-        if connection_mode == "onebot11":
-            if not endpoint:
-                raise AppError(
-                    ErrorCode.ADAPTER_CONNECT_FAILED,
-                    "请填写 OneBot 11 WebSocket 地址。",
-                    status_code=400,
-                )
-            return OneBot11Adapter(
+        return self.adapter_factory.build(
+            connection_mode,
+            QQAdapterRequest(
                 instance_id="test-instance",
                 account_id="test-account",
                 endpoint=endpoint,
                 api_endpoint=api_endpoint,
                 token=token,
                 allow_remote=allow_remote,
-            )
-        raise AppError(
-            ErrorCode.ADAPTER_CONNECT_FAILED,
-            "未知的连接方式。",
-            status_code=400,
+            ),
         )
 
     # ------------------------------------------------------------------ 生命周期
     async def start(self) -> None:
         self._closed = False
+        # 上次进程留下的运行时状态没有对应内存适配器，启动时统一降为未连接。
+        await reset_stale_runtime_statuses(self.database)
         async with self.database.session() as session:
             instances = list(
                 (

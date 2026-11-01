@@ -45,6 +45,9 @@ class ToolRegistry:
                 "input_schema": tool.parameters_schema(),
                 "builtin": True,
                 "runtime_status": "available",
+                "execution": "in_process",
+                "registration": "fixed_at_startup",
+                "authorization": "group_gate_and_risk_deny_by_default",
             }
             for tool in self.list_tools()
         ]

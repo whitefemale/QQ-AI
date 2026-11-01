@@ -11,6 +11,17 @@ export type DesktopBackendStatus =
   | 'external'
   | 'error'
 
+export type DesktopBackendHealthState = 'unknown' | 'healthy' | 'degraded'
+
+/** 健康探测只表示后端 HTTP 进程可达，不代表 QQ 连接或模型能力。 */
+export interface DesktopBackendHealth {
+  state: DesktopBackendHealthState
+  lastCheckAt: string | null
+  latencyMs: number | null
+  consecutiveFailures: number
+  message: string
+}
+
 export interface DesktopBackendInfo {
   status: DesktopBackendStatus
   port: number | null
@@ -18,6 +29,12 @@ export interface DesktopBackendInfo {
   managed: boolean
   version: string
   error: string
+  health: DesktopBackendHealth
+}
+
+export interface DesktopTrayInfo {
+  available: boolean
+  reason: '' | 'icon_missing' | 'icon_invalid' | 'tray_error' | 'not_initialized'
 }
 
 export interface DesktopSettings {
@@ -26,6 +43,7 @@ export interface DesktopSettings {
   showWindowOnStart: boolean
   firstRunCompleted: boolean
   dataDir: string
+  connectorsDir: string
 }
 
 export interface DesktopSetupStep {
@@ -50,6 +68,7 @@ export interface DesktopLogEntry {
 
 export interface DesktopInfo {
   isDesktop: true
+  packaged?: boolean
   desktopVersion: string
   backend: DesktopBackendInfo
   settings: DesktopSettings
@@ -58,14 +77,16 @@ export interface DesktopInfo {
   desktopLogPath: string
   setup: DesktopSetupState
   logs: DesktopLogEntry[]
+  tray: DesktopTrayInfo
 }
 
 export interface DesktopSettingsResult {
   settings: DesktopSettings
   restartRequired: boolean
+  canceled?: boolean
 }
 
-export type DesktopFolderKind = 'data' | 'logs' | 'backups'
+export type DesktopFolderKind = 'data' | 'logs' | 'backups' | 'connectors'
 
 interface DesktopBridge {
   isDesktop: true
@@ -75,6 +96,7 @@ interface DesktopBridge {
   startBackend(options?: { demo?: boolean }): Promise<DesktopInfo>
   stopBackend(): Promise<DesktopInfo>
   restartBackend(): Promise<DesktopInfo>
+  chooseConnectorsDir(): Promise<DesktopSettingsResult>
   openFolder(kind: DesktopFolderKind): Promise<void>
   openReleases(): Promise<void>
   openConsole(): Promise<DesktopInfo>
@@ -126,8 +148,17 @@ export function restartDesktopBackend(): Promise<DesktopInfo> {
   return bridge().restartBackend()
 }
 
+/** 打开系统目录选择对话框；只返回并保存路径，不授予后端任意路径访问能力。 */
+export function chooseDesktopConnectorsDir(): Promise<DesktopSettingsResult> {
+  return bridge().chooseConnectorsDir()
+}
+
 export function openDesktopFolder(kind: DesktopFolderKind): Promise<void> {
   return bridge().openFolder(kind)
+}
+
+export function openDesktopConnectorsFolder(): Promise<void> {
+  return bridge().openFolder('connectors')
 }
 
 export function openDesktopReleases(): Promise<void> {

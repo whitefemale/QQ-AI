@@ -59,6 +59,7 @@
           </el-table>
           <p class="muted note-line">
             安全测试以管理员身份执行一次，不经过群聊，不允许高风险权限。参数会在审计日志中记录（已脱敏）。
+            内置工具在进程内执行，启动时固定注册；不存在插件式「工具扩展」或任意代码加载入口。
           </p>
         </div>
       </el-tab-pane>
@@ -122,6 +123,12 @@
               <template #default="{ row }">
                 <div class="plugin-detail">
                   <div><span class="muted">ID：</span><span class="mono">{{ row.id }}</span></div>
+                  <div>
+                    <span class="muted">执行方式：</span>
+                    <el-tag size="small" :type="row.execution === 'builtin_in_process' ? 'success' : 'info'">
+                      {{ pluginExecutionLabel(row.execution) }}
+                    </el-tag>
+                  </div>
                   <div v-if="row.entrypoint"><span class="muted">入口：</span><span class="mono">{{ row.entrypoint }}</span></div>
                   <div><span class="muted">高风险权限：</span>{{ row.high_risk_permissions.join('、') || '无' }}</div>
                   <div>
@@ -156,12 +163,70 @@
                       批准只修改本地登记状态，第三方运行时仍未启用。
                     </span>
                   </div>
+                  <div v-if="row.runtime_requirements?.length" class="runtime-requirements">
+                    <div class="muted">未来开放第三方执行前必须同时满足（当前均未实现）：</div>
+                    <div v-for="requirement in row.runtime_requirements" :key="requirement.key" class="requirement-line">
+                      <span class="mono">{{ requirement.key }}</span>
+                      <StateTag :state="requirement.state" />
+                      <span class="muted">{{ requirement.note }}</span>
+                    </div>
+                  </div>
                   <div v-if="row.last_error" class="error-text">{{ row.last_error }}</div>
                 </div>
               </template>
             </el-table-column>
           </el-table>
-          <el-empty v-if="!loading && !plugins.length" description="暂无已登记插件。" />
+          <el-empty v-if="!loading && !plugins.length" description="尚未发现扩展模块；本机不执行插件代码。" />
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane label="扩展契约" name="contracts">
+        <div class="card">
+          <div class="card-title">
+            <span>接口契约与执行边界</span>
+            <span class="muted">
+              来源：本地注册表与数据库
+              <template v-if="extensionMatrix"> · {{ formatTime(extensionMatrix.checked_at) }}</template>
+            </span>
+          </div>
+          <el-table v-loading="loading" :data="extensionMatrix?.contracts ?? []" size="small" row-key="kind">
+            <el-table-column label="类型" width="170">
+              <template #default="{ row }">
+                <div>{{ extensionKindLabel(row.kind) }}</div>
+                <div class="muted mono">{{ row.kind }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column prop="interface" label="接口" min-width="190" show-overflow-tooltip />
+            <el-table-column label="状态" width="130">
+              <template #default="{ row }"><StateTag :state="row.state" /></template>
+            </el-table-column>
+            <el-table-column label="执行" width="170">
+              <template #default="{ row }"><span class="mono">{{ row.execution }}</span></template>
+            </el-table-column>
+            <el-table-column label="实现" min-width="240">
+              <template #default="{ row }">
+                <el-tag v-for="item in row.implementations" :key="item" size="small" class="gap-tag">{{ item }}</el-tag>
+                <el-tag v-for="item in row.planned ?? []" :key="`planned-${item}`" size="small" type="info" class="gap-tag">
+                  {{ item }}（规划）
+                </el-tag>
+                <span v-if="!row.implementations.length" class="muted">无</span>
+              </template>
+            </el-table-column>
+            <el-table-column type="expand">
+              <template #default="{ row }">
+                <div class="contract-detail">
+                  <div><span class="muted">流水线依赖：</span>{{ row.pipeline_dependency }}</div>
+                  <div class="muted">保证：</div>
+                  <ul>
+                    <li v-for="item in row.guarantees" :key="item">{{ item }}</li>
+                  </ul>
+                </div>
+              </template>
+            </el-table-column>
+          </el-table>
+          <div class="contract-notes">
+            <p v-for="note in extensionMatrix?.notes ?? []" :key="note" class="muted">{{ note }}</p>
+          </div>
         </div>
       </el-tab-pane>
 
@@ -646,6 +711,7 @@ import type {
   BudgetAlertList,
   BudgetCheck,
   BudgetPolicy,
+  ExtensionCapabilitiesPayload,
   Group,
   LLMProvider,
   PluginRecord,
@@ -658,6 +724,7 @@ import type {
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
 import { FEATURE_OPTIONS, featureLabel } from '@/constants/budgets'
+import { extensionKindLabel, pluginExecutionLabel } from '@/utils/extensions'
 import { costStatusLabel, costStatusTag, formatCost, formatNumber, formatTime, riskTag } from '@/utils/format'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -678,6 +745,7 @@ const error = ref<string | null>(null)
 
 const tools = ref<ToolRecord[]>([])
 const plugins = ref<PluginRecord[]>([])
+const extensionMatrix = ref<ExtensionCapabilitiesPayload | null>(null)
 const loadErrors = ref<unknown[]>([])
 const healthId = ref<string | null>(null)
 const budgets = ref<BudgetPolicy[]>([])
@@ -911,18 +979,21 @@ async function loadAll(): Promise<void> {
   loading.value = true
   error.value = null
   try {
-    const [toolData, pluginData, budgetData, summary, groupData, providerData, accountData] = await Promise.all([
-      api<{ items: ToolRecord[] }>('/tools'),
-      api<{ items: PluginRecord[]; load_errors: unknown[] }>('/plugins'),
-      api<{ items: BudgetPolicy[] }>('/budgets'),
-      api<UsageSummary>('/usage/summary', { query: { hours: 24 } }),
-      api<{ items: Group[] }>('/groups'),
-      api<{ items: LLMProvider[] }>('/providers'),
-      api<{ items: Account[] }>('/accounts'),
-    ])
+    const [toolData, pluginData, budgetData, summary, groupData, providerData, accountData, matrix] =
+      await Promise.all([
+        api<{ items: ToolRecord[] }>('/tools'),
+        api<{ items: PluginRecord[]; load_errors: unknown[] }>('/plugins'),
+        api<{ items: BudgetPolicy[] }>('/budgets'),
+        api<UsageSummary>('/usage/summary', { query: { hours: 24 } }),
+        api<{ items: Group[] }>('/groups'),
+        api<{ items: LLMProvider[] }>('/providers'),
+        api<{ items: Account[] }>('/accounts'),
+        api<ExtensionCapabilitiesPayload>('/extensions/capabilities'),
+      ])
     tools.value = toolData.items
     plugins.value = pluginData.items
     loadErrors.value = pluginData.load_errors ?? []
+    extensionMatrix.value = matrix
     budgets.value = budgetData.items
     usageSummary.value = summary
     groups.value = groupData.items
@@ -1150,6 +1221,46 @@ onMounted(loadAll)
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.runtime-requirements {
+  border-top: 1px dashed var(--app-border);
+  padding-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.requirement-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.contract-detail {
+  padding: 8px 16px 12px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.contract-detail ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.contract-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.contract-notes p {
+  margin: 0;
 }
 
 .error-text {

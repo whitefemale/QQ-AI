@@ -23,6 +23,17 @@ test('默认设置包含自动启动与关闭到托盘', () => {
   assert.equal(DEFAULT_SETTINGS.autoStartBackend, true)
   assert.equal(DEFAULT_SETTINGS.closeToTray, true)
   assert.equal(DEFAULT_SETTINGS.dataDir, '')
+  assert.equal(DEFAULT_SETTINGS.connectorsDir, '')
+})
+
+test('连接器目录只接受绝对路径或空值', () => {
+  const absolute = path.resolve('D:/connectors/napcat')
+  assert.deepEqual(validatePatch({ connectorsDir: `  ${absolute}  ` }), { connectorsDir: absolute })
+  assert.deepEqual(validatePatch({ connectorsDir: '' }), { connectorsDir: '' })
+  assert.throws(() => validatePatch({ connectorsDir: 'relative/napcat' }), /绝对路径/u)
+  assert.throws(() => validatePatch({ connectorsDir: 42 }), /必须是字符串/u)
+  assert.equal(normalizeSettings({ connectorsDir: 'relative/napcat' }).connectorsDir, '')
+  assert.equal(normalizeSettings({ connectorsDir: absolute }).connectorsDir, absolute)
 })
 
 test('设置原子写入并可重新加载', () => {

@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.qq.mock import MockQQAdapter
 from app.adapters.qq.onebot11 import validate_onebot_endpoints
 from app.core.errors import AppError, ErrorCode, planned
 from app.core.security import CredentialCipher, redact_value
 from app.core.time import iso_utc, utcnow
 from app.db.session import Database
+from app.media.service import MediaService
 from app.models.account import Account, AdapterInstance
+from app.models.group import Group, Member
+from app.models.media import MediaAsset
+from app.models.memory import Memory, MemoryCandidate
+from app.models.message import Message, OutboxMessage
 from app.services.adapter_manager import AdapterManager, heartbeat_age_seconds
 from app.services.audit import write_audit
+from app.services.connection_diagnostics import failed_report
+from app.services.memory_service import MemoryService
+from app.services.persona_store import PersonaStore
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +48,16 @@ class AccountService:
         database: Database,
         cipher: CredentialCipher,
         manager: AdapterManager,
+        personas: PersonaStore,
+        memories: MemoryService,
+        media: MediaService,
     ) -> None:
         self.database = database
         self.cipher = cipher
         self.manager = manager
+        self.personas = personas
+        self.memories = memories
+        self.media = media
 
     # ------------------------------------------------------------------ 查询
     async def list_accounts(self) -> list[dict[str, Any]]:
@@ -174,21 +190,100 @@ class AccountService:
         )
         return await self.get_account(account_id)
 
-    async def delete_account(self, account_id: str) -> None:
+    async def delete_account(self, account_id: str, *, actor: str = "local-admin") -> None:
+        """删除账号及其关联数据；媒体只清理不再被其他消息引用的资产。"""
         await self.manager.disconnect_account(account_id)
         async with self.database.session() as session:
             account = await session.get(Account, account_id)
             if account is None:
                 raise AppError(ErrorCode.NOT_FOUND, "账号不存在或已被删除。", status_code=404)
             name = account.display_name
+            message_rows = list(
+                (
+                    await session.execute(
+                        select(Message.id, Message.segments_json).where(Message.account_id == account_id)
+                    )
+                ).all()
+            )
+            message_ids = {str(row.id) for row in message_rows}
+            media_refs: set[str] = set()
+            for row in message_rows:
+                for segment in row.segments_json or []:
+                    if isinstance(segment, dict):
+                        ref = segment.get("media_ref")
+                        if isinstance(ref, str) and ref.strip():
+                            media_refs.add(ref.strip())
+            media_asset_ids = list(
+                (
+                    await session.execute(
+                        select(MediaAsset.id).where(
+                            MediaAsset.account_id == account_id,
+                            MediaAsset.deleted_at.is_(None),
+                        )
+                    )
+                ).scalars()
+            )
+            counts = {
+                "groups": int(
+                    await session.scalar(select(func.count(Group.id)).where(Group.account_id == account_id)) or 0
+                ),
+                "members": int(
+                    await session.scalar(select(func.count(Member.id)).where(Member.account_id == account_id)) or 0
+                ),
+                "messages": len(message_ids),
+                "memories": int(
+                    await session.scalar(select(func.count(Memory.id)).where(Memory.account_id == account_id)) or 0
+                ),
+                "memory_candidates": int(
+                    await session.scalar(
+                        select(func.count(MemoryCandidate.id)).where(MemoryCandidate.account_id == account_id)
+                    )
+                    or 0
+                ),
+                "outbox_messages": int(
+                    await session.scalar(
+                        select(func.count(OutboxMessage.id)).where(OutboxMessage.account_id == account_id)
+                    )
+                    or 0
+                ),
+                "media_assets": len(media_asset_ids),
+            }
+        if message_ids:
+            # 先擦除人格证据与记忆来源，避免删除账号后留下指向已删消息的引用。
+            await self.personas.prune_evidence(message_ids, actor=actor)
+            await self.memories.scrub_source_message_ids(message_ids, actor=actor)
+        async with self.database.session() as session:
+            account = await session.get(Account, account_id)
+            if account is None:
+                raise AppError(ErrorCode.NOT_FOUND, "账号不存在或已被删除。", status_code=404)
             await session.delete(account)
             await session.commit()
+        media_deleted = 0
+        media_skipped = 0
+        media_errors = 0
+        for media_id in media_asset_ids:
+            try:
+                if await self.media.delete(str(media_id), protect_referenced=True):
+                    media_deleted += 1
+                else:
+                    media_skipped += 1
+            except Exception as exc:  # noqa: BLE001 - 媒体清理失败不能掩盖账号已删除
+                media_errors += 1
+                logger.warning("删除账号媒体失败", extra={"media_id": str(media_id), "reason": type(exc).__name__})
         await write_audit(
             self.database,
             action="account.delete",
             target_type="account",
             target_id=account_id,
-            details={"display_name": name},
+            details={
+                "display_name": name,
+                **counts,
+                "media_deleted": media_deleted,
+                "media_skipped_shared": media_skipped,
+                "media_errors": media_errors,
+                "media_refs": len(media_refs),
+            },
+            actor=actor,
         )
 
     # ------------------------------------------------------------------ 实例
@@ -435,12 +530,33 @@ class AccountService:
             action="account.instance.test",
             target_type="adapter_instance",
             target_id=instance_id,
-            details={"account_id": account_id, "mode": mode, "ok": result.get("ok")},
+            details={
+                "account_id": account_id,
+                "mode": mode,
+                "ok": result.get("ok"),
+                "state": result.get("state"),
+            },
         )
         return redact_value(result)
 
     async def test_unsaved_connection(self, payload: dict[str, Any]) -> dict[str, Any]:
-        normalized = self._normalize_instance_payload(payload)
+        try:
+            normalized = self._normalize_instance_payload(payload)
+        except AppError as exc:
+            result = failed_report(
+                connection_mode=_clean(payload.get("connection_mode"), 32) or "onebot11",
+                started_at=utcnow(),
+                error_code=exc.code,
+                error_message=exc.message,
+                config_error=True,
+            ).model_dump(mode="json")
+            await write_audit(
+                self.database,
+                action="account.instance.test_unsaved",
+                target_type="adapter_instance",
+                details={"ok": False, "state": result["state"]},
+            )
+            return redact_value(result)
         result = await self.manager.test_connection(
             connection_mode=normalized["mode"],
             endpoint=normalized["endpoint"],
@@ -452,17 +568,87 @@ class AccountService:
             self.database,
             action="account.instance.test_unsaved",
             target_type="adapter_instance",
-            details={"mode": normalized["mode"], "ok": result.get("ok")},
+            details={"mode": normalized["mode"], "ok": result.get("ok"), "state": result.get("state")},
         )
         return redact_value(result)
+
+    async def require_confirmed_identity(
+        self,
+        account_id: str,
+        instance_id: str,
+        confirm_self_user_id: str | None,
+    ) -> dict[str, Any]:
+        """导入群列表等真实操作前，必须由用户确认当前登录身份。
+
+        身份只能来自在线适配器报告的 ``self_platform_user_id``；Mock 永远拒绝。
+        """
+        instance = await self._require_instance(account_id, instance_id)
+        confirmed = str(confirm_self_user_id or "").strip()
+        if not confirmed:
+            raise AppError(
+                ErrorCode.CONNECTOR_IDENTITY_MISMATCH,
+                "请先确认当前登录的 QQ 号（confirm_self_user_id）后再导入真实群列表。",
+                status_code=400,
+            )
+        adapter = self.manager.get_adapter(instance_id)
+        if adapter is None:
+            raise AppError(
+                ErrorCode.ADAPTER_UNAVAILABLE,
+                "请先连接该连接器并完成身份验证。",
+                status_code=409,
+            )
+        if isinstance(adapter, MockQQAdapter) or instance.connection_mode == "mock":
+            raise AppError(
+                ErrorCode.ADAPTER_UNSUPPORTED_OPERATION,
+                "Mock 模式没有真实 QQ 身份，不能导入真实群列表或确认身份。",
+                status_code=400,
+            )
+        if adapter.status == "connected_unverified":
+            raise AppError(
+                ErrorCode.ADAPTER_IDENTITY_UNVERIFIED,
+                "连接器已连接但身份尚未验证；请先完成 WebSocket 身份验证。",
+                status_code=409,
+            )
+        if adapter.status != "online":
+            raise AppError(
+                ErrorCode.ADAPTER_UNAVAILABLE,
+                "连接器当前不在线，无法确认身份。",
+                status_code=409,
+            )
+        expected = str(adapter.self_platform_user_id or "").strip()
+        if not expected:
+            raise AppError(
+                ErrorCode.ADAPTER_IDENTITY_UNVERIFIED,
+                "连接器尚未返回登录账号，无法确认身份。",
+                status_code=409,
+            )
+        if not hmac.compare_digest(expected, confirmed):
+            raise AppError(
+                ErrorCode.CONNECTOR_IDENTITY_MISMATCH,
+                "填写的 QQ 号与连接器当前登录身份不一致。",
+                status_code=409,
+            )
+        return {"user_id": expected, "instance": instance}
 
     async def fetch_connector_groups(self, account_id: str, instance_id: str) -> dict[str, Any]:
         await self._require_instance(account_id, instance_id)
         adapter = self.manager.get_adapter(instance_id)
-        if adapter is None or adapter.status != "online":
+        if adapter is None:
             raise AppError(
                 ErrorCode.ADAPTER_UNAVAILABLE,
                 "请先连接该连接器，再获取群列表。",
+                status_code=409,
+            )
+        if adapter.status == "connected_unverified":
+            raise AppError(
+                ErrorCode.ADAPTER_IDENTITY_UNVERIFIED,
+                "连接器已连接，但 QQ 登录身份尚未验证；请先完成身份验证后再获取群列表。",
+                status_code=409,
+            )
+        if adapter.status != "online":
+            raise AppError(
+                ErrorCode.ADAPTER_UNAVAILABLE,
+                "连接器当前不在线，请先连接并确认身份已验证。",
                 status_code=409,
             )
         groups = await adapter.get_group_list()

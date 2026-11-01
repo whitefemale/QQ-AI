@@ -1,6 +1,7 @@
 """所有 ORM 模型统一导入，确保 Alembic 能发现全部表。"""
 
 from app.models.account import Account, AdapterInstance
+from app.models.connector import ConnectorConfigSnapshot, ConnectorInstallation, ConnectorJob
 from app.models.governance import (
     AuditLog,
     AutomationRule,
@@ -39,6 +40,9 @@ __all__ = [
     "BackupRecord",
     "BudgetAlert",
     "BudgetPolicy",
+    "ConnectorConfigSnapshot",
+    "ConnectorInstallation",
+    "ConnectorJob",
     "ConversationEvalCase",
     "ConversationEvalRun",
     "Group",

@@ -16,6 +16,13 @@
       :closable="false"
     />
 
+    <ReadinessBanner
+      :payload="onboarding"
+      :error="onboardingError"
+      :loading="onboardingLoading"
+      @retry="loadOnboarding"
+    />
+
     <el-alert
       v-if="dashboard?.global_pause.paused"
       type="error"
@@ -102,9 +109,11 @@
           </el-descriptions-item>
         </el-descriptions>
         <div class="quick-actions">
+          <el-button size="small" @click="router.push('/onboarding')">接入向导</el-button>
           <el-button size="small" @click="router.push('/accounts')">配置 QQ 接入</el-button>
           <el-button size="small" @click="router.push('/providers')">配置模型</el-button>
           <el-button size="small" @click="router.push('/groups')">管理群白名单</el-button>
+          <el-button size="small" @click="router.push('/diagnostics')">诊断与日志</el-button>
           <el-button size="small" @click="router.push('/personas')">人格工作台</el-button>
         </div>
       </div>
@@ -215,7 +224,11 @@
           <span>最近消息</span>
           <el-button size="small" text @click="router.push('/messages')">查看全部</el-button>
         </div>
-        <el-empty v-if="!dashboard?.recent_messages.length" description="暂无消息记录" :image-size="60" />
+        <el-empty
+          v-if="!dashboard?.recent_messages.length"
+          description="暂无消息；接入真实 QQ 或运行 Mock 演示后显示。"
+          :image-size="60"
+        />
         <el-table v-else :data="dashboard.recent_messages" size="small">
           <el-table-column label="时间" width="118">
             <template #default="{ row }">{{ formatTime(row.at) }}</template>
@@ -244,8 +257,9 @@
 import { computed, onMounted, ref } from 'vue'
 
 import { api, errorMessage } from '@/api/client'
-import type { DashboardPayload } from '@/api/types'
+import type { DashboardPayload, OnboardingPayload } from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
+import ReadinessBanner from '@/components/ReadinessBanner.vue'
 import StateTag from '@/components/StateTag.vue'
 import { useAppStore } from '@/stores/app'
 import { useEventsStore } from '@/stores/events'
@@ -269,6 +283,9 @@ const dashboard = ref<DashboardPayload | null>(null)
 const loading = ref(false)
 const demoLoading = ref(false)
 const error = ref<string | null>(null)
+const onboarding = ref<OnboardingPayload | null>(null)
+const onboardingLoading = ref(false)
+const onboardingError = ref<string | null>(null)
 
 const headerDescription = computed(
   () =>
@@ -294,6 +311,19 @@ const outboxSummary = computed(() => {
   return entries.map(([status, count]) => `${status}:${count}`).join(' · ')
 })
 
+async function loadOnboarding(): Promise<void> {
+  onboardingLoading.value = true
+  onboardingError.value = null
+  try {
+    onboarding.value = await api<OnboardingPayload>('/onboarding')
+  } catch (err) {
+    // 接入状态失败不阻塞仪表盘；保留上次结果并显示轻量重试提示。
+    onboardingError.value = errorMessage(err)
+  } finally {
+    onboardingLoading.value = false
+  }
+}
+
 async function load(): Promise<void> {
   loading.value = true
   error.value = null
@@ -305,6 +335,7 @@ async function load(): Promise<void> {
   } finally {
     loading.value = false
   }
+  await loadOnboarding()
 }
 
 async function bootstrapDemo(): Promise<void> {

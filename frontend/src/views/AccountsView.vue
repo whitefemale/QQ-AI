@@ -6,6 +6,7 @@
     >
       <template #actions>
         <el-button :loading="loading" @click="load">刷新</el-button>
+        <el-button @click="goConnectors">连接器管理</el-button>
         <el-button type="primary" @click="openCreate">新建账号</el-button>
       </template>
     </PageHeader>
@@ -16,6 +17,13 @@
       :closable="false"
       title="请使用你本人拥有并授权管理的专用 QQ 账号；账号出现验证或封禁风险时应立即暂停。"
       description="默认只允许连接本机/私网连接器。填写公网地址必须显式开启风险确认；Token 仅加密保存在本地。"
+    />
+    <el-alert
+      type="info"
+      show-icon
+      :closable="false"
+      title="安装 ≠ 登录 ≠ 身份验证 ≠ 真实收发"
+      description="「连接器」页可管理下载、官方安装器、进程、配置与诊断；本页保留为高级手动设置。诊断最多验证到身份与动作通道，真实群收发仍需人工验收。"
     />
 
     <el-alert v-if="error" type="error" :title="error" show-icon :closable="false" />
@@ -29,7 +37,11 @@
                 <span class="muted">连接器实例</span>
                 <el-button size="small" @click="openInstanceDialog(row, null)">添加连接器</el-button>
               </div>
-              <el-empty v-if="!row.instances.length" description="该账号还没有连接器实例" :image-size="50" />
+              <el-empty
+                v-if="!row.instances.length"
+                description="该账号还没有连接器实例；添加 Mock 或 OneBot 11 连接器。"
+                :image-size="50"
+              />
               <el-table v-else :data="row.instances" size="small">
                 <el-table-column prop="name" label="名称" width="140" />
                 <el-table-column label="方式" width="100">
@@ -58,13 +70,39 @@
                     <span class="muted">{{ heartbeatText(instance) }}</span>
                   </template>
                 </el-table-column>
-                <el-table-column label="操作" min-width="330">
+                <el-table-column label="操作" min-width="360">
                   <template #default="{ row: instance }">
                     <div class="row-actions">
-                      <el-button size="small" :disabled="instance.status === 'online'" @click="connectInstance(row, instance)">连接</el-button>
-                      <el-button size="small" :disabled="instance.status !== 'online'" @click="disconnectInstance(row, instance)">断开</el-button>
-                      <el-button size="small" @click="testSavedInstance(row, instance)">测试</el-button>
-                      <el-button size="small" :disabled="instance.status !== 'online'" @click="fetchGroups(row, instance)">拉取群列表</el-button>
+                      <el-button
+                        size="small"
+                        :disabled="!instanceActions(instance.status).canConnect"
+                        @click="connectInstance(row, instance)"
+                      >
+                        {{ instance.status === 'connected_unverified' ? '重新连接' : '连接' }}
+                      </el-button>
+                      <el-button
+                        size="small"
+                        :disabled="!instanceActions(instance.status).canDisconnect"
+                        @click="disconnectInstance(row, instance)"
+                      >
+                        断开
+                      </el-button>
+                      <el-button size="small" @click="testSavedInstance(row, instance)">测试并诊断</el-button>
+                      <el-button
+                        v-if="instance.connection_mode === 'onebot11'"
+                        size="small"
+                        :disabled="instance.status !== 'online'"
+                        @click="confirmIdentity(row, instance)"
+                      >
+                        确认登录身份
+                      </el-button>
+                      <el-button
+                        size="small"
+                        :disabled="!instanceActions(instance.status).canFetchGroups"
+                        @click="fetchGroups(row, instance)"
+                      >
+                        拉取群列表
+                      </el-button>
                       <el-button size="small" @click="openInstanceDialog(row, instance)">编辑</el-button>
                       <el-button size="small" type="danger" text @click="deleteInstance(row, instance)">删除</el-button>
                     </div>
@@ -72,21 +110,37 @@
                 </el-table-column>
                 <el-table-column type="expand">
                   <template #default="{ row: instance }">
+                    <div class="instance-state">
+                      <div class="state-line">
+                        <span class="muted">状态</span>
+                        <StateTag :state="instance.status" />
+                        <el-tag
+                          v-if="instance.connection_mode === 'onebot11'"
+                          size="small"
+                          :type="instance.live_health?.identity_verified ? 'warning' : 'info'"
+                        >
+                          身份{{ instance.live_health?.identity_verified ? '已验证' : '未验证' }}
+                        </el-tag>
+                        <span class="muted">
+                          来源：{{ instance.live_health?.status_source || '数据库快照（当前进程无适配器）' }}
+                        </span>
+                        <span class="muted">观测：{{ formatTime(instance.live_health?.observed_at) }}</span>
+                      </div>
+                      <div class="state-line muted">
+                        下一步：{{ instanceStatusNextStep(instance.status, instance.connection_mode, instance.last_error_message) }}
+                      </div>
+                      <div v-if="instance.last_error_code || instance.last_error_message" class="state-line">
+                        <span class="mono">{{ instance.last_error_code || 'ERROR' }}</span>
+                        <span>{{ instance.last_error_message || '—' }}</span>
+                      </div>
+                    </div>
                     <div class="capability-grid">
                       <el-tag v-for="(value, key) in instance.capabilities" :key="key" size="small" :type="value ? 'success' : 'info'">
                         {{ capabilityLabel(String(key)) }}：{{ value ? '支持' : '不支持' }}
                       </el-tag>
                     </div>
-                    <el-alert
-                      v-if="instance.last_error_message"
-                      class="instance-error"
-                      type="error"
-                      :title="instance.last_error_message"
-                      :closable="false"
-                      show-icon
-                    />
-                    <div v-if="instance.connection_mode === 'mock'" class="muted">
-                      Mock 连接器不会连接真实 QQ；可通过「模拟测试」页面注入事件。
+                    <div v-if="instance.connection_mode === 'mock'" class="muted instance-mock-note">
+                      Mock 在线不代表真实 QQ；Mock 连接器可通过「模拟测试」页面注入事件。
                     </div>
                   </template>
                 </el-table-column>
@@ -129,10 +183,15 @@
           </template>
         </el-table-column>
       </el-table>
-      <el-empty v-if="!loading && !accounts.length" description="还没有 QQ 账号。可以先初始化 Mock 演示环境，或新建 OneBot 11 账号。" />
+      <el-empty
+        v-if="!loading && !accounts.length"
+        description="尚未配置连接实例；可添加 Mock 或 OneBot 11，或从接入向导开始。"
+      >
+        <el-button size="small" @click="router.push('/onboarding')">打开接入向导</el-button>
+      </el-empty>
     </div>
 
-    <el-dialog v-model="createDialog" title="新建账号" width="560px" :close-on-click-modal="false">
+    <el-dialog v-model="createDialog" title="新建账号" width="900px" :close-on-click-modal="false">
       <el-form label-width="110px">
         <el-form-item label="账号名称" required>
           <el-input v-model="form.display_name" maxlength="128" placeholder="例如：群友助手（专用小号）" />
@@ -148,17 +207,11 @@
         <InstanceFormFields v-model="form.instance" />
       </el-form>
 
-      <el-alert
-        v-if="testResult"
-        :type="testResult.ok ? 'success' : 'error'"
-        :title="testResult.ok ? '连接测试成功' : '连接测试失败'"
-        :description="testSummary"
-        :closable="false"
-        show-icon
-      />
+      <el-alert v-if="testError" type="error" :title="testError" :closable="false" show-icon />
+      <ConnectionDiagnostics v-if="testResult" :report="testResult" />
 
       <template #footer>
-        <el-button @click="testConnection" :loading="testing">测试连接（不保存）</el-button>
+        <el-button @click="testConnection" :loading="testing">测试并诊断（不保存）</el-button>
         <el-button @click="createDialog = false">取消</el-button>
         <el-button type="primary" :loading="saving" @click="createAccount">创建</el-button>
       </template>
@@ -174,12 +227,46 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="diagnosticsDialog" :title="diagnosticsTitle" width="900px">
+      <div v-loading="diagnosticsLoading" class="diagnostics-body">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="诊断会临时建立独立连接；若连接器只允许一个连接，请先断开当前实例。"
+        />
+        <el-alert v-if="diagnosticsError" type="error" :title="diagnosticsError" :closable="false" show-icon />
+        <ConnectionDiagnostics v-if="diagnosticsReport" :report="diagnosticsReport" />
+      </div>
+      <template #footer>
+        <el-button @click="diagnosticsDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="groupsDialog" title="从连接器导入群" width="560px">
       <el-alert
         type="info"
         :closable="false"
         show-icon
         title="导入的群默认关闭 AI 回复；请在「群聊管理」中逐群确认后再启用。"
+      />
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        class="mt8"
+        title="导入真实群列表前必须确认当前登录身份"
+        description="请填写你本人当前登录的 QQ 号；后端会与在线连接器上报的身份核对，不一致或 Mock 实例会被拒绝。"
+      />
+      <div class="identity-hint muted">
+        在线适配器报告身份：
+        <span class="mono">{{ groupsContext?.instance.live_health?.self_platform_user_id || '尚未报告' }}</span>
+      </div>
+      <el-input
+        v-model="importSelfUserId"
+        placeholder="当前登录 QQ 号（confirm_self_user_id）"
+        maxlength="128"
+        class="mt8"
       />
       <el-empty v-if="!connectorGroups.length" description="连接器没有返回群列表" :image-size="55" />
       <el-table v-else :data="connectorGroups" size="small" max-height="320">
@@ -188,12 +275,74 @@
       </el-table>
       <template #footer>
         <el-button @click="groupsDialog = false">取消</el-button>
-        <el-button type="primary" :loading="importing" :disabled="!connectorGroups.length" @click="importGroups">确认导入</el-button>
+        <el-button
+          type="primary"
+          :loading="importing"
+          :disabled="!connectorGroups.length || !importSelfUserId.trim()"
+          @click="importGroups"
+        >确认导入</el-button>
       </template>
     </el-dialog>
 
-    <el-dialog v-model="statusDialog" title="账号实时状态" width="600px">
-      <pre class="status-pre">{{ statusJson }}</pre>
+    <el-dialog v-model="statusDialog" title="账号实时状态" width="760px">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="实时状态来自当前后端进程；数据库状态可能滞后，重启后需重新连接。"
+      />
+      <template v-if="statusSnapshot">
+        <el-descriptions :column="2" border size="small" class="mt8">
+          <el-descriptions-item label="账号启用">{{ statusSnapshot.account.enabled ? '是' : '否' }}</el-descriptions-item>
+          <el-descriptions-item label="账号状态"><StateTag :state="statusSnapshot.account.status" /></el-descriptions-item>
+          <el-descriptions-item label="全局暂停">
+            <StateTag :state="statusSnapshot.global_pause.paused ? 'paused' : 'available'" :label="statusSnapshot.global_pause.paused ? '暂停中' : '未暂停'" />
+          </el-descriptions-item>
+          <el-descriptions-item label="实例数量">{{ statusSnapshot.account.instances.length }}</el-descriptions-item>
+        </el-descriptions>
+        <el-table v-if="statusSnapshot.account.instances.length" :data="statusSnapshot.account.instances" size="small" class="mt8">
+          <el-table-column label="#" width="46">
+            <template #default="{ $index }">{{ $index + 1 }}</template>
+          </el-table-column>
+          <el-table-column label="方式" width="110">
+            <template #default="{ row: instance }">{{ modeLabel(instance.connection_mode) }}</template>
+          </el-table-column>
+          <el-table-column label="数据库状态" width="130">
+            <template #default="{ row: instance }"><StateTag :state="instance.status" /></template>
+          </el-table-column>
+          <el-table-column label="实时适配器" width="130">
+            <template #default="{ row: instance }">
+              <StateTag v-if="instance.live_health?.status" :state="String(instance.live_health.status)" />
+              <span v-else class="muted">当前进程无适配器</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="身份验证" width="100">
+            <template #default="{ row: instance }">
+              <el-tag size="small" :type="instance.live_health?.identity_verified ? 'success' : 'info'">
+                {{ instance.live_health?.identity_verified ? '已验证' : '未验证' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="实时观测时间" min-width="150">
+            <template #default="{ row: instance }">{{ formatTime(instance.live_health?.observed_at) }}</template>
+          </el-table-column>
+          <el-table-column label="心跳" width="110">
+            <template #default="{ row: instance }">
+              <span class="muted">{{ instance.live_health?.heartbeat_age_seconds == null ? '—' : `${instance.live_health.heartbeat_age_seconds} 秒` }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-empty v-else description="该账号还没有连接器实例。" :image-size="50" />
+        <div class="row-actions status-actions">
+          <el-button size="small" type="primary" plain @click="copyAccountStatus">复制脱敏状态</el-button>
+          <span class="muted">不含账号名、QQ 号、实例名、地址、Token 或错误正文。</span>
+        </div>
+        <el-collapse class="mt8">
+          <el-collapse-item title="查看原始 JSON（可能含 QQ 标识，请勿公开粘贴）" name="raw">
+            <pre class="status-pre">{{ statusJson }}</pre>
+          </el-collapse-item>
+        </el-collapse>
+      </template>
       <template #footer>
         <el-button @click="statusDialog = false">关闭</el-button>
       </template>
@@ -219,10 +368,21 @@
 import { computed, defineComponent, h, onMounted, reactive, ref } from 'vue'
 
 import { api, errorMessage } from '@/api/client'
-import type { Account, AdapterInstance } from '@/api/types'
+import { CONNECTOR_CONFIRMATIONS, confirmConnectorIdentity } from '@/api/connectors'
+import type {
+  Account,
+  AccountStatusSnapshot,
+  AdapterInstance,
+  ConnectionDiagnostics as ConnectionDiagnosticsReport,
+} from '@/api/types'
+import ConnectionDiagnostics from '@/components/ConnectionDiagnostics.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
+import { DELETE_PHRASE, typedConfirm } from '@/utils/confirmation'
+import { accountStatusCopy, instanceActions, instanceStatusNextStep } from '@/utils/diagnostics'
+import { formatTime } from '@/utils/format'
 import { ElAlert, ElDivider, ElFormItem, ElInput, ElMessage, ElMessageBox, ElOption, ElSelect, ElSwitch } from 'element-plus'
+import { useRouter } from 'vue-router'
 
 interface InstanceForm {
   name: string
@@ -373,20 +533,29 @@ const instanceForm = ref<InstanceForm>(emptyInstance())
 const instanceContext = ref<{ account: Account; instance: AdapterInstance | null } | null>(null)
 const editingInstance = computed(() => instanceContext.value?.instance ?? null)
 
-const testResult = ref<Record<string, unknown> | null>(null)
-const testSummary = computed(() => {
-  if (!testResult.value) return ''
-  const ok = Boolean(testResult.value.ok)
-  const latency = testResult.value.latency_ms
-  return ok ? `耗时 ${latency ?? '—'} ms` : String(testResult.value.error_message ?? testResult.value.message ?? '请检查地址与 Token。')
-})
+const testResult = ref<ConnectionDiagnosticsReport | null>(null)
+const testError = ref<string | null>(null)
+
+const diagnosticsDialog = ref(false)
+const diagnosticsLoading = ref(false)
+const diagnosticsReport = ref<ConnectionDiagnosticsReport | null>(null)
+const diagnosticsError = ref<string | null>(null)
+const diagnosticsTitle = ref('测试并诊断')
 
 const groupsDialog = ref(false)
 const connectorGroups = ref<Array<{ platform_group_id: string; name: string | null }>>([])
 const groupsContext = ref<{ account: Account; instance: AdapterInstance } | null>(null)
+const importSelfUserId = ref('')
+
+const router = useRouter()
+
+function goConnectors(): void {
+  void router.push('/connectors')
+}
 
 const statusDialog = ref(false)
 const statusJson = ref('')
+const statusSnapshot = ref<AccountStatusSnapshot | null>(null)
 const mockSentDialog = ref(false)
 const mockSent = ref<Array<Record<string, unknown>>>([])
 
@@ -438,19 +607,22 @@ function openCreate(): void {
   form.allow_private = false
   form.instance = emptyInstance()
   testResult.value = null
+  testError.value = null
   createDialog.value = true
 }
 
 async function testConnection(): Promise<void> {
   testing.value = true
   testResult.value = null
+  testError.value = null
   try {
-    testResult.value = await api<Record<string, unknown>>('/accounts/test-connection', {
+    testResult.value = await api<ConnectionDiagnosticsReport>('/accounts/test-connection', {
       method: 'POST',
       body: instancePayload(form.instance),
+      timeoutMs: 60_000,
     })
   } catch (err) {
-    testResult.value = { ok: false, error_message: errorMessage(err) }
+    testError.value = errorMessage(err)
   } finally {
     testing.value = false
   }
@@ -547,7 +719,7 @@ async function setAccountEnabled(account: Account, enabled: boolean): Promise<vo
 async function connectInstance(account: Account, instance: AdapterInstance): Promise<void> {
   try {
     await api(`/accounts/${account.id}/instances/${instance.id}/connect`, { method: 'POST' })
-    ElMessage.success('已发起连接。')
+    ElMessage.success('已发起连接；只有身份验证通过后才会显示在线。')
   } catch (err) {
     ElMessage.error(errorMessage(err))
   } finally {
@@ -567,15 +739,22 @@ async function disconnectInstance(account: Account, instance: AdapterInstance): 
 }
 
 async function testSavedInstance(account: Account, instance: AdapterInstance): Promise<void> {
+  diagnosticsTitle.value = `测试并诊断 · ${instance.name}`
+  diagnosticsReport.value = null
+  diagnosticsError.value = null
+  diagnosticsDialog.value = true
+  diagnosticsLoading.value = true
   try {
-    const result = await api<Record<string, unknown>>(
+    diagnosticsReport.value = await api<ConnectionDiagnosticsReport>(
       `/accounts/${account.id}/instances/${instance.id}/test`,
-      { method: 'POST', body: {} },
+      { method: 'POST', body: {}, timeoutMs: 60_000 },
     )
-    ElMessage.success(`连接测试成功：${result.latency_ms ?? '—'} ms`)
   } catch (err) {
-    ElMessage.error(errorMessage(err))
+    diagnosticsError.value = errorMessage(err)
+  } finally {
+    diagnosticsLoading.value = false
   }
+  await load()
 }
 
 async function fetchGroups(account: Account, instance: AdapterInstance): Promise<void> {
@@ -585,7 +764,35 @@ async function fetchGroups(account: Account, instance: AdapterInstance): Promise
     )
     connectorGroups.value = data.groups
     groupsContext.value = { account, instance }
+    importSelfUserId.value = ''
     groupsDialog.value = true
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  }
+}
+
+async function confirmIdentity(account: Account, instance: AdapterInstance): Promise<void> {
+  if (instance.connection_mode === 'mock' || instance.status !== 'online') return
+  let userId: string
+  try {
+    const result = await ElMessageBox.prompt(
+      '请输入当前登录的 QQ 号。后端会与在线适配器上报的身份核对；该确认不代表真实群收发已验证。',
+      '确认登录身份',
+      {
+        confirmButtonText: '确认',
+        cancelButtonText: '取消',
+        inputPlaceholder: '当前登录 QQ 号',
+        inputValidator: (value: string) => Boolean(value && value.trim()) || '请输入 QQ 号',
+      },
+    )
+    userId = result.value.trim()
+  } catch {
+    return
+  }
+  try {
+    await confirmConnectorIdentity(account.id, userId, CONNECTOR_CONFIRMATIONS.confirmIdentity)
+    ElMessage.success('登录身份已确认；真实收发仍需独立验收。')
+    await load()
   } catch (err) {
     ElMessage.error(errorMessage(err))
   }
@@ -598,7 +805,11 @@ async function importGroups(): Promise<void> {
   try {
     const result = await api<{ created: number; updated: number; skipped: number }>('/groups/import-connector', {
       method: 'POST',
-      body: { account_id: context.account.id, instance_id: context.instance.id },
+      body: {
+        account_id: context.account.id,
+        instance_id: context.instance.id,
+        confirm_self_user_id: importSelfUserId.value.trim(),
+      },
     })
     ElMessage.success(`导入完成：新增 ${result.created}，更新 ${result.updated}，跳过 ${result.skipped}。`)
     groupsDialog.value = false
@@ -612,11 +823,22 @@ async function importGroups(): Promise<void> {
 
 async function showStatus(account: Account): Promise<void> {
   try {
-    const data = await api<Record<string, unknown>>(`/accounts/${account.id}/status`)
+    const data = await api<AccountStatusSnapshot>(`/accounts/${account.id}/status`)
+    statusSnapshot.value = data
     statusJson.value = JSON.stringify(data, null, 2)
     statusDialog.value = true
   } catch (err) {
     ElMessage.error(errorMessage(err))
+  }
+}
+
+async function copyAccountStatus(): Promise<void> {
+  if (!statusSnapshot.value) return
+  try {
+    await navigator.clipboard.writeText(accountStatusCopy(statusSnapshot.value))
+    ElMessage.success('已复制脱敏账号状态。')
+  } catch (err) {
+    ElMessage.error(`复制失败：${err instanceof Error ? err.message : String(err)}。请手动查看结构化字段。`)
   }
 }
 
@@ -650,17 +872,14 @@ async function deleteInstance(account: Account, instance: AdapterInstance): Prom
 }
 
 async function deleteAccount(account: Account): Promise<void> {
+  const confirmed = await typedConfirm(
+    `删除账号「${account.display_name}」会永久删除其群配置、消息记录、记忆与发送队列，并清理不再被其他账号引用的媒体文件。连接器会先断开，此操作不可恢复。`,
+    DELETE_PHRASE,
+    '删除账号',
+  )
+  if (!confirmed) return
   try {
-    await ElMessageBox.confirm(
-      `确定删除账号「${account.display_name}」？其连接器会先断开。群与消息记录不会自动删除。`,
-      '删除账号',
-      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-  try {
-    await api(`/accounts/${account.id}`, { method: 'DELETE' })
+    await api(`/accounts/${account.id}`, { method: 'DELETE', query: { confirm: DELETE_PHRASE } })
     ElMessage.success('账号已删除。')
     await load()
   } catch (err) {
@@ -684,6 +903,33 @@ onMounted(load)
   margin-bottom: 8px;
 }
 
+.instance-state {
+  margin: 8px 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--app-surface);
+}
+
+.state-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 2px 0;
+  font-size: 13px;
+}
+
+.instance-mock-note {
+  padding: 0 12px 8px;
+}
+
+.diagnostics-body {
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 .capability-grid {
   display: flex;
   gap: 6px;
@@ -701,6 +947,20 @@ onMounted(load)
   background: var(--app-surface-soft);
   border-radius: 8px;
   padding: 12px;
+  font-size: 12px;
+}
+
+.mt8 {
+  margin-top: 8px;
+}
+
+.status-actions {
+  margin-top: 10px;
+  align-items: center;
+}
+
+.identity-hint {
+  margin-top: 8px;
   font-size: 12px;
 }
 </style>

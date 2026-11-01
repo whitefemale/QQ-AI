@@ -6,12 +6,12 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.time import utcnow
 from app.db.session import Database
-from app.models.message import Message
+from app.models.message import Message, OutboxMessage
 from app.schemas.message import CanonicalMessage
 
 logger = logging.getLogger(__name__)
@@ -169,11 +169,18 @@ class MessageService:
         self,
         conversation_id: str,
         *,
+        account_id: str,
+        group_id: str | None,
         limit: int = 20,
         before: datetime | None = None,
     ) -> list[Message]:
+        """短期上下文同时按账号与会话范围过滤，避免不同账号/群串上下文。"""
         async with self.database.session() as session:
-            query = select(Message).where(Message.conversation_id == conversation_id)
+            query = select(Message).where(
+                Message.account_id == account_id,
+                Message.conversation_id == conversation_id,
+                Message.group_id.is_(None) if group_id is None else Message.group_id == group_id,
+            )
             if before is not None:
                 query = query.where(Message.event_timestamp <= before)
             query = query.order_by(Message.event_timestamp.desc()).limit(max(1, min(limit, 100)))
@@ -197,3 +204,27 @@ class MessageService:
                 ).scalars()
             )
         return {"count": len(records), "last_at": records[0] if records else None}
+
+    async def outbox_stats_by_origin(
+        self,
+        account_id: str,
+        group_id: str,
+        origin_member_platform_user_id: str,
+        since: datetime,
+    ) -> dict[str, Any]:
+        """每人回复统计：只算 outbox 中真正发出的 AI 回复，命令回复与待审核草稿不计入。"""
+        effective_time = func.coalesce(OutboxMessage.sent_at, OutboxMessage.created_at)
+        async with self.database.session() as session:
+            count, last_at = (
+                await session.execute(
+                    select(func.count(OutboxMessage.id), func.max(effective_time)).where(
+                        OutboxMessage.account_id == account_id,
+                        OutboxMessage.group_id == group_id,
+                        OutboxMessage.origin_member_platform_user_id == origin_member_platform_user_id,
+                        OutboxMessage.reply_kind == "reply",
+                        OutboxMessage.status.in_(("sent", "unknown")),
+                        effective_time >= since,
+                    )
+                )
+            ).one()
+        return {"count": int(count or 0), "last_at": last_at}

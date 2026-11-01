@@ -32,7 +32,7 @@ function closeServer(server) {
   return new Promise((resolve) => server.close(() => resolve()))
 }
 
-function makeManager({ port, spawnImpl, dataDir }) {
+function makeManager({ port, spawnImpl, dataDir, ...options }) {
   return new BackendManager({
     repoRoot: path.resolve(__dirname, '..', '..'),
     backendDir: path.resolve(__dirname, '..', '..', 'backend'),
@@ -42,6 +42,7 @@ function makeManager({ port, spawnImpl, dataDir }) {
     preferredPort: port,
     spawnImpl,
     startupTimeoutMs: 3000,
+    ...options,
   })
 }
 
@@ -109,4 +110,137 @@ test('健康检查失败时会结束进程并进入错误状态', async (t) => {
   t.after(() => {
     /* 假进程无需清理 */
   })
+})
+
+test('外部后端运行期间持续健康探测，stop 时清理定时器且不停止外部进程', async (t) => {
+  const { server, port } = await startHealthServer()
+  t.after(() => closeServer(server))
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aiqf-backend-'))
+  const timers = []
+  const cleared = []
+  let clock = 1000
+  let probeCalls = 0
+  const manager = makeManager({
+    port,
+    dataDir,
+    healthProbe: async () => {
+      probeCalls += 1
+      return true
+    },
+    setIntervalImpl: (fn, ms) => {
+      const handle = { fn, ms, unref() {} }
+      timers.push(handle)
+      return handle
+    },
+    clearIntervalImpl: (handle) => cleared.push(handle),
+    now: () => {
+      clock += 10
+      return clock
+    },
+  })
+
+  await manager.start()
+  assert.equal(manager.getInfo().status, 'external')
+  assert.equal(timers.length, 1)
+  assert.equal(timers[0].ms, 12000)
+  assert.equal(manager.getInfo().health.state, 'unknown')
+
+  const healthy = await manager.checkHealth()
+  assert.equal(probeCalls, 1)
+  assert.equal(healthy.status, 'external')
+  assert.equal(healthy.health.state, 'healthy')
+  assert.equal(healthy.health.consecutiveFailures, 0)
+  assert.equal(healthy.health.latencyMs, 10)
+  assert.ok(healthy.health.lastCheckAt)
+
+  const copy = manager.getInfo()
+  copy.health.state = 'degraded'
+  copy.health.consecutiveFailures = 99
+  assert.equal(manager.getInfo().health.state, 'healthy')
+  assert.equal(manager.getInfo().health.consecutiveFailures, 0)
+
+  await manager.stop()
+  assert.equal(cleared.length, 1)
+  assert.equal(manager.getInfo().health.state, 'unknown')
+  assert.equal(server.listening, true)
+})
+
+test('前两次健康失败不改状态，第三次降级，恢复后立即正常且不改变后端状态', async (t) => {
+  const { server, port } = await startHealthServer()
+  t.after(() => closeServer(server))
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aiqf-backend-'))
+  let healthy = true
+  const manager = makeManager({
+    port,
+    dataDir,
+    healthProbe: async () => healthy,
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl: () => {},
+  })
+
+  await manager.start()
+  await manager.checkHealth()
+  assert.equal(manager.getInfo().health.state, 'healthy')
+
+  healthy = false
+  await manager.checkHealth()
+  let info = manager.getInfo()
+  assert.equal(info.status, 'external')
+  assert.equal(info.health.state, 'healthy')
+  assert.equal(info.health.consecutiveFailures, 1)
+  assert.match(info.health.message, /1 次/u)
+
+  await manager.checkHealth()
+  info = manager.getInfo()
+  assert.equal(info.status, 'external')
+  assert.equal(info.health.state, 'healthy')
+  assert.equal(info.health.consecutiveFailures, 2)
+
+  await manager.checkHealth()
+  info = manager.getInfo()
+  assert.equal(info.status, 'external')
+  assert.equal(info.health.state, 'degraded')
+  assert.equal(info.health.consecutiveFailures, 3)
+  assert.match(info.health.message, /连续 3 次/u)
+
+  healthy = true
+  info = await manager.checkHealth()
+  assert.equal(info.status, 'external')
+  assert.equal(info.health.state, 'healthy')
+  assert.equal(info.health.consecutiveFailures, 0)
+  assert.equal(info.health.message, '')
+
+  await manager.stop()
+  assert.equal(server.listening, true)
+})
+
+test('重叠的健康探测会跳过，不会堆积请求', async (t) => {
+  const { server, port } = await startHealthServer()
+  t.after(() => closeServer(server))
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aiqf-backend-'))
+  let release
+  let probeCalls = 0
+  const manager = makeManager({
+    port,
+    dataDir,
+    healthProbe: () => {
+      probeCalls += 1
+      return new Promise((resolve) => {
+        release = resolve
+      })
+    },
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl: () => {},
+  })
+
+  await manager.start()
+  const first = manager.checkHealth()
+  const second = await manager.checkHealth()
+  assert.equal(probeCalls, 1)
+  assert.equal(second.health.state, 'unknown')
+
+  release(true)
+  const firstInfo = await first
+  assert.equal(firstInfo.health.state, 'healthy')
+  await manager.stop()
 })

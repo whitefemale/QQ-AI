@@ -11,6 +11,8 @@
           <el-button @click="openCandidates">候选审核</el-button>
         </el-badge>
         <el-button @click="openExtract">AI 提取候选</el-button>
+        <el-button @click="openExport">导出 CSV</el-button>
+        <el-button @click="openCleanup">清理工具</el-button>
         <el-button :loading="loading" @click="reload">刷新</el-button>
         <el-button type="primary" @click="openCreate">添加记忆</el-button>
       </template>
@@ -97,10 +99,17 @@
             <span :class="{ muted: !row.expires_at }">{{ formatTime(row.expires_at) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="210" fixed="right">
+        <el-table-column label="创建 / 更新" width="150">
+          <template #default="{ row }">
+            <div>{{ formatTime(row.created_at) }}</div>
+            <div class="muted">{{ formatTime(row.updated_at) }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="285" fixed="right">
           <template #default="{ row }">
             <div class="row-actions">
               <el-button size="small" @click="togglePinned(row)">{{ row.is_pinned ? '取消固定' : '固定' }}</el-button>
+              <el-button size="small" text @click="openSources(row)">来源</el-button>
               <el-button size="small" @click="openEdit(row)">编辑</el-button>
               <el-button size="small" type="danger" text @click="removeMemory(row)">删除</el-button>
             </div>
@@ -361,7 +370,7 @@
           </template>
         </el-table-column>
       </el-table>
-      <el-empty v-if="!candidateLoading && !candidates.length" description="该状态下没有候选。" />
+      <el-empty v-if="!candidateLoading && !candidates.length" description="暂无待审核记忆候选；后台提取默认关闭。" />
       <div v-if="candidateTotal > candidatePageSize" class="pagination">
         <el-pagination
           v-model:current-page="candidatePage"
@@ -372,6 +381,134 @@
         />
       </div>
     </el-dialog>
+
+    <el-dialog v-model="exportDialog" title="导出记忆 CSV" width="560px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="导出使用当前筛选条件"
+        description="默认排除敏感记忆。CSV 带 UTF-8 BOM 并做公式注入防护；导出动作会写审计，但不记录记忆正文。"
+      />
+      <el-checkbox v-model="exportIncludeSensitive">
+        包含敏感记忆（仅在本机管理界面下载，导出文件不再受应用保护）
+      </el-checkbox>
+      <el-alert
+        v-if="exportIncludeSensitive"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="敏感记忆将写入导出文件"
+        description="请只保存在受控位置，并避免上传到公开网盘、聊天群或代码仓库。"
+      />
+      <p class="muted">
+        筛选：{{ filters.account_id ? accountLabel(filters.account_id) : '全部账号' }} ·
+        {{ filters.group_id ? groupLabel(filters.group_id) : '全部群' }} ·
+        {{ filters.memory_type ? memoryTypeLabel(filters.memory_type) : '全部类型' }} ·
+        {{ filters.search.trim() ? `搜索「${filters.search.trim()}」` : '无搜索词' }}
+      </p>
+      <template #footer>
+        <el-button @click="exportDialog = false">取消</el-button>
+        <el-button type="primary" :loading="exporting" @click="exportCsv">下载 CSV</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="cleanupDialog" title="记忆清理" width="560px" :close-on-click-modal="false">
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="清理只删除未固定的匹配记忆"
+        description="固定记忆不会被删除。建议先使用「仅统计」确认范围，再执行真实清理。"
+      />
+      <el-form label-width="100px">
+        <el-form-item label="模式">
+          <el-radio-group v-model="cleanupMode">
+            <el-radio value="expired">已过期</el-radio>
+            <el-radio value="older_than">创建超过天数</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="cleanupMode === 'older_than'" label="天数">
+          <el-input-number v-model="cleanupDays" :min="1" :max="3650" />
+        </el-form-item>
+        <el-form-item label="仅统计">
+          <el-switch v-model="cleanupDryRun" />
+          <span class="muted" style="margin-left: 10px">开启时不会删除任何记忆。</span>
+        </el-form-item>
+      </el-form>
+      <el-alert
+        v-if="cleanupResult"
+        :type="cleanupResult.dry_run ? 'info' : 'success'"
+        :closable="false"
+        show-icon
+        :title="`匹配 ${cleanupResult.matched} 条，删除 ${cleanupResult.deleted} 条`"
+        :description="cleanupResult.note"
+      />
+      <template #footer>
+        <el-button @click="cleanupDialog = false">关闭</el-button>
+        <el-button type="primary" :loading="cleaning" @click="runCleanup">
+          {{ cleanupDryRun ? '仅统计' : '执行清理' }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="sourcesDialog" title="记忆来源" width="760px">
+      <el-alert type="info" :closable="false" show-icon :title="sourcesNote" />
+      <el-table v-loading="sourcesLoading" :data="sources" size="small">
+        <el-table-column label="时间" width="150">
+          <template #default="{ row }">{{ row.timestamp ? formatTime(row.timestamp) : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="群 / 发送者" width="180">
+          <template #default="{ row }">
+            <div>{{ row.group_name || row.group_id || '—' }}</div>
+            <div class="muted">{{ row.sender_name || '—' }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="脱敏预览" min-width="260">
+          <template #default="{ row }">
+            <span v-if="row.missing" class="muted">消息已删除或不在该记忆所属账号/群范围内。</span>
+            <span v-else>{{ row.preview || '（无文本）' }}</span>
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-empty v-if="!sourcesLoading && !sources.length" description="该记忆没有关联的来源消息。" :image-size="50" />
+      <template #footer>
+        <el-button @click="sourcesDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="approvalDialog" title="批准记忆候选" width="540px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="批准后生成正式记忆"
+        description="普通敏感度可能按相关性自动注入；敏感记忆不会被自动注入，只能在控制台查看与管理。"
+      />
+      <p class="candidate-preview">{{ approvalCandidate?.content }}</p>
+      <el-form label-width="100px">
+        <el-form-item label="敏感度">
+          <el-radio-group v-model="approvalSensitivity">
+            <el-radio value="normal">普通（可自动注入）</el-radio>
+            <el-radio value="sensitive">敏感（仅人工管理）</el-radio>
+          </el-radio-group>
+        </el-form-item>
+      </el-form>
+      <el-alert
+        v-if="approvalCandidate?.is_mock"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="这是 Mock 模拟内容"
+        description="Mock 候选不是真实模型的理解结果，不应作为真实记忆长期保留。"
+      />
+      <template #footer>
+        <el-button @click="approvalDialog = false">取消</el-button>
+        <el-button type="primary" :loading="candidateActionId !== ''" @click="submitCandidateApproval">
+          确认批准
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -379,7 +516,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 
 import PageHeader from '@/components/PageHeader.vue'
-import { api, errorMessage } from '@/api/client'
+import { api, downloadApiFile, errorMessage } from '@/api/client'
 import type {
   Account,
   Group,
@@ -387,10 +524,14 @@ import type {
   MemoryCandidateApproval,
   MemoryCandidateListPayload,
   MemoryCandidateRecord,
+  MemoryCleanupResult,
   MemoryExtractionResult,
   MemoryListPayload,
   MemoryRecord,
+  MemorySourceItem,
+  MemorySourcesPayload,
 } from '@/api/types'
+import { CLEANUP_PHRASE, typedConfirm } from '@/utils/confirmation'
 import { formatTime } from '@/utils/format'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -444,6 +585,23 @@ const candidateLoading = ref(false)
 const candidateError = ref('')
 const candidateNote = ref('')
 const candidateActionId = ref('')
+
+const exportDialog = ref(false)
+const exportIncludeSensitive = ref(false)
+const exporting = ref(false)
+const cleanupDialog = ref(false)
+const cleanupMode = ref<'expired' | 'older_than'>('expired')
+const cleanupDays = ref(90)
+const cleanupDryRun = ref(true)
+const cleaning = ref(false)
+const cleanupResult = ref<MemoryCleanupResult | null>(null)
+const sourcesDialog = ref(false)
+const sourcesLoading = ref(false)
+const sources = ref<MemorySourceItem[]>([])
+const sourcesNote = ref('')
+const approvalDialog = ref(false)
+const approvalCandidate = ref<MemoryCandidateRecord | null>(null)
+const approvalSensitivity = ref<'normal' | 'sensitive'>('normal')
 
 const filters = reactive({
   account_id: '',
@@ -801,25 +959,27 @@ async function loadCandidates(): Promise<void> {
   }
 }
 
-async function approveCandidate(candidate: MemoryCandidateRecord): Promise<void> {
-  const mockWarning = candidate.is_mock ? '\n\n注意：这是 Mock 模拟内容，不是真实模型的理解结果。' : ''
-  try {
-    await ElMessageBox.confirm(
-      `批准后将生成普通敏感度正式记忆，并保留 ${candidate.source_message_ids.length} 条证据引用。${mockWarning}`,
-      '批准记忆候选',
-      {
-        confirmButtonText: '批准',
-        cancelButtonText: '取消',
-        type: candidate.is_mock ? 'warning' : 'info',
-      },
-    )
-  } catch {
-    return
-  }
+function approveCandidate(candidate: MemoryCandidateRecord): void {
+  approvalCandidate.value = candidate
+  approvalSensitivity.value = 'normal'
+  approvalDialog.value = true
+}
+
+async function submitCandidateApproval(): Promise<void> {
+  const candidate = approvalCandidate.value
+  if (!candidate) return
   candidateActionId.value = candidate.id
   try {
-    await api<MemoryCandidateApproval>(`/memories/candidates/${candidate.id}/approve`, { method: 'POST' })
-    ElMessage.success('候选已批准为正式记忆。是否注入仍取决于群设置与相关性。')
+    await api<MemoryCandidateApproval>(`/memories/candidates/${candidate.id}/approve`, {
+      method: 'POST',
+      body: { sensitivity: approvalSensitivity.value },
+    })
+    ElMessage.success(
+      approvalSensitivity.value === 'sensitive'
+        ? '候选已批准为敏感记忆，不会自动注入提示词。'
+        : '候选已批准为正式记忆。是否注入仍取决于群设置与相关性。',
+    )
+    approvalDialog.value = false
     if (candidates.value.length === 1 && candidatePage.value > 1) candidatePage.value -= 1
     await Promise.all([loadCandidates(), loadPendingCount(), loadMemories()])
   } catch (cause) {
@@ -849,6 +1009,95 @@ async function rejectCandidate(candidate: MemoryCandidateRecord): Promise<void> 
     ElMessage.error(errorMessage(cause))
   } finally {
     candidateActionId.value = ''
+  }
+}
+
+function openExport(): void {
+  exportIncludeSensitive.value = false
+  exportDialog.value = true
+}
+
+async function exportCsv(): Promise<void> {
+  exporting.value = true
+  try {
+    const file = await downloadApiFile('/memories/export.csv', {
+      query: {
+        account_id: filters.account_id || undefined,
+        group_id: filters.group_id || undefined,
+        memory_type: filters.memory_type || undefined,
+        search: filters.search.trim() || undefined,
+        include_expired: filters.include_expired,
+        include_sensitive: exportIncludeSensitive.value,
+      },
+    })
+    const url = URL.createObjectURL(file.blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = file.filename
+    link.click()
+    URL.revokeObjectURL(url)
+    ElMessage.success(exportIncludeSensitive.value ? '已导出（含敏感记忆）。' : '已导出（不含敏感记忆）。')
+    exportDialog.value = false
+  } catch (cause) {
+    ElMessage.error(errorMessage(cause))
+  } finally {
+    exporting.value = false
+  }
+}
+
+function openCleanup(): void {
+  cleanupMode.value = 'expired'
+  cleanupDays.value = 90
+  cleanupDryRun.value = true
+  cleanupResult.value = null
+  cleanupDialog.value = true
+}
+
+async function runCleanup(): Promise<void> {
+  if (!cleanupDryRun.value) {
+    const scope = cleanupMode.value === 'expired' ? '所有已过期' : `创建超过 ${cleanupDays.value} 天`
+    const confirmed = await typedConfirm(
+      `将永久删除${scope}的未固定记忆，无法恢复。固定记忆不受影响。建议先执行「仅统计」核对范围。`,
+      CLEANUP_PHRASE,
+      '执行记忆清理',
+    )
+    if (!confirmed) return
+  }
+  cleaning.value = true
+  cleanupResult.value = null
+  try {
+    const result = await api<MemoryCleanupResult>('/memories/cleanup', {
+      method: 'POST',
+      body: {
+        mode: cleanupMode.value,
+        days: cleanupMode.value === 'older_than' ? cleanupDays.value : undefined,
+        dry_run: cleanupDryRun.value,
+        confirm: cleanupDryRun.value ? undefined : CLEANUP_PHRASE,
+      },
+    })
+    cleanupResult.value = result
+    ElMessage.success(result.note)
+    if (!result.dry_run) await loadMemories()
+  } catch (cause) {
+    ElMessage.error(errorMessage(cause))
+  } finally {
+    cleaning.value = false
+  }
+}
+
+async function openSources(row: MemoryRecord): Promise<void> {
+  sourcesDialog.value = true
+  sourcesLoading.value = true
+  sources.value = []
+  sourcesNote.value = '只展示该记忆所属账号与群范围内的来源消息。'
+  try {
+    const data = await api<MemorySourcesPayload>(`/memories/${row.id}/sources`)
+    sources.value = data.items
+    sourcesNote.value = data.note
+  } catch (cause) {
+    ElMessage.error(errorMessage(cause))
+  } finally {
+    sourcesLoading.value = false
   }
 }
 
@@ -969,5 +1218,15 @@ onMounted(async () => {
   align-items: center;
   flex-wrap: wrap;
   margin-top: 5px;
+}
+
+.candidate-preview {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--el-fill-color-lighter);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

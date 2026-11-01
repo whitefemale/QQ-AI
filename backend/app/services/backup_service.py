@@ -21,6 +21,7 @@ from sqlalchemy.engine import make_url
 
 from app.core.config import Settings
 from app.core.errors import AppError, ErrorCode
+from app.core.schema_version import current_revision, head_revision, schema_compatibility
 from app.core.time import iso_utc, utcnow
 from app.db.session import Database
 from app.models.account import Account
@@ -93,7 +94,11 @@ def _replace_with_retry(source: Path, target: Path, *, attempts: int = 20, delay
 
 
 def _table_counts(path: Path) -> dict[str, int]:
-    connection = sqlite3.connect(str(path))
+    """读取关键表行数；损坏/截断文件返回空字典，由 integrity_check 报告失败。"""
+    try:
+        connection = sqlite3.connect(str(path))
+    except sqlite3.Error:
+        return {}
     try:
         existing = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         counts: dict[str, int] = {}
@@ -101,6 +106,8 @@ def _table_counts(path: Path) -> dict[str, int]:
             if table in existing:
                 counts[table] = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         return counts
+    except sqlite3.Error:
+        return {}
     finally:
         connection.close()
 
@@ -142,7 +149,8 @@ def _verify(path: Path, expected_sha256: str | None = None) -> dict[str, Any]:
         "integrity_ok": integrity_ok,
         "integrity_message": integrity_message,
         "schema_version": _schema_version(path),
-        "tables": _table_counts(path),
+        # 损坏文件不再尝试统计表，避免把 SQLite 解析错误泄漏成 500。
+        "tables": _table_counts(path) if integrity_ok else {},
         "verified_at": iso_utc(utcnow()),
     }
 
@@ -271,26 +279,44 @@ class BackupService:
                     await session.commit()
         return result
 
+    async def _schema_state(self, backup_revision: str | None) -> dict[str, Any]:
+        return schema_compatibility(
+            backup_revision,
+            await current_revision(self.database),
+            head_revision(),
+        )
+
     async def preview_restore(self, backup_id: str) -> dict[str, Any]:
         verification = await self.verify_backup(backup_id)
         record = await self._record_by_id(backup_id)
         pause = await get_global_pause(self.database)
         async with self.database.session() as session:
             accounts = await session.scalar(select(func.count(Account.id)))
+        schema = await self._schema_state(verification["schema_version"])
+        warnings = [
+            "恢复会用备份中的数据库覆盖当前数据库。",
+            "恢复前会自动创建一份安全备份。",
+            "恢复会断开所有 QQ 连接器，所有账号需重新连接。",
+            "媒体文件、日志不包含在备份中。",
+            "加密密钥不在备份中；密钥变化后旧凭证将无法解密。",
+        ]
+        if schema["status"] == "unknown":
+            warnings.append(schema["message"])
+        if record.app_version and record.app_version != self.settings.app_version:
+            warnings.append(
+                f"备份创建于程序版本 {record.app_version}，当前为 {self.settings.app_version}；"
+                "请结合 Schema 状态判断兼容性。"
+            )
         return {
             "backup": self._record_public(record),
             "verification": verification,
+            "schema": schema,
+            "app_version": {"backup": record.app_version, "current": self.settings.app_version},
             "current_state": {"accounts": int(accounts or 0)},
             "requires_pause": True,
             "paused": bool(pause.get("paused")),
             "confirm_phrase": "RESTORE",
-            "warnings": [
-                "恢复会用备份中的数据库覆盖当前数据库。",
-                "恢复前会自动创建一份安全备份。",
-                "恢复会断开所有 QQ 连接器，所有账号需重新连接。",
-                "媒体文件、日志不包含在备份中。",
-                "加密密钥不在备份中；密钥变化后旧凭证将无法解密。",
-            ],
+            "warnings": warnings,
         }
 
     async def restore_backup(
@@ -317,6 +343,18 @@ class BackupService:
         verification = await self.verify_backup(backup_id)
         if not verification["checksum_ok"] or not verification["integrity_ok"]:
             raise AppError(ErrorCode.BACKUP_INVALID, "备份校验未通过，已拒绝恢复。", status_code=400)
+        schema = await self._schema_state(verification["schema_version"])
+        if not schema["restore_allowed"]:
+            raise AppError(
+                ErrorCode.BACKUP_SCHEMA_INCOMPATIBLE,
+                schema["message"],
+                status_code=409,
+                details={
+                    "backup_schema": schema["backup_revision"],
+                    "current_schema": schema["current_revision"],
+                    "head_schema": schema["head_revision"],
+                },
+            )
         path = self._path_for(record)
 
         safety = await self.create_backup(note=f"恢复 {record.filename} 前的自动安全备份", actor="system")
@@ -390,6 +428,12 @@ class BackupService:
                 "filename": record.filename,
                 "safety_backup_id": safety["id"],
                 "verified_schema": verification["schema_version"],
+                "schema_status": schema["status"],
+                "backup_schema": schema["backup_revision"],
+                "current_schema": schema["current_revision"],
+                "head_schema": schema["head_revision"],
+                "backup_app_version": record.app_version,
+                "current_app_version": self.settings.app_version,
             },
             actor=actor,
         )
@@ -406,7 +450,7 @@ class BackupService:
             ],
         }
 
-    async def delete_backup(self, backup_id: str) -> None:
+    async def delete_backup(self, backup_id: str, *, actor: str = "local-admin") -> None:
         record = await self._record_by_id(backup_id)
         path = self._path_for(record)
         path.unlink(missing_ok=True)
@@ -421,6 +465,7 @@ class BackupService:
             target_type="backup",
             target_id=backup_id,
             details={"filename": record.filename},
+            actor=actor,
         )
 
     async def backup_file(self, backup_id: str) -> tuple[str, Path]:

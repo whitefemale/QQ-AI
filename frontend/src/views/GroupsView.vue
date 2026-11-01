@@ -2,7 +2,7 @@
   <div class="page">
     <PageHeader
       title="群聊管理"
-      description="只有登记并启用的白名单群才会触发 AI 回复。默认仅 @ 回复；频率、冷却、安静时段与关键词均在本地生效。"
+      description="只有登记并启用的白名单群才会触发 AI 回复。新建与导入的群默认「观察」，不会生成回复；频率、冷却、安静时段与关键词均在本地生效。"
     >
       <template #actions>
         <el-button :loading="loading" @click="load">刷新</el-button>
@@ -62,11 +62,17 @@
             <span v-else class="muted">全局默认 Provider</span>
           </template>
         </el-table-column>
-        <el-table-column label="限速" min-width="180">
+        <el-table-column label="限速" min-width="230">
           <template #default="{ row }">
-            <span class="muted">
-              冷却 {{ row.rate_limit.cooldown_seconds }}s · 时 {{ row.rate_limit.max_replies_per_hour }} · 日 {{ row.rate_limit.max_replies_per_day }} · 连续 {{ row.rate_limit.max_consecutive_replies }}
-            </span>
+            <div class="muted">
+              群：冷却 {{ row.rate_limit.cooldown_seconds }}s · 时 {{ row.rate_limit.max_replies_per_hour }} · 日 {{ row.rate_limit.max_replies_per_day }} · 连续 {{ row.rate_limit.max_consecutive_replies }}
+            </div>
+            <div class="muted">
+              每人：时 {{ row.rate_limit.max_replies_per_member_per_hour ?? '—' }} · 日 {{ row.rate_limit.max_replies_per_member_per_day ?? '—' }}
+            </div>
+            <div class="muted">
+              回复 ≤ {{ row.max_reply_chars_effective ?? '—' }} 字 · 上下文 {{ row.context_message_limit_effective ?? '—' }} 条
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="能力" min-width="180">
@@ -134,6 +140,16 @@
           </el-select>
           <div class="form-tip">{{ currentModeNote }}</div>
         </el-form-item>
+        <div class="threshold-grid">
+          <el-form-item label="回复字数上限">
+            <el-input-number v-model="form.max_reply_chars" :min="50" :max="2000" placeholder="使用全局值" />
+            <div class="form-tip">留空使用全局设置；范围 50–2000。</div>
+          </el-form-item>
+          <el-form-item label="上下文消息条数">
+            <el-input-number v-model="form.context_message_limit" :min="1" :max="100" placeholder="使用全局值" />
+            <div class="form-tip">留空使用全局设置；范围 1–100。</div>
+          </el-form-item>
+        </div>
         <el-form-item label="绑定人格">
           <el-select v-model="form.persona_id" style="width: 100%" clearable placeholder="使用账号默认/不绑定">
             <el-option v-for="persona in personas" :key="persona.id" :label="persona.name" :value="persona.id" />
@@ -250,6 +266,15 @@
           <el-form-item label="连续回复上限">
             <el-input-number v-model="form.rate_limit.max_consecutive_replies" :min="1" :max="50" />
           </el-form-item>
+          <el-form-item label="每人每小时">
+            <el-input-number v-model="form.rate_limit.max_replies_per_member_per_hour" :min="1" :max="100" />
+          </el-form-item>
+          <el-form-item label="每人每天">
+            <el-input-number v-model="form.rate_limit.max_replies_per_member_per_day" :min="1" :max="1000" />
+          </el-form-item>
+        </div>
+        <div class="form-tip">
+          每人限额只统计已发送（含状态未知）的 AI 回复，待审核草稿不占额度；命令回复不计入每人额度，但仍计入群级额度。
         </div>
 
         <el-divider content-position="left">安静时段</el-divider>
@@ -290,7 +315,7 @@
         </el-form-item>
         <el-form-item label="允许主动发言">
           <el-switch v-model="form.allow_proactive" />
-          <div class="form-tip">定时主动话题为规划能力；当前「上下文参与」仍受频率与连续回复限制。</div>
+          <div class="form-tip">「上下文参与」回复模式与定时主动话题仍在规划中，当前版本无法选择或保存该模式。</div>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -308,7 +333,8 @@ import { api, errorMessage } from '@/api/client'
 import type { Account, Group, LLMProvider, Persona } from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { DELETE_PHRASE, typedConfirm } from '@/utils/confirmation'
+import { ElMessage } from 'element-plus'
 
 interface ReplyMode {
   value: string
@@ -323,6 +349,8 @@ interface GroupForm {
   name: string
   enabled: boolean
   reply_mode: string
+  max_reply_chars: number | null
+  context_message_limit: number | null
   persona_id: string | null
   llm_provider_id: string | null
   llm_fallback_provider_id: string | null
@@ -335,6 +363,8 @@ interface GroupForm {
     max_replies_per_hour: number
     max_replies_per_day: number
     max_consecutive_replies: number
+    max_replies_per_member_per_hour: number
+    max_replies_per_member_per_day: number
   }
   quiet_hours: {
     enabled: boolean
@@ -365,6 +395,8 @@ const DEFAULT_RATE_LIMIT = {
   max_replies_per_hour: 8,
   max_replies_per_day: 60,
   max_consecutive_replies: 2,
+  max_replies_per_member_per_hour: 10,
+  max_replies_per_member_per_day: 50,
 }
 
 function emptyForm(): GroupForm {
@@ -373,7 +405,9 @@ function emptyForm(): GroupForm {
     platform_group_id: '',
     name: '',
     enabled: false,
-    reply_mode: 'mention_only',
+    reply_mode: 'observe',
+    max_reply_chars: null,
+    context_message_limit: null,
     persona_id: null,
     llm_provider_id: null,
     llm_fallback_provider_id: null,
@@ -415,7 +449,7 @@ function providerOptionLabel(provider: LLMProvider): string {
       : provider.provider_type === 'anthropic_native'
         ? 'Anthropic'
         : 'OpenAI 兼容'
-  return `${provider.name}（${typeLabel} · ${provider.model}）`
+  return `${provider.name}（${typeLabel} · ${provider.model || '未填写模型'}）`
 }
 
 function onPrimaryChange(): void {
@@ -472,6 +506,8 @@ function openEdit(group: Group): void {
     name: group.name ?? '',
     enabled: group.enabled,
     reply_mode: group.reply_mode,
+    max_reply_chars: group.max_reply_chars ?? null,
+    context_message_limit: group.context_message_limit ?? null,
     persona_id: group.persona_id,
     llm_provider_id: group.llm_provider_id,
     llm_fallback_provider_id: group.llm_fallback_provider_id,
@@ -523,6 +559,8 @@ async function saveGroup(): Promise<void> {
     name: form.name.trim(),
     enabled: form.enabled,
     reply_mode: form.reply_mode,
+    max_reply_chars: form.max_reply_chars ?? null,
+    context_message_limit: form.context_message_limit ?? null,
     persona_id: form.persona_id || null,
     llm_provider_id: form.llm_provider_id || null,
     llm_fallback_provider_id: form.llm_provider_id ? form.llm_fallback_provider_id || null : null,
@@ -589,18 +627,15 @@ async function resumeGroup(group: Group): Promise<void> {
 }
 
 async function deleteGroup(group: Group): Promise<void> {
+  const confirmed = await typedConfirm(
+    `移除「${group.name || group.platform_group_id}」会删除群配置、记忆与待审核候选，并取消该群所有待发送消息。历史消息会保留，但不再关联该群；此操作不可恢复。`,
+    DELETE_PHRASE,
+    '移除群',
+  )
+  if (!confirmed) return
   try {
-    await ElMessageBox.confirm(
-      `确定从白名单移除「${group.name || group.platform_group_id}」？历史消息不会自动删除。`,
-      '移除群',
-      { type: 'warning', confirmButtonText: '移除', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-  try {
-    await api(`/groups/${group.id}`, { method: 'DELETE' })
-    ElMessage.success('群已移除。')
+    await api(`/groups/${group.id}`, { method: 'DELETE', query: { confirm: DELETE_PHRASE } })
+    ElMessage.success('群已移除，历史消息已保留。')
     await load()
   } catch (err) {
     ElMessage.error(errorMessage(err))

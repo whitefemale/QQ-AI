@@ -20,9 +20,13 @@ DEFAULT_RATE_LIMITS = {
     "max_replies_per_hour": 20,
     "max_replies_per_day": 100,
     "max_consecutive_replies": 3,
+    "max_replies_per_member_per_hour": 10,
+    "max_replies_per_member_per_day": 50,
 }
 
-SUPPORTED_REPLY_MODES = {"mention_only", "keyword", "always", "observe"}
+SUPPORTED_REPLY_MODES = {"mention_only", "keyword", "always", "observe", "manual_confirm"}
+REPEAT_LOOP_WINDOW_SECONDS = 60
+REPEAT_LOOP_THRESHOLD = 4
 
 
 @dataclass
@@ -31,6 +35,8 @@ class RateLimitSnapshot:
     replies_last_hour: int = 0
     replies_today: int = 0
     consecutive_replies: int = 0
+    member_replies_last_hour: int = 0
+    member_replies_today: int = 0
 
     @property
     def cooldown_remaining_seconds(self) -> float:
@@ -73,6 +79,7 @@ class PolicyEngine:
     def __init__(self) -> None:
         self._last_sender: dict[str, str] = {}
         self._consecutive: dict[str, int] = {}
+        self._recent_texts: dict[tuple[str, str, str], list[tuple[datetime, str, str]]] = {}
 
     def _sync_sender(self, conversation_id: str, sender_id: str) -> None:
         previous = self._last_sender.get(conversation_id)
@@ -87,9 +94,12 @@ class PolicyEngine:
         if conversation_id is None:
             self._last_sender.clear()
             self._consecutive.clear()
+            self._recent_texts.clear()
             return
         self._last_sender.pop(conversation_id, None)
         self._consecutive.pop(conversation_id, None)
+        for key in [key for key in self._recent_texts if key[1] == conversation_id]:
+            self._recent_texts.pop(key, None)
 
     def hard_block(self, data: PolicyInput) -> PolicyDecision | None:
         message = data.message
@@ -103,6 +113,11 @@ class PolicyEngine:
             return PolicyDecision("intercept", "account_disabled", "账号已停用。")
         if data.global_paused:
             return PolicyDecision("intercept", "global_paused", "全局紧急暂停生效中。")
+        if message_is_empty(message):
+            return PolicyDecision("intercept", "invalid_message", "消息没有文本或媒体内容，已忽略。")
+        repeat = self._check_repeat_loop(data)
+        if repeat is not None:
+            return repeat
 
         if message.conversation_type == "group":
             if group is None:
@@ -144,9 +159,9 @@ class PolicyEngine:
             return PolicyDecision("observe", reason, "消息未直接触发 AI 回复，仅记录观察。")
 
         decision_reason, trigger_reason = trigger
-        limits = _rate_limits(group)
+        limits = rate_limits(group)
         if group is not None:
-            blocked = self._check_rate_limits(data, limits)
+            blocked = check_rate_limits(data.rate, limits, data.now)
             if blocked is not None:
                 return blocked
         return PolicyDecision(
@@ -170,6 +185,7 @@ class PolicyEngine:
             return None
         if mode == "observe":
             return None
+        # manual_confirm 与 mention_only 使用同一触发条件；差别只在生成后的入队状态。
 
         mentioned = message.mentions_user(data.self_platform_user_id) and not message.mention_all
         if mentioned:
@@ -187,35 +203,77 @@ class PolicyEngine:
                     return "keyword_matched", "keyword"
         return None
 
-    def _check_rate_limits(self, data: PolicyInput, limits: dict[str, float]) -> PolicyDecision | None:
-        now = data.now
-        cooldown = float(limits["cooldown_seconds"])
-        if cooldown > 0 and data.rate.last_reply_at is not None:
-            elapsed = (now - data.rate.last_reply_at).total_seconds()
-            if elapsed < cooldown:
-                remaining = round(cooldown - elapsed, 1)
-                return PolicyDecision(
-                    "intercept",
-                    "cooldown",
-                    f"冷却中，还需等待约 {remaining} 秒。",
-                )
-        hourly = int(limits["max_replies_per_hour"])
-        if hourly > 0 and data.rate.replies_last_hour >= hourly:
-            return PolicyDecision("intercept", "hourly_limit", f"已达到每小时最多 {hourly} 条回复的限制。")
-        daily = int(limits["max_replies_per_day"])
-        if daily > 0 and data.rate.replies_today >= daily:
-            return PolicyDecision("intercept", "daily_limit", f"已达到每日最多 {daily} 条回复的限制。")
-        consecutive = int(limits["max_consecutive_replies"])
-        if consecutive > 0 and data.rate.consecutive_replies >= consecutive:
+    def _check_repeat_loop(self, data: PolicyInput) -> PolicyDecision | None:
+        """进程内启发式：同一会话同一发送者 60 秒内重复完全相同文本。"""
+        message = data.message
+        text = str(message.text or "").strip()
+        if not text:
+            return None
+        key = (data.account.id, message.conversation_id, message.sender_id)
+        cutoff = data.now - timedelta(seconds=REPEAT_LOOP_WINDOW_SECONDS)
+        # hard_block 可能对同一条消息调用多次（命令判断 + 主判断）；按消息 ID 去重，
+        # 否则重复登记会把 2 条旧消息误算成 4 条并触发回环拦截。
+        unique: dict[str, tuple[datetime, str, str]] = {}
+        for item in self._recent_texts.get(key, []):
+            if item[0] >= cutoff:
+                unique[item[2]] = item
+        entries = [item for item in unique.values() if item[2] != message.message_id]
+        repeat_count = sum(1 for _ts, item_text, _mid in entries if item_text == text) + 1
+        if message.message_id not in unique:
+            unique[message.message_id] = (data.now, text, message.message_id)
+        self._recent_texts[key] = list(unique.values())[-20:]
+        if repeat_count >= REPEAT_LOOP_THRESHOLD:
             return PolicyDecision(
                 "intercept",
-                "consecutive_limit",
-                f"同一成员连续触发已达 {consecutive} 次，等待其他成员参与后再回复。",
+                "repeat_loop",
+                "检测到短时间内完全相同的重复消息，已停止回复以避免刷屏或回环。",
             )
         return None
 
     def current_consecutive(self, conversation_id: str) -> int:
         return self._consecutive.get(conversation_id, 0)
+
+
+def check_rate_limits(rate: RateLimitSnapshot, limits: dict[str, float], now: datetime) -> PolicyDecision | None:
+    """流水线与人工批准共用的纯限频判定。"""
+    cooldown = float(limits["cooldown_seconds"])
+    if cooldown > 0 and rate.last_reply_at is not None:
+        elapsed = (now - rate.last_reply_at).total_seconds()
+        if elapsed < cooldown:
+            remaining = round(cooldown - elapsed, 1)
+            return PolicyDecision(
+                "intercept",
+                "cooldown",
+                f"冷却中，还需等待约 {remaining} 秒。",
+            )
+    hourly = int(limits["max_replies_per_hour"])
+    if hourly > 0 and rate.replies_last_hour >= hourly:
+        return PolicyDecision("intercept", "hourly_limit", f"已达到每小时最多 {hourly} 条回复的限制。")
+    daily = int(limits["max_replies_per_day"])
+    if daily > 0 and rate.replies_today >= daily:
+        return PolicyDecision("intercept", "daily_limit", f"已达到每日最多 {daily} 条回复的限制。")
+    consecutive = int(limits["max_consecutive_replies"])
+    if consecutive > 0 and rate.consecutive_replies >= consecutive:
+        return PolicyDecision(
+            "intercept",
+            "consecutive_limit",
+            f"同一成员连续触发已达 {consecutive} 次，等待其他成员参与后再回复。",
+        )
+    member_hourly = int(limits["max_replies_per_member_per_hour"])
+    if member_hourly > 0 and rate.member_replies_last_hour >= member_hourly:
+        return PolicyDecision(
+            "intercept",
+            "member_hourly_limit",
+            f"该成员每小时最多触发 {member_hourly} 条回复，请稍后再试。",
+        )
+    member_daily = int(limits["max_replies_per_member_per_day"])
+    if member_daily > 0 and rate.member_replies_today >= member_daily:
+        return PolicyDecision(
+            "intercept",
+            "member_daily_limit",
+            f"该成员今日最多触发 {member_daily} 条回复，请明天再试。",
+        )
+    return None
 
 
 def _quiet_with_timezone(group: Group) -> dict:
@@ -225,7 +283,7 @@ def _quiet_with_timezone(group: Group) -> dict:
     return quiet
 
 
-def _rate_limits(group: Group | None) -> dict[str, float]:
+def rate_limits(group: Group | None) -> dict[str, float]:
     limits: dict[str, float] = {key: float(value) for key, value in DEFAULT_RATE_LIMITS.items()}
     if group is None:
         return limits
@@ -251,12 +309,20 @@ async def build_rate_snapshot(
         return RateLimitSnapshot(consecutive_replies=policy.current_consecutive(message.conversation_id))
     last_hour = await message_service.outbound_stats(group.id, now - timedelta(hours=1))
     today = await message_service.outbound_stats(group.id, start_of_day_utc(now, group.timezone))
+    member_hour = await message_service.outbox_stats_by_origin(
+        group.account_id, group.id, message.sender_id, now - timedelta(hours=1)
+    )
+    member_today = await message_service.outbox_stats_by_origin(
+        group.account_id, group.id, message.sender_id, start_of_day_utc(now, group.timezone)
+    )
     last_reply_at: datetime | None = last_hour.get("last_at")
     return RateLimitSnapshot(
         last_reply_at=last_reply_at,
         replies_last_hour=int(last_hour.get("count") or 0),
         replies_today=int(today.get("count") or 0),
         consecutive_replies=policy.current_consecutive(message.conversation_id),
+        member_replies_last_hour=int(member_hour.get("count") or 0),
+        member_replies_today=int(member_today.get("count") or 0),
     )
 
 
@@ -265,7 +331,21 @@ def effective_self_id(account: Account, adapter_self_id: str | None) -> str | No
 
 
 def message_is_empty(message: CanonicalMessage) -> bool:
-    return not message.text and not message.media_segments
+    return not str(message.text or "").strip() and not message.media_segments
+
+
+def quiet_hours_decision(group: Group | None, now: datetime) -> PolicyDecision | None:
+    if group is not None and in_quiet_hours(now, _quiet_with_timezone(group)):
+        return PolicyDecision("intercept", "quiet_hours", "当前处于群安静时段，已阻止发送。")
+    return None
+
+
+def effective_max_reply_chars(group: Group | None, default: int) -> int:
+    return int(group.max_reply_chars) if group is not None and group.max_reply_chars else int(default)
+
+
+def effective_context_limit(group: Group | None, default: int) -> int:
+    return int(group.context_message_limit) if group is not None and group.context_message_limit else int(default)
 
 
 def get_message_row_status(message: Message | None) -> str | None:

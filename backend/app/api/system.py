@@ -10,16 +10,10 @@ from app.api.deps import as_payload, get_actor, get_runtime
 from app.core.errors import AppError, ErrorCode
 from app.core.response import ok
 from app.core.time import iso_utc, utcnow
-from app.models.account import Account
 from app.models.governance import AuditLog
-from app.models.group import Group
-from app.models.media import MediaAsset
-from app.models.memory import Memory, MemoryCandidate
-from app.models.message import Message
-from app.models.persona import Persona
-from app.models.provider import LLMProvider
 from app.runtime import AppRuntime
 from app.services.audit import write_audit
+from app.services.privacy_service import privacy_overview
 from app.services.retention import RETENTION_AUTO_KEY, normalize_retention_days
 from app.services.settings_store import (
     get_global_pause,
@@ -78,6 +72,30 @@ async def dashboard(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, Any
 @router.get("/capabilities")
 async def capabilities(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, Any]:
     media = await runtime.providers.capability_overview()
+    connections: list[dict[str, Any]] = []
+    for mode in runtime.manager.adapter_factory.modes():
+        item: dict[str, Any] = {
+            "mode": mode["value"],
+            "name": mode["label"],
+            "state": mode["state"],
+            "note": mode["note"],
+            "interface": "BaseQQAdapter",
+        }
+        if mode["value"] == "onebot11":
+            item["capabilities"] = {
+                "receive": ["text", "mention", "reply", "image", "audio"],
+                "send": ["text", "reply", "mention"],
+                "media_download": False,
+                "note": "当前版本不下载或转存真实图片/语音；AI 只能看到「未配置识别能力」的提示。",
+            }
+            item["verification"] = {
+                "protocol_implemented": True,
+                "automated_tests": "local_fake_server",
+                "real_qq_verified": False,
+                "identity_required_for_online": True,
+                "note": "自动化测试只使用本机假服务器；真实 QQ 登录、入站消息与出站发送尚未在本仓库验证。",
+            }
+        connections.append(item)
     return ok(
         {
             "media": media,
@@ -89,32 +107,7 @@ async def capabilities(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, 
                     "Anthropic 原生 Messages API 已可配置，但需要用户提供真实 API Key。"
                 ),
             },
-            "connections": [
-                {
-                    "mode": "mock",
-                    "name": "Mock 连接器",
-                    "state": "available",
-                    "note": "仅用于本地演示与测试，不会连接真实 QQ。",
-                },
-                {
-                    "mode": "onebot11",
-                    "name": "OneBot 11（NapCat 等）",
-                    "state": "available",
-                    "note": "需用户自行安装并登录连接器，仅允许回环/私网地址，除非显式确认公网风险。",
-                    "capabilities": {
-                        "receive": ["text", "mention", "reply", "image", "audio"],
-                        "send": ["text", "reply", "mention"],
-                        "media_download": False,
-                        "note": "当前版本不下载或转存真实图片/语音；AI 只能看到「未配置识别能力」的提示。",
-                    },
-                },
-                {
-                    "mode": "official",
-                    "name": "官方 QQ 机器人",
-                    "state": "planned",
-                    "note": "仅为规划占位，当前版本不可用。",
-                },
-            ],
+            "connections": connections,
             "features": [
                 {
                     "key": "long_term_memory",
@@ -213,6 +206,15 @@ async def capabilities(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, 
                         "自动清理默认关闭，需管理员显式开启；清理不调用模型、不发送消息，日志只删除 app.log.*。"
                     ),
                 },
+                {
+                    "key": "managed_connector_install",
+                    "state": "available",
+                    "note": (
+                        "本机专用连接器页可下载/校验/解压官方包、显式运行安装器、启停受管进程、"
+                        "写配置前加密快照与回滚。所有第三方动作需本机确认词；不自动更新/卸载。"
+                        "真实安装器、QQ 登录与收发尚未验证。"
+                    ),
+                },
                 {"key": "scheduled_topic", "state": "planned", "note": "定时话题尚未实现。"},
             ],
         }
@@ -220,29 +222,7 @@ async def capabilities(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, 
 
 
 async def _privacy_overview(runtime: AppRuntime) -> dict[str, Any]:
-    async with runtime.database.session() as session:
-        counts = {
-            "accounts": int(await session.scalar(select(func.count(Account.id))) or 0),
-            "groups": int(await session.scalar(select(func.count(Group.id))) or 0),
-            "personas": int(await session.scalar(select(func.count(Persona.id))) or 0),
-            "providers": int(await session.scalar(select(func.count(LLMProvider.id))) or 0),
-            "messages": int(await session.scalar(select(func.count(Message.id))) or 0),
-            "media_assets": int(await session.scalar(select(func.count(MediaAsset.id))) or 0),
-            "memories": int(await session.scalar(select(func.count(Memory.id))) or 0),
-            "memory_candidates": int(await session.scalar(select(func.count(MemoryCandidate.id))) or 0),
-        }
-    return {
-        "counts": counts,
-        "notes": [
-            "消息仅来自用户自行接入的 QQ 账号与白名单群。",
-            "Token 与 API Key 使用本地密钥加密存储，接口只返回掩码。",
-            "备份只包含数据库，不包含媒体文件与加密密钥。",
-            "长期记忆仅在显式开启的群内检索；只使用本群与当前发送者的普通敏感度记忆，不跨群。",
-            "敏感记忆、已过期记忆、被排除成员的成员级记忆不会自动注入提示词。",
-            "AI 记忆候选只用于人工审核，批准前不是正式记忆、不会注入提示词；已审核候选记录保留在本地供追溯。",
-            "自动清理默认关闭；手动或开启后的清理只删除超过保留期限的本地数据，日志仅处理 app.log.* 轮转文件。",
-        ],
-    }
+    return await privacy_overview(runtime.database)
 
 
 @router.get("/settings")
@@ -266,6 +246,7 @@ async def read_settings(runtime: AppRuntime = Depends(get_runtime)) -> dict[str,
                 "admin_token_configured": bool(runtime.settings.admin_api_token),
                 "credential_key_configured": runtime.cipher.available,
                 "cors_origins": runtime.settings.cors_origin_list,
+                "allowed_hosts": runtime.settings.allowed_host_list,
             },
             "privacy": await _privacy_overview(runtime),
         }
@@ -327,12 +308,20 @@ async def retention_status(runtime: AppRuntime = Depends(get_runtime)) -> dict[s
     return ok(await runtime.retention.status())
 
 
+@router.get("/system/retention/preview")
+async def retention_preview(runtime: AppRuntime = Depends(get_runtime)) -> dict[str, Any]:
+    """只读统计；不删除数据、不写审计、不更新上次运行记录。"""
+    return ok(await runtime.retention.preview())
+
+
 @router.post("/system/retention/run")
 async def retention_run(
     request: Request,
+    payload: dict[str, Any] | None = Body(default=None),
     runtime: AppRuntime = Depends(get_runtime),
 ) -> dict[str, Any]:
-    summary = await runtime.retention.run(trigger="manual", actor=get_actor(request))
+    confirm = str(as_payload(payload).get("confirm") or "")
+    summary = await runtime.retention.run(trigger="manual", actor=get_actor(request), confirm=confirm)
     return ok(summary)
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TimestampMixin, UTCDateTime, new_id
@@ -23,7 +23,10 @@ class Group(Base, TimestampMixin):
     name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    reply_mode: Mapped[str] = mapped_column(String(32), default="mention_only", nullable=False)
+    reply_mode: Mapped[str] = mapped_column(String(32), default="observe", nullable=False)
+    # 为空表示跟随全局 settings.max_reply_chars / context_message_limit。
+    max_reply_chars: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    context_message_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     persona_id: Mapped[str | None] = mapped_column(
         String(64), ForeignKey("personas.id", ondelete="SET NULL"), nullable=True
     )

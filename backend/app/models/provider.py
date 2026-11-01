@@ -29,6 +29,9 @@ class LLMProvider(Base, TimestampMixin):
     config_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_tested_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    # 显式测试证据：只保存白名单元数据与截断预览，不保存提示词、Key 或完整响应。
+    last_test_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    last_generation_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class ProviderRegistry(Base, TimestampMixin):

@@ -49,7 +49,15 @@ class Message(Base, TimestampMixin):
 
 class OutboxMessage(Base, TimestampMixin):
     __tablename__ = "outbox_messages"
-    __table_args__ = (Index("ix_outbox_status_next", "status", "next_attempt_at"),)
+    __table_args__ = (
+        Index("ix_outbox_status_next", "status", "next_attempt_at"),
+        Index(
+            "ix_outbox_group_origin_sent",
+            "group_id",
+            "origin_member_platform_user_id",
+            "sent_at",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
     account_id: Mapped[str] = mapped_column(
@@ -62,6 +70,9 @@ class OutboxMessage(Base, TimestampMixin):
     conversation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     conversation_type: Mapped[str] = mapped_column(String(16), default="group", nullable=False)
     reply_to_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 每人限频统计口径：只统计 reply_kind=reply 且 status=sent/unknown 的行。
+    origin_member_platform_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reply_kind: Mapped[str] = mapped_column(String(32), default="reply", nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)

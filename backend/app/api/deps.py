@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.errors import AppError, ErrorCode
 from app.runtime import AppRuntime
 from fastapi import Request
 
@@ -21,6 +22,12 @@ def get_actor(request: Request) -> str:
 
 def as_payload(value: dict[str, Any] | None) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def require_confirmation(value: str | None, phrase: str, message: str) -> None:
+    """破坏性操作的服务端二次确认；缺失或不匹配时返回统一错误码。"""
+    if (value or "").strip() != phrase:
+        raise AppError(ErrorCode.CONFIRMATION_REQUIRED, message, status_code=400)
 
 
 def bool_query(value: str | None) -> bool | None:

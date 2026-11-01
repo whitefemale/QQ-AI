@@ -19,8 +19,8 @@ htmlcov/
 dist/
 build/
 
-# 数据
-data/
+# 数据（保留目录占位，不提交数据库/日志/备份）
+data/*
 !data/.gitkeep
 *.db
 *.db-wal
@@ -44,3 +44,12 @@ Thumbs.db
 # 备份包
 backups/
 *.zip
+
+# 本地发布产物与截图（构建记录写入 docs/ROADMAP.md 与 release/BUILD_INFO.json）
+/release/
+desktop/.smoke/
+# 由 scripts/make_icon.py 从 icon.png 生成
+desktop/assets/icon.ico
+
+# 用户自行下载的第三方连接器（不随仓库分发）
+connectors/

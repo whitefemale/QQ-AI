@@ -2,6 +2,7 @@
 // 功能预算只接受这些固定键，避免任意文本成为作用域 ID。
 export const FEATURE_OPTIONS = [
   { value: 'chat', label: '聊天回复' },
+  { value: 'provider_test', label: '模型测试' },
   { value: 'persona_growth', label: '人格成长' },
   { value: 'memory_extraction', label: '记忆提取' },
   { value: 'media.image.describe', label: '图片描述' },

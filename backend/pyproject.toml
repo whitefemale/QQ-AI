@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai-group-friend"
-version = "0.1.0"
+version = "0.2.1"
 description = "本地优先的 AI 群友 QQ 管理平台"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,6 +33,10 @@ dev = [
   "asgi-lifespan>=2.1",
   "ruff>=0.11",
   "mypy>=1.15",
+]
+# 仅在构建 Windows 发行包时需要；普通开发/测试不安装。
+packaging = [
+  "pyinstaller>=6.16",
 ]
 
 [tool.hatch.build.targets.wheel]

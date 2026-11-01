@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.api.deps import as_payload, get_actor, get_runtime
+from app.api.deps import as_payload, get_actor, get_runtime, require_confirmation
 from app.core.response import ok
 from app.runtime import AppRuntime
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import FileResponse
 
 router = APIRouter()
@@ -62,10 +62,12 @@ async def restore_backup(
 @router.delete("/backups/{backup_id}")
 async def delete_backup(
     backup_id: str,
+    confirm: str | None = Query(default=None),
     runtime: AppRuntime = Depends(get_runtime),
     actor: str = Depends(get_actor),
 ) -> dict[str, Any]:
-    await runtime.backups.delete_backup(backup_id)
+    require_confirmation(confirm, "DELETE", "删除备份文件不可恢复；请输入 DELETE 以确认。")
+    await runtime.backups.delete_backup(backup_id, actor=actor)
     return ok({"deleted": True, "id": backup_id})
 
 

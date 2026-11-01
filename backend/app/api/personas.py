@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.api.deps import as_payload, get_actor, get_runtime
+from app.api.deps import as_payload, get_actor, get_runtime, require_confirmation
 from app.core.errors import AppError, ErrorCode
 from app.core.response import ok
 from app.models.persona import DEFAULT_PERSONA_THRESHOLDS
@@ -155,6 +155,15 @@ async def get_persona(persona_id: str, runtime: AppRuntime = Depends(get_runtime
     return ok(await runtime.personas.detail(persona_id))
 
 
+@router.post("/personas/{persona_id}/preview")
+async def preview_persona_update(
+    persona_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    return ok(await runtime.personas.preview_update(persona_id, as_payload(payload)))
+
+
 @router.patch("/personas/{persona_id}")
 async def update_persona(
     persona_id: str,
@@ -168,9 +177,15 @@ async def update_persona(
 @router.delete("/personas/{persona_id}")
 async def delete_persona(
     persona_id: str,
+    confirm: str | None = Query(default=None),
     runtime: AppRuntime = Depends(get_runtime),
     actor: str = Depends(get_actor),
 ) -> dict[str, Any]:
+    require_confirmation(
+        confirm,
+        "DELETE",
+        "删除人格会同时删除其版本与成长记录，且不可恢复；请输入 DELETE 以确认。",
+    )
     await runtime.personas.delete_persona(persona_id, actor=actor)
     return ok({"deleted": True, "id": persona_id})
 
@@ -220,6 +235,15 @@ async def list_events(
     return ok({"items": await runtime.personas.list_events(persona_id, limit=limit)})
 
 
+@router.get("/personas/{persona_id}/events/{event_id}/evidence")
+async def get_event_evidence(
+    persona_id: str,
+    event_id: str,
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    return ok(await runtime.personas.event_evidence(persona_id, event_id))
+
+
 @router.get("/personas/{persona_id}/versions")
 async def list_versions(
     persona_id: str,
@@ -227,6 +251,15 @@ async def list_versions(
 ) -> dict[str, Any]:
     await runtime.personas.get_persona(persona_id)
     return ok({"items": await runtime.personas.list_versions(persona_id)})
+
+
+@router.get("/personas/{persona_id}/versions/{version_id}")
+async def get_version(
+    persona_id: str,
+    version_id: str,
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    return ok(await runtime.personas.version_detail(persona_id, version_id))
 
 
 @router.post("/personas/{persona_id}/versions/{version_id}/restore")

@@ -222,17 +222,86 @@ async def test_context_length_error_has_actionable_message() -> None:
     assert "长度限制" in caught.value.message
 
 
-async def test_connection_test_reports_failure_without_raising() -> None:
+async def test_rate_limit_exposes_retry_after_and_safety() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, json={"error": {"type": "authentication_error", "message": "bad key"}})
+        return httpx.Response(
+            429,
+            headers={"retry-after": "7"},
+            json={"error": {"type": "rate_limit_error", "message": "slow down"}},
+        )
 
     provider = _provider()
     provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     try:
-        result = await provider.test_connection()
+        with pytest.raises(AppError) as caught:
+            await _generate(provider)
     finally:
         await provider.close()
-    assert result.ok is False
-    assert result.error_code == ErrorCode.LLM_AUTH_FAILED
-    assert result.message
-    assert result.details["elapsed_ms"] >= 0
+
+    assert caught.value.code == ErrorCode.LLM_RATE_LIMITED
+    assert caught.value.retryable is True
+    assert caught.value.details["retry_after_seconds"] == 7.0
+    assert caught.value.details["retry_safety"] == "safe"
+
+
+async def test_models_are_paginated_and_deduplicated() -> None:
+    calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append({"url": str(request.url), "params": dict(request.url.params)})
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "claude-sonnet-5", "type": "model", "display_name": "Sonnet"},
+                        {"id": "claude-haiku-4-5", "type": "model"},
+                    ],
+                    "has_more": True,
+                    "last_id": "claude-haiku-4-5",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "claude-haiku-4-5", "type": "model"},
+                    {"id": "claude-opus-5", "type": "model"},
+                ],
+                "has_more": False,
+            },
+        )
+
+    provider = _provider("https://api.example.invalid")
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        result = await provider.list_models(timeout_seconds=3)
+    finally:
+        await provider.close()
+
+    assert calls[0]["url"].startswith("https://api.example.invalid/v1/models?")
+    assert calls[0]["params"]["limit"] == "100"
+    assert "after_id" not in calls[0]["params"]
+    assert calls[1]["params"]["after_id"] == "claude-haiku-4-5"
+    assert result.supported is True
+    assert result.state == "available"
+    assert [item.id for item in result.models] == ["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"]
+    assert result.current_model_listed is True
+    assert result.truncated is False
+
+
+async def test_models_endpoint_missing_means_unsupported() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"type": "not_found_error", "message": "no models"}})
+
+    provider = _provider()
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        result = await provider.list_models()
+    finally:
+        await provider.close()
+
+    assert result.supported is False
+    assert result.state == "unsupported"
+    assert result.models == []
+    assert "手动填写" in (result.message or "")

@@ -285,8 +285,16 @@
                   </div>
                   <div class="muted">{{ event.evidence_summary }}</div>
                   <p v-if="event.diff_summary" class="diff-summary">变化摘要：{{ event.diff_summary }}</p>
-                  <pre class="proposal-pre">{{ JSON.stringify(event.proposal, null, 2) }}</pre>
+                  <PersonaDiffView :diff="event.diff" empty-text="该提案没有可展示的差异快照。" />
+                  <el-alert
+                    v-if="event.impact?.skipped_locked.length"
+                    type="warning"
+                    :closable="false"
+                    show-icon
+                    :title="`锁定字段将被跳过：${event.impact.skipped_locked.join('、')}`"
+                  />
                   <div class="row-actions">
+                    <el-button size="small" @click="openEvidence(event)">查看依据</el-button>
                     <el-button size="small" type="success" @click="review(event, true)">批准并应用</el-button>
                     <el-button size="small" type="danger" plain @click="review(event, false)">拒绝</el-button>
                   </div>
@@ -296,7 +304,7 @@
               <div class="grid grid-2">
                 <div class="card">
                   <div class="card-title">版本历史</div>
-                  <el-empty v-if="!selected.versions?.length" description="暂无版本" :image-size="50" />
+                  <el-empty v-if="!selected.versions?.length" description="尚无版本记录。" :image-size="50" />
                   <el-table v-else :data="selected.versions" size="small" max-height="360">
                     <el-table-column label="版本" width="70">
                       <template #default="{ row }">v{{ row.version_no }}</template>
@@ -305,8 +313,9 @@
                     <el-table-column label="时间" width="140">
                       <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
                     </el-table-column>
-                    <el-table-column label="操作" width="90">
+                    <el-table-column label="操作" width="140">
                       <template #default="{ row }">
+                        <el-button size="small" text @click="openVersion(row)">查看差异</el-button>
                         <el-button size="small" text type="primary" :disabled="!row.restorable" @click="restoreVersion(row)">回滚</el-button>
                       </template>
                     </el-table-column>
@@ -314,7 +323,7 @@
                 </div>
                 <div class="card">
                   <div class="card-title">成长事件</div>
-                  <el-empty v-if="!selected.events?.length" description="暂无成长事件" :image-size="50" />
+                  <el-empty v-if="!selected.events?.length" description="暂无人格成长或审核事件。" :image-size="50" />
                   <el-timeline v-else>
                     <el-timeline-item
                       v-for="event in selected.events.slice(0, 20)"
@@ -453,6 +462,60 @@
         <el-button type="primary" :loading="creating" @click="createPersona">创建</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="previewDialog" title="保存前预览" width="760px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="预览不会写入数据库"
+        :description="previewData?.note ?? '确认后仍需保存才会生成新版本。'"
+      />
+      <PersonaDiffView :diff="previewData?.diff" empty-text="没有检测到变更，保存不会产生新版本内容。" />
+      <template #footer>
+        <el-button @click="previewDialog = false">取消</el-button>
+        <el-button type="primary" :loading="saving" :disabled="!previewData?.changes.length" @click="confirmSave">
+          确认保存
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="versionDialog" title="版本差异" width="760px">
+      <div v-if="versionDetail" class="version-head">
+        <strong>v{{ versionDetail.version_no }}</strong>
+        <span class="muted">{{ versionDetail.change_summary }} · {{ formatTime(versionDetail.created_at) }}</span>
+        <el-alert type="info" :closable="false" show-icon :title="versionDetail.note" />
+      </div>
+      <PersonaDiffView :diff="versionDetail?.diff" empty-text="该版本与当前状态没有可展示的差异。" />
+      <template #footer>
+        <el-button @click="versionDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="evidenceDialog" title="提案依据" width="720px">
+      <el-alert type="info" :closable="false" show-icon :title="evidenceNote" />
+      <el-table v-loading="evidenceLoading" :data="evidenceItems" size="small">
+        <el-table-column label="时间" width="150">
+          <template #default="{ row }">{{ row.timestamp ? formatTime(row.timestamp) : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="群 / 发送者" width="180">
+          <template #default="{ row }">
+            <div>{{ row.group_name || row.group_id || '—' }}</div>
+            <div class="muted">{{ row.sender_name || '—' }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="脱敏预览" min-width="260">
+          <template #default="{ row }">
+            <span v-if="row.missing" class="muted">消息已删除或不在绑定群范围内。</span>
+            <span v-else>{{ row.preview || '（无文本）' }}</span>
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-empty v-if="!evidenceLoading && !evidenceItems.length" description="该提案没有可查看的消息证据。" :image-size="50" />
+      <template #footer>
+        <el-button @click="evidenceDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -460,9 +523,23 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 
 import { api, errorMessage } from '@/api/client'
-import type { Account, EvolutionEvent, Group, Persona, PersonaTemplate, PersonaTrait, PersonaVersion } from '@/api/types'
+import type {
+  Account,
+  EvolutionEvent,
+  Group,
+  Persona,
+  PersonaEvidenceItem,
+  PersonaEvidencePayload,
+  PersonaPreview,
+  PersonaTemplate,
+  PersonaTrait,
+  PersonaVersion,
+  PersonaVersionDetail,
+} from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
+import PersonaDiffView from '@/components/PersonaDiffView.vue'
 import StateTag from '@/components/StateTag.vue'
+import { DELETE_PHRASE, typedConfirm } from '@/utils/confirmation'
 import { formatTime } from '@/utils/format'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -536,6 +613,16 @@ const traitFilter = ref<string | undefined>(undefined)
 const analysisGroupId = ref<string | undefined>(undefined)
 const pending = ref<EvolutionEvent[]>([])
 const lastOutcome = ref<GrowthOutcome | null>(null)
+
+const previewDialog = ref(false)
+const previewData = ref<PersonaPreview | null>(null)
+const pendingSaveBody = ref<Record<string, unknown> | null>(null)
+const versionDialog = ref(false)
+const versionDetail = ref<PersonaVersionDetail | null>(null)
+const evidenceDialog = ref(false)
+const evidenceLoading = ref(false)
+const evidenceItems = ref<PersonaEvidenceItem[]>([])
+const evidenceNote = ref('')
 
 const seeded = ref(false)
 const createDialog = ref(false)
@@ -765,14 +852,65 @@ async function savePersona(): Promise<void> {
   }
   saving.value = true
   try {
-    await api(`/personas/${selected.value.id}`, { method: 'PATCH', body })
+    const preview = await api<PersonaPreview>(`/personas/${selected.value.id}/preview`, {
+      method: 'POST',
+      body,
+    })
+    previewData.value = preview
+    pendingSaveBody.value = body
+    previewDialog.value = true
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  } finally {
+    saving.value = false
+  }
+}
+
+async function confirmSave(): Promise<void> {
+  if (!selected.value || !pendingSaveBody.value) return
+  saving.value = true
+  try {
+    await api(`/personas/${selected.value.id}`, { method: 'PATCH', body: pendingSaveBody.value })
     ElMessage.success('人格配置已保存并生成新版本。')
+    previewDialog.value = false
+    pendingSaveBody.value = null
     await loadBasics()
     await loadDetail(selected.value.id)
   } catch (err) {
     ElMessage.error(errorMessage(err))
   } finally {
     saving.value = false
+  }
+}
+
+async function openVersion(version: PersonaVersion): Promise<void> {
+  if (!selected.value) return
+  try {
+    versionDetail.value = await api<PersonaVersionDetail>(
+      `/personas/${selected.value.id}/versions/${version.id}`,
+    )
+    versionDialog.value = true
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  }
+}
+
+async function openEvidence(event: EvolutionEvent): Promise<void> {
+  if (!selected.value) return
+  evidenceDialog.value = true
+  evidenceLoading.value = true
+  evidenceItems.value = []
+  evidenceNote.value = '只展示该人格绑定群范围内的证据消息；已删除或越权的消息标记为缺失。'
+  try {
+    const data = await api<PersonaEvidencePayload>(
+      `/personas/${selected.value.id}/events/${event.id}/evidence`,
+    )
+    evidenceItems.value = data.items
+    evidenceNote.value = data.note
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  } finally {
+    evidenceLoading.value = false
   }
 }
 
@@ -913,17 +1051,14 @@ async function resetPersona(): Promise<void> {
 }
 
 async function deletePersona(persona: Persona): Promise<void> {
+  const confirmed = await typedConfirm(
+    `删除人格「${persona.name}」会同时删除其版本、成长记录与证据，绑定该人格的群需要重新选择人格。此操作不可恢复。`,
+    DELETE_PHRASE,
+    '删除人格',
+  )
+  if (!confirmed) return
   try {
-    await ElMessageBox.confirm(
-      `确定删除人格「${persona.name}」？绑定该人格的群需要重新选择人格。`,
-      '删除人格',
-      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-  try {
-    await api(`/personas/${persona.id}`, { method: 'DELETE' })
+    await api(`/personas/${persona.id}`, { method: 'DELETE', query: { confirm: DELETE_PHRASE } })
     ElMessage.success('人格已删除。')
     if (selectedId.value === persona.id) {
       selectedId.value = null
@@ -1106,6 +1241,14 @@ onMounted(loadBasics)
   border-radius: 9px;
   padding: 10px 12px;
   margin-bottom: 10px;
+}
+
+.version-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
 }
 
 .pending-head {

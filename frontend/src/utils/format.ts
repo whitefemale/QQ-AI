@@ -64,7 +64,10 @@ export const STATE_LABELS: Record<string, string> = {
   disconnected: '未连接',
   unconfigured: '未配置',
   connecting: '连接中',
+  connected_unverified: '已连接 · 身份未验证',
   reconnecting: '重连中',
+  identity_verified: '身份已验证 · 真实收发未验证',
+  not_verified: '未验证',
   error: '错误',
   disabled: '已停用',
   enabled: '已启用',
@@ -109,8 +112,15 @@ export const STATE_LABELS: Record<string, string> = {
   cross_group: '跨群学习',
   observe: '仅观察',
   mention_only: '仅 @ 回复',
-  keyword: '关键词触发',
-  always: '所有消息',
+  manual_confirm: '手动确认',
+  keyword: '关键词触发（高级）',
+  always: '自动回复',
+  pending_approval: '待确认发送',
+  awaiting_approval: '待人工确认',
+  sensitive_output: '疑似敏感内容',
+  empty_output: '空回复被拦截',
+  repeat_loop: '重复刷屏拦截',
+  invalid_message: '无效消息拦截',
   low: '低风险',
   medium: '中风险',
   high: '高风险',
@@ -126,10 +136,10 @@ export function stateTag(value?: string | null): TagType {
   if (['online', 'available', 'healthy', 'sent', 'succeeded', 'stable', 'applied', 'builtin_active'].includes(value)) {
     return 'success'
   }
-  if (['error', 'failed', 'incompatible', 'rejected', 'high', 'intercepted'].includes(value)) {
+  if (['error', 'failed', 'incompatible', 'rejected', 'high', 'intercepted', 'sensitive_output'].includes(value)) {
     return 'danger'
   }
-  if (['reconnecting', 'connecting', 'pending', 'sending', 'queued', 'running', 'candidate', 'pending_review', 'unknown', 'mock_only', 'warning', 'paused'].includes(value)) {
+  if (['reconnecting', 'connecting', 'connected_unverified', 'identity_verified', 'not_verified', 'pending', 'sending', 'queued', 'running', 'candidate', 'pending_review', 'unknown', 'mock_only', 'warning', 'paused', 'pending_approval', 'awaiting_approval', 'repeat_loop'].includes(value)) {
     return 'warning'
   }
   if (['planned', 'unconfigured', 'disabled', 'runtime_planned', 'unsupported_by_adapter'].includes(value)) {
@@ -150,6 +160,7 @@ const EVENT_LABELS: Record<string, string> = {
   'command.handled': '命令处理',
   'reply.generated': '生成回复',
   'reply.failed': '回复失败',
+  'reply.awaiting_approval': '回复待人工确认',
   'outbox.sent': '消息已发送',
   'outbox.failed': '发送失败',
   'outbox.unknown': '发送状态未知',

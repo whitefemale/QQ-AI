@@ -1,5 +1,6 @@
 'use strict'
 
+const cryptoDefault = require('node:crypto')
 const fsDefault = require('node:fs')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
@@ -126,16 +127,82 @@ function createCommandRunner({ spawnImpl = spawn, logger = null } = {}) {
   }
 }
 
+function isConfiguredEnvValue(value) {
+  const trimmed = String(value ?? '').trim()
+  return Boolean(trimmed) && !trimmed.startsWith('replace-with') && !trimmed.startsWith('<')
+}
+
 function readEnvKeyState(envFile, fsImpl = fsDefault) {
   try {
     const text = fsImpl.readFileSync(envFile, 'utf8')
     const match = text.match(/^CREDENTIAL_ENCRYPTION_KEY=(.*)$/mu)
     if (!match) return 'missing'
-    const value = match[1].trim()
-    if (!value || value.startsWith('replace-with') || value.startsWith('<')) return 'placeholder'
-    return 'configured'
+    return isConfiguredEnvValue(match[1]) ? 'configured' : 'placeholder'
   } catch {
     return 'missing'
+  }
+}
+
+function readEnvValue(text, key) {
+  const match = String(text).match(new RegExp(`^${key}=(.*)$`, 'mu'))
+  return match ? match[1].trim() : ''
+}
+
+/**
+ * 打包版首次启动生成 userData 下的本地密钥文件。
+ *
+ * 已有文件绝不覆盖；缺少任一密钥时直接报错，避免轮换加密密钥导致旧凭证不可解密。
+ */
+function ensureLocalEnvFile({ envFile, fsImpl = fsDefault, cryptoImpl = cryptoDefault } = {}) {
+  if (!envFile) throw new Error('缺少本地密钥文件路径。')
+  let text = null
+  try {
+    text = fsImpl.readFileSync(envFile, 'utf8')
+  } catch {
+    text = null
+  }
+  if (text === null) {
+    const credentialKey = cryptoImpl.randomBytes(32).toString('base64url')
+    const appSecret = cryptoImpl.randomBytes(48).toString('base64url')
+    const content =
+      '# 由桌面版首次启动生成；请勿提交、分享或粘贴到聊天中。\n' +
+      `APP_SECRET_KEY=${appSecret}\n` +
+      `CREDENTIAL_ENCRYPTION_KEY=${credentialKey}\n`
+    fsImpl.mkdirSync(path.dirname(envFile), { recursive: true })
+    fsImpl.writeFileSync(envFile, content, { encoding: 'utf8', mode: 0o600 })
+    return { created: true, envFile, keyState: 'configured' }
+  }
+  if (
+    !isConfiguredEnvValue(readEnvValue(text, 'CREDENTIAL_ENCRYPTION_KEY')) ||
+    !isConfiguredEnvValue(readEnvValue(text, 'APP_SECRET_KEY'))
+  ) {
+    throw new Error(
+      '本地密钥文件缺少有效的 CREDENTIAL_ENCRYPTION_KEY 或 APP_SECRET_KEY。为避免破坏已有凭证，安装版不会覆盖该文件；请先备份并修复。',
+    )
+  }
+  return { created: false, envFile, keyState: 'configured' }
+}
+
+/** 打包版自检：只读检查随附后端、前端与安装器，不执行任何命令。 */
+function inspectPackagedRuntime({
+  backendExecutable,
+  frontendDist,
+  installerExecutable = '',
+  fsImpl = fsDefault,
+} = {}) {
+  const backendExists = Boolean(backendExecutable) && fsImpl.existsSync(backendExecutable)
+  const frontendIndex = frontendDist ? path.join(frontendDist, 'index.html') : ''
+  const frontendExists = Boolean(frontendIndex) && fsImpl.existsSync(frontendIndex)
+  const installerExists = Boolean(installerExecutable) && fsImpl.existsSync(installerExecutable)
+  const missing = []
+  if (!backendExists) missing.push('内置后端')
+  if (!frontendExists) missing.push('管理界面资源')
+  return {
+    backendExists,
+    frontendExists,
+    installerExists,
+    missing,
+    ok: missing.length === 0,
   }
 }
 
@@ -335,6 +402,9 @@ module.exports = {
   atLeast,
   createCommandRunner,
   inspectSetup,
+  inspectPackagedRuntime,
+  isConfiguredEnvValue,
   readEnvKeyState,
+  ensureLocalEnvFile,
   runSetup,
 }

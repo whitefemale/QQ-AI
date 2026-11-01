@@ -44,6 +44,7 @@ TREND_BUCKETS = {"hour", "day"}
 # 只在预算层归一化为固定键，避免任意文本成为作用域 ID。
 FEATURE_KEYS = {
     "chat": "聊天回复",
+    "provider_test": "模型测试",
     "persona_growth": "人格成长",
     "memory_extraction": "记忆提取",
     "media.image.describe": "图片描述",

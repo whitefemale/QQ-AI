@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import pytest
+from app import __version__
 from app.core.config import Settings
 from app.main import create_app
 from fastapi.testclient import TestClient
@@ -40,13 +41,21 @@ def client(settings: Settings) -> Any:
 def test_health_and_ready(client: TestClient) -> None:
     health = _data(client.get("/api/health"))
     assert health["status"] == "ok"
-    assert health["version"] == "0.1.0"
+    assert health["version"] == __version__
 
     ready = _data(client.get("/api/ready"))
     assert ready["ready"] is True
     assert ready["database"] == "ok"
     assert ready["credential_key_configured"] is True
     assert ready["global_paused"] is False
+
+
+def test_planned_demo_reset_endpoint_is_removed(client: TestClient) -> None:
+    """不保留永远返回 501、且前端不调用的占位端点。"""
+    response = client.post("/api/demo/reset-hint", json={})
+    # SPA 托管可能把未知路径报为 405；关键是不能再返回 501/成功。
+    assert response.status_code in {404, 405}
+    assert "OPERATION_PLANNED" not in response.text
 
 
 def test_capabilities_are_honest(client: TestClient) -> None:
@@ -56,6 +65,8 @@ def test_capabilities_are_honest(client: TestClient) -> None:
     assert modes["onebot11"]["state"] == "available"
     assert modes["official"]["state"] == "planned"
     assert modes["onebot11"]["capabilities"]["media_download"] is False
+    assert modes["onebot11"]["verification"]["real_qq_verified"] is False
+    assert modes["onebot11"]["verification"]["automated_tests"] == "local_fake_server"
 
     assert "anthropic_native" in data["llm"]["available"]
     assert "anthropic_native" not in data["llm"]["planned"]
@@ -78,6 +89,43 @@ def test_capabilities_are_honest(client: TestClient) -> None:
 
     for item in data["media"]:
         assert item["state"] in {"mock_only", "available", "unconfigured", "planned"}
+
+
+def test_connection_diagnostics_and_reply_mode_honesty(client: TestClient) -> None:
+    mock = _data(client.post("/api/accounts/test-connection", json={"connection_mode": "mock"}))
+    assert mock["state"] == "mock_only"
+    assert mock["ok"] is True
+    assert len(mock["checks"]) == 9
+    assert mock["identity_verified"] is False
+    assert mock["message_send_attempted"] is False
+
+    invalid = _data(client.post("/api/accounts/test-connection", json={"connection_mode": "onebot11"}))
+    assert invalid["state"] == "failed"
+    assert invalid["ok"] is False
+    checks = {item["id"]: item for item in invalid["checks"]}
+    assert checks["config"]["state"] == "failed"
+    assert checks["websocket"]["state"] == "skipped"
+
+    modes = {item["value"]: item for item in _data(client.get("/api/groups"))["reply_modes"]}
+    assert modes["context"]["state"] == "planned"
+    assert "不可用" in modes["context"]["note"] or "规划" in modes["context"]["note"]
+
+    demo = _data(client.post("/api/demo/bootstrap", json={}))
+    account = demo["account"]
+    instance = next(item for item in account["instances"] if item["connection_mode"] == "mock")
+    saved = _data(client.post(f"/api/accounts/{account['id']}/instances/{instance['id']}/test", json={}))
+    assert saved["state"] == "mock_only"
+
+    rejected = client.post(
+        "/api/groups",
+        json={
+            "account_id": account["id"],
+            "platform_group_id": "999999",
+            "reply_mode": "context",
+        },
+    )
+    error = _error(rejected, 400)
+    assert error["code"] == "VALIDATION_ERROR"
 
 
 def test_media_usage_and_provider_toggle_are_honest(client: TestClient) -> None:
@@ -159,6 +207,94 @@ def test_demo_bootstrap_and_mock_closed_loop(client: TestClient) -> None:
 
     recent = _data(client.get("/api/events/recent"))
     assert recent["items"]
+
+
+def test_manual_confirm_api_and_new_group_defaults(client: TestClient) -> None:
+    demo = _data(client.post("/api/demo/bootstrap", json={}))
+    account_id = demo["account"]["id"]
+    group_id = demo["group"]["id"]
+    self_id = demo["account"].get("self_platform_user_id") or "10000"
+
+    modes = {item["value"]: item for item in _data(client.get("/api/groups"))["reply_modes"]}
+    assert modes["observe"]["label"] == "观察（默认）"
+    assert modes["manual_confirm"]["label"] == "手动确认"
+    assert modes["keyword"]["label"] == "关键词触发（高级）"
+    assert modes["context"]["state"] == "planned"
+
+    created = _data(
+        client.post(
+            "/api/groups",
+            json={
+                "account_id": account_id,
+                "platform_group_id": "smoke-observe-group",
+                "name": "冒烟新群",
+            },
+        )
+    )
+    assert created["reply_mode"] == "observe"
+    assert created["enabled"] is False
+
+    _data(
+        client.patch(
+            f"/api/groups/{group_id}",
+            json={"reply_mode": "manual_confirm", "enabled": True},
+        )
+    )
+    injection = _data(
+        client.post(
+            f"/api/accounts/{account_id}/mock/events",
+            json={
+                "group_internal_id": group_id,
+                "text": "@AI 群友 请生成待审核回复",
+                "mentions": [self_id],
+                "sender_id": "20001",
+                "sender_name": "待审群友",
+            },
+        )
+    )
+    assert injection["sent"] is False
+    pending = _data(client.get("/api/outbox", params={"group_id": group_id, "status": "pending_approval"}))
+    assert pending["total"] == 1
+    outbox_id = pending["items"][0]["id"]
+
+    # 到期派发不会发送待审核草稿。
+    _data(client.post("/api/outbox/dispatch-due"))
+    still_pending = _data(client.get("/api/outbox", params={"group_id": group_id, "status": "pending_approval"}))
+    assert still_pending["items"][0]["status"] == "pending_approval"
+
+    approved = _data(client.post(f"/api/outbox/{outbox_id}/approve", json={}))
+    assert approved["sent_immediately"] is True
+    assert approved["item"]["status"] == "sent"
+    _error(client.post(f"/api/outbox/{outbox_id}/approve", json={}), 409)
+    _error(client.post(f"/api/outbox/{outbox_id}/reject", json={}), 409)
+
+    audit = _data(client.get("/api/audit", params={"action": "outbox.approve"}))
+    approved_events = [item for item in audit["items"] if item["details"].get("result") == "approved"]
+    assert len(approved_events) == 1
+    assert approved_events[0]["target_id"] == outbox_id
+    # 冲突的重复批准同样写审计，但不产生第二次发送。
+    conflict = next(item for item in audit["items"] if item["details"].get("result") == "blocked")
+    assert conflict["details"]["reason"] == "not_pending_approval"
+
+    _data(client.patch(f"/api/groups/{group_id}", json={"rate_limit": {"cooldown_seconds": 0}}))
+    second = _data(
+        client.post(
+            f"/api/accounts/{account_id}/mock/events",
+            json={
+                "group_internal_id": group_id,
+                "text": "@AI 群友 再生成一条待审核回复",
+                "mentions": [self_id],
+                "sender_id": "20002",
+                "sender_name": "待审群友二",
+            },
+        )
+    )
+    assert second["sent"] is False
+    pending = _data(client.get("/api/outbox", params={"group_id": group_id, "status": "pending_approval"}))
+    second_id = pending["items"][0]["id"]
+    rejected = _data(client.post(f"/api/outbox/{second_id}/reject", json={"reason": "冒烟拒绝"}))
+    assert rejected["status"] == "rejected"
+    _error(client.post(f"/api/outbox/{second_id}/approve", json={}), 409)
 
 
 def test_usage_summary_and_cost_budget_enforcement(client: TestClient) -> None:
@@ -389,7 +525,10 @@ def test_persona_validation_and_crud(client: TestClient) -> None:
     updated = _data(client.patch(f"/api/personas/{persona_id}", json={"notes": "冒烟测试备注"}))
     assert updated["notes"] == "冒烟测试备注"
 
-    _data(client.delete(f"/api/personas/{persona_id}"))
+    missing_confirm = _error(client.delete(f"/api/personas/{persona_id}"), 400)
+    assert missing_confirm["code"] == "CONFIRMATION_REQUIRED"
+    _data(client.get(f"/api/personas/{persona_id}"))
+    _data(client.delete(f"/api/personas/{persona_id}", params={"confirm": "DELETE"}))
     _error(client.get(f"/api/personas/{persona_id}"), 404)
 
 
@@ -921,3 +1060,21 @@ def test_usage_trends_alerts_and_csv_export_are_real(client: TestClient) -> None
     assert _csv_safe("normal") == "normal"
     for risky in ("=SUM(A1:A2)", "+1", "-2", "@cmd", "\ttext"):
         assert _csv_safe(risky).startswith("'")
+
+
+def test_phase5_onboarding_and_diagnostics_envelopes(client: TestClient) -> None:
+    before = _data(client.get("/api/audit", params={"page_size": 1}))
+    onboarding = _data(client.get("/api/onboarding"))
+    diagnostics = _data(client.get("/api/diagnostics"))
+    after = _data(client.get("/api/audit", params={"page_size": 1}))
+
+    assert onboarding["schema_version"] == "onboarding.v1"
+    assert onboarding["overall"] == "action_required"
+    assert onboarding["ready_for_replies"] is False
+    assert len(onboarding["steps"]) == 8
+    assert diagnostics["schema_version"] == "diagnostics.v1"
+    assert diagnostics["excluded"]
+    assert "已脱敏" in diagnostics["text"]
+    assert diagnostics["connectors"]["real_qq_verified"] is False
+    assert diagnostics["connection_test"]["message_send_attempted"] is False
+    assert before["total"] == after["total"]

@@ -31,7 +31,10 @@ class Account(Base, TimestampMixin):
 
 class AdapterInstance(Base, TimestampMixin):
     __tablename__ = "adapter_instances"
-    __table_args__ = (UniqueConstraint("account_id", "name", name="uq_adapter_instances_account_name"),)
+    __table_args__ = (
+        UniqueConstraint("account_id", "name", name="uq_adapter_instances_account_name"),
+        UniqueConstraint("connector_installation_id", name="uq_adapter_instances_connector_installation_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
     account_id: Mapped[str] = mapped_column(
@@ -52,5 +55,14 @@ class AdapterInstance(Base, TimestampMixin):
     last_sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 受管连接器安装关联；每个安装最多一个自动配置的实例。
+    connector_installation_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("connector_installations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    identity_confirmed_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    identity_confirmed_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
     account: Mapped[Account] = relationship(back_populates="instances")

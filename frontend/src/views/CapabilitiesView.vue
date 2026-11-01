@@ -76,7 +76,10 @@
     <div class="card">
       <div class="card-title">
         <span>媒体能力</span>
-        <span class="muted">available = 真实已启用 · mock_only = 仅模拟 · unconfigured = 未配置 · planned = 规划中</span>
+        <span class="muted">
+          available = 真实已启用 · mock_only = 仅模拟 · unconfigured = 未配置 · planned = 规划中 ·
+          执行列区分任务队列与仅接口契约
+        </span>
       </div>
       <el-table v-loading="loading" :data="capabilities?.media ?? []" row-key="capability">
         <el-table-column prop="capability" label="能力" width="140" />
@@ -84,6 +87,13 @@
         <el-table-column label="状态" width="120">
           <template #default="{ row }">
             <StateTag :state="row.state" />
+          </template>
+        </el-table-column>
+        <el-table-column label="执行" width="130">
+          <template #default="{ row }">
+            <el-tag size="small" :type="mediaExecutionTagType(row.execution)">
+              {{ mediaExecutionLabel(row.execution) }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="note" label="说明" min-width="260" show-overflow-tooltip />
@@ -98,6 +108,14 @@
         <el-table-column type="expand">
           <template #default="{ row }">
             <div class="provider-list">
+              <div class="capability-detail">
+                <span class="muted">来源：{{ row.source }}</span>
+                <span class="muted">检查时间：{{ formatTime(row.checked_at) }}</span>
+                <span v-if="row.last_error" class="error-text">最近错误：{{ row.last_error }}</span>
+              </div>
+              <div class="capability-detail">
+                <span class="muted">下一步：{{ row.next_step }}</span>
+              </div>
               <el-empty v-if="!row.providers.length" description="没有注册 Provider" :image-size="45" />
               <div v-for="provider in row.providers" :key="provider.provider_id" class="provider-line">
                 <div class="provider-meta">
@@ -119,6 +137,10 @@
           </template>
         </el-table-column>
       </el-table>
+      <p class="muted job-note">
+        停用 Provider 会立即取消该能力下排队与运行中的任务；运行中的迟到结果不会保存。标为「仅接口契约」的能力不会被执行，
+        启用 Mock 也只用于验证接口，不代表真实识别。
+      </p>
     </div>
 
     <div class="card">
@@ -236,23 +258,18 @@
 import { computed, onMounted, ref } from 'vue'
 
 import { api, errorMessage } from '@/api/client'
-import type { CapabilitiesPayload, MediaJob, MediaUsageSummary } from '@/api/types'
+import type {
+  CapabilitiesPayload,
+  MediaJob,
+  MediaProvider,
+  MediaProviderToggleResult,
+  MediaUsageSummary,
+} from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
+import { mediaExecutionLabel, mediaExecutionTagType, mediaToggleMessage } from '@/utils/extensions'
 import { formatTime } from '@/utils/format'
 import { ElMessage } from 'element-plus'
-
-interface RegistryProvider {
-  provider_id: string
-  name: string
-  version: string
-  enabled: boolean
-  status: string
-  health_status: string
-  is_mock: boolean
-  planned: boolean
-  last_error?: string | null
-}
 
 const capabilities = ref<CapabilitiesPayload | null>(null)
 const loading = ref(false)
@@ -328,14 +345,19 @@ async function loadAll(): Promise<void> {
   await Promise.all([loadCapabilities(), loadJobs(), loadUsage()])
 }
 
-async function toggleMedia(provider: RegistryProvider, enabled: boolean): Promise<void> {
+async function toggleMedia(provider: MediaProvider, enabled: boolean): Promise<void> {
   try {
-    await api(`/media/providers/${provider.provider_id}/enable`, {
+    const data = await api<MediaProviderToggleResult>(`/media/providers/${provider.provider_id}/enable`, {
       method: 'POST',
       body: { enabled },
     })
-    ElMessage.success(enabled ? '已启用媒体 Provider。' : '已停用媒体 Provider。')
-    await loadCapabilities()
+    const message = mediaToggleMessage(enabled, data.cancelled_jobs, data.cancellation_error)
+    if (enabled || !data.cancellation_error) {
+      ElMessage.success(message)
+    } else {
+      ElMessage.warning(message)
+    }
+    await Promise.all([loadCapabilities(), loadJobs()])
   } catch (err) {
     ElMessage.error(errorMessage(err))
   }
@@ -343,7 +365,7 @@ async function toggleMedia(provider: RegistryProvider, enabled: boolean): Promis
 
 async function testMedia(providerId: string): Promise<void> {
   try {
-    const data = await api<RegistryProvider>(`/media/providers/${providerId}/test`, { method: 'POST' })
+    const data = await api<MediaProvider>(`/media/providers/${providerId}/test`, { method: 'POST' })
     if (data.health_status === 'healthy') {
       ElMessage.success('健康检查通过。')
     } else {
@@ -421,6 +443,19 @@ onMounted(loadAll)
 
 .provider-list {
   padding: 8px 16px 12px 48px;
+}
+
+.capability-detail {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.error-text {
+  color: var(--el-color-danger);
 }
 
 .provider-line {

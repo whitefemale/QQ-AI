@@ -129,6 +129,14 @@ class BaseQQAdapter(ABC):
     async def get_login_info(self) -> dict[str, Any] | None:
         return None
 
+    async def probe_action(self) -> dict[str, Any]:
+        """执行一个无副作用的动作探测，用于连接诊断。"""
+        raise AppError(
+            ErrorCode.ADAPTER_UNSUPPORTED_OPERATION,
+            "当前连接器不支持动作通道探测。",
+            status_code=400,
+        )
+
     async def next_event(self) -> CanonicalMessage:
         return await self._queue.get()
 

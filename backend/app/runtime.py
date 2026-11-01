@@ -9,6 +9,7 @@ from app.adapters.media.local_store import LocalMediaStore
 from app.adapters.tools.executor import ToolExecutor, sync_tool_records
 from app.adapters.tools.registry import build_default_tool_registry
 from app.budgets.service import BudgetService
+from app.connectors.manager import ConnectorManager
 from app.core.config import Settings
 from app.core.security import CredentialCipher
 from app.db.session import Database
@@ -31,11 +32,13 @@ from app.services.account_service import AccountService
 from app.services.adapter_manager import AdapterManager, OutboxWorker
 from app.services.backup_service import BackupService
 from app.services.demo_service import DemoService
+from app.services.diagnostics_service import DiagnosticsService
 from app.services.group_service import GroupService
 from app.services.memory_auto import MemoryAutoExtractionScheduler
 from app.services.memory_extraction import MemoryExtractionService
 from app.services.memory_service import MemoryService
 from app.services.message_service import MessageService
+from app.services.onboarding_service import OnboardingService
 from app.services.persona_store import PersonaStore
 from app.services.playground_service import PlaygroundService
 from app.services.provider_service import ProviderService
@@ -109,8 +112,8 @@ class AppRuntime:
         )
         self.context_builder = ContextBuilder(self.messages, settings)
         self.prompt_builder = PromptBuilder(settings)
-        self.outbox = OutboxService(self.database, settings, self.messages, self.events)
         self.policy = PolicyEngine()
+        self.outbox = OutboxService(self.database, settings, self.messages, self.events, self.policy)
         self.pipeline = MessagePipeline(
             database=self.database,
             settings=settings,
@@ -159,13 +162,43 @@ class AppRuntime:
             interval=2.0,
         )
 
-        self.accounts = AccountService(self.database, self.cipher, self.manager)
+        self.accounts = AccountService(
+            self.database,
+            self.cipher,
+            self.manager,
+            self.personas,
+            self.memories,
+            self.media_service,
+        )
+        # 连接器只在本机管理；不依赖 AdapterManager 的自动连接顺序。
+        self.connectors = ConnectorManager(
+            database=self.database,
+            settings=settings,
+            cipher=self.cipher,
+            adapter_manager=self.manager,
+            account_service=self.accounts,
+        )
         self.groups = GroupService(self.database, settings)
         self.providers = ProviderService(
             self.database,
             self.cipher,
             self.llm_gateway,
             self.provider_registry,
+            media_jobs=self.media_jobs,
+        )
+        self.onboarding = OnboardingService(
+            database=self.database,
+            cipher=self.cipher,
+            adapter_manager=self.manager,
+            connector_manager=self.connectors,
+        )
+        self.diagnostics = DiagnosticsService(
+            database=self.database,
+            adapter_manager=self.manager,
+            connector_manager=self.connectors,
+            settings=settings,
+            events=self.events,
+            cipher=self.cipher,
         )
         self.queries = MessageQueryService(self.database)
         self.dashboard = DashboardService(
@@ -197,6 +230,8 @@ class AppRuntime:
             await self.plugins.sync()
             await sync_tool_records(self.database, self.tool_registry)
             await self.providers.load_media_provider_state()
+            # 先恢复/扫描连接器状态，再让适配器按既有策略自动连接；不启动任何连接器进程。
+            await self.connectors.start()
             await self.manager.start()
             await self.worker.start()
             await self.memory_auto.start()
@@ -226,6 +261,8 @@ class AppRuntime:
         await self.retention_scheduler.stop()
         await self.memory_auto.stop()
         await self.worker.stop()
+        # 只取消安装任务并丢弃进程所有权；不自动终止用户的 NapCat/QQ 会话。
+        await self.connectors.stop()
         await self.manager.stop()
         await self.llm_gateway.close()
         await self.database.dispose()

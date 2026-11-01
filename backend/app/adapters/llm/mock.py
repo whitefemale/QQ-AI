@@ -7,7 +7,7 @@ from typing import Any
 
 from app.adapters.llm.base import BaseLLMProvider
 from app.core.security import redact_text
-from app.schemas.llm import ConnectionTestResult, LLMRequest, LLMResponse, LLMToolCall
+from app.schemas.llm import LLMRequest, LLMResponse, LLMToolCall, ModelListResult
 
 
 class MockLLMProvider(BaseLLMProvider):
@@ -122,9 +122,11 @@ class MockLLMProvider(BaseLLMProvider):
             raw={"mock": True},
         )
 
-    async def test_connection(self) -> ConnectionTestResult:
-        return ConnectionTestResult(
-            ok=True,
-            message="Mock 模型可用（模拟回复，不代表真实模型质量）。",
-            details={"model": self.model or "mock-model"},
+    async def list_models(self, timeout_seconds: float | None = None) -> ModelListResult:
+        return ModelListResult(
+            supported=False,
+            state="mock",
+            current_model_listed=None,
+            message="Mock 模型没有远端模型列表；这不是真实服务商能力。",
+            note="Mock 仅用于本地流程测试。",
         )

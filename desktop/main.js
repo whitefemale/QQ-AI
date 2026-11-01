@@ -1,6 +1,17 @@
 'use strict'
 
-const { app, BrowserWindow, Menu, Notification, Tray, ipcMain, nativeImage, shell } = require('electron')
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  Notification,
+  Tray,
+  dialog,
+  ipcMain,
+  nativeImage,
+  session,
+  shell,
+} = require('electron')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -11,12 +22,12 @@ const paths = require('./lib/paths')
 const { SettingsStore } = require('./lib/settings')
 const { BackendManager } = require('./lib/backend')
 const { createLogger } = require('./lib/logger')
-const { createCommandRunner, runSetup } = require('./lib/setup')
+const { createCommandRunner, ensureLocalEnvFile, inspectPackagedRuntime, runSetup } = require('./lib/setup')
 const { findFreePort } = require('./lib/ports')
 
 const SMOKE_MODE = process.argv.includes('--smoke')
 const RELEASES_URL = 'https://github.com/whitefemale/QQ-AI/releases'
-const FOLDER_KINDS = new Set(['data', 'logs', 'backups'])
+const FOLDER_KINDS = new Set(['data', 'logs', 'backups', 'connectors'])
 
 // 冒烟模式使用独立的 userData，避免读写用户真实的桌面设置、缓存与日志。
 if (SMOKE_MODE) {
@@ -24,8 +35,18 @@ if (SMOKE_MODE) {
   app.setPath('userData', smokeUserData)
 }
 
+// 源码运行与安装包使用不同资源布局；所有路径都从这一处派生。
+const RUNTIME = paths.resolveRuntime({
+  isPackaged: app.isPackaged,
+  resourcesPath: process.resourcesPath,
+  userDataPath: app.getPath('userData'),
+  repoRoot: paths.REPO_ROOT,
+  appRoot: app.getAppPath(),
+})
+
 let mainWindow = null
 let tray = null
+let trayState = { available: false, reason: 'not_initialized' }
 let backend = null
 let settingsStore = null
 let logger = null
@@ -35,6 +56,7 @@ let setupRunning = false
 let smokeRoot = null
 let trayHintShown = false
 let lastConsoleOrigin = ''
+let lastBackendStatus = 'stopped'
 let preferredBackendPort = 8000
 const recentLogs = []
 
@@ -45,15 +67,21 @@ const setupState = {
   steps: [],
 }
 
-const STARTUP_STEPS = [
-  ['environment', '检查运行环境'],
-  ['venv', '创建后端虚拟环境'],
-  ['backend-deps', '检查后端依赖'],
-  ['env', '生成本地安全密钥'],
-  ['frontend-deps', '安装前端依赖'],
-  ['frontend-build', '构建管理界面'],
-  ['backend', '启动本地后端'],
-]
+const STARTUP_STEPS = RUNTIME.packaged
+  ? [
+      ['environment', '检查随附运行环境'],
+      ['env', '生成本地安全密钥'],
+      ['backend', '启动本地后端'],
+    ]
+  : [
+      ['environment', '检查运行环境'],
+      ['venv', '创建后端虚拟环境'],
+      ['backend-deps', '检查后端依赖'],
+      ['env', '生成本地安全密钥'],
+      ['frontend-deps', '安装前端依赖'],
+      ['frontend-build', '构建管理界面'],
+      ['backend', '启动本地后端'],
+    ]
 
 function emptySetupSteps() {
   return STARTUP_STEPS.map(([id, label]) => ({ id, label, status: 'pending', detail: '' }))
@@ -62,7 +90,19 @@ function emptySetupSteps() {
 setupState.steps = emptySetupSteps()
 
 function resolveDataDir() {
-  return paths.resolveDataDir(settingsStore ? settingsStore.load().dataDir : '', paths.REPO_ROOT)
+  const base = RUNTIME.packaged ? path.dirname(RUNTIME.defaultDataDir) : paths.REPO_ROOT
+  return paths.resolveDataDir(
+    settingsStore ? settingsStore.load().dataDir : '',
+    base,
+    RUNTIME.defaultDataDir,
+  )
+}
+
+/** 连接器目录：空值在源码模式交给后端仓库默认；安装包使用 userData 下的可写目录。 */
+function resolveConnectorsDir() {
+  const configured = settingsStore ? settingsStore.load().connectorsDir || '' : ''
+  if (configured) return configured
+  return RUNTIME.packaged ? RUNTIME.defaultConnectorsDir : ''
 }
 
 function backendLogPath() {
@@ -73,10 +113,25 @@ function snapshot() {
   const settings = settingsStore ? settingsStore.load() : {}
   return {
     isDesktop: true,
+    packaged: RUNTIME.packaged,
     desktopVersion: app.getVersion(),
     backend: backend
       ? backend.getInfo()
-      : { status: 'stopped', port: null, pid: null, managed: true, version: '', error: '' },
+      : {
+          status: 'stopped',
+          port: null,
+          pid: null,
+          managed: true,
+          version: '',
+          error: '',
+          health: {
+            state: 'unknown',
+            lastCheckAt: null,
+            latencyMs: null,
+            consecutiveFailures: 0,
+            message: '',
+          },
+        },
     settings,
     dataDir: resolveDataDir(),
     logPath: backendLogPath(),
@@ -88,6 +143,7 @@ function snapshot() {
       steps: setupState.steps.map((step) => ({ ...step })),
     },
     logs: recentLogs.slice(-120),
+    tray: { ...trayState },
   }
 }
 
@@ -127,6 +183,17 @@ function resetSetupState() {
   setupState.steps = emptySetupSteps()
 }
 
+// 只允许诊断复制所需的剪贴板写入权限；摄像头、麦克风、定位、通知、设备等一律拒绝。
+const ALLOWED_PERMISSIONS = new Set(['clipboard-sanitized-write'])
+
+function hardenSession(targetSession) {
+  targetSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+    callback(ALLOWED_PERMISSIONS.has(permission))
+  })
+  targetSession.setPermissionCheckHandler((_webContents, permission) => ALLOWED_PERMISSIONS.has(permission))
+  targetSession.setDevicePermissionHandler(() => false)
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -135,13 +202,15 @@ function createWindow() {
     minHeight: 700,
     show: false,
     title: 'AI 群友',
-    icon: fs.existsSync(paths.ICON_PATH) ? paths.ICON_PATH : undefined,
+    icon: fs.existsSync(RUNTIME.iconPath) ? RUNTIME.iconPath : undefined,
     backgroundColor: '#f4f7fd',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
       spellcheck: false,
       offscreen: SMOKE_MODE,
     },
@@ -158,7 +227,7 @@ function createWindow() {
   mainWindow.on('close', (event) => {
     if (quitting) return
     const settings = settingsStore.load()
-    if (settings.closeToTray && tray) {
+    if (settings.closeToTray && trayState.available && tray) {
       event.preventDefault()
       mainWindow.hide()
       if (!trayHintShown && Notification.isSupported()) {
@@ -190,6 +259,9 @@ function createWindow() {
   mainWindow.webContents.on('will-redirect', (event, url) => {
     if (!isAllowedNavigation(url)) event.preventDefault()
   })
+  mainWindow.webContents.on('will-attach-webview', (event) => {
+    event.preventDefault()
+  })
 
   mainWindow.webContents.on('did-finish-load', () => {
     sendState()
@@ -203,7 +275,7 @@ function isShellUrl(url) {
   try {
     const parsed = new URL(url)
     if (parsed.protocol !== 'file:') return false
-    return path.resolve(fileURLToPath(parsed)).toLowerCase() === path.resolve(paths.SHELL_HTML).toLowerCase()
+    return path.resolve(fileURLToPath(parsed)).toLowerCase() === path.resolve(RUNTIME.shellHtml).toLowerCase()
   } catch {
     return false
   }
@@ -228,22 +300,27 @@ function isAllowedNavigation(url) {
 function loadShell() {
   if (!mainWindow || mainWindow.isDestroyed()) return
   lastConsoleOrigin = ''
-  mainWindow.loadFile(paths.SHELL_HTML).catch((error) => {
+  mainWindow.loadFile(RUNTIME.shellHtml).catch((error) => {
     if (logger) logger.error(`加载启动页失败：${error.message}`)
   })
 }
 
-function navigateToConsole(port) {
+function navigateToConsole(port, targetPath = '/', { force = false } = {}) {
   if (!mainWindow || mainWindow.isDestroyed() || !port) return
   const origin = `http://127.0.0.1:${port}`
-  if (lastConsoleOrigin === origin) {
-    const current = mainWindow.webContents.getURL()
-    if (current.startsWith(`${origin}/`)) return
+  const normalized = targetPath.startsWith('/') ? targetPath : `/${targetPath}`
+  if (!force && lastConsoleOrigin === origin) {
+    try {
+      const current = new URL(mainWindow.webContents.getURL())
+      if (current.origin === origin && current.pathname === normalized) return
+    } catch {
+      /* 当前地址无法解析时继续加载 */
+    }
   }
   lastConsoleOrigin = origin
   // 使用一次性查询参数强制重新获取 index.html，避免升级/重建后命中旧的入口缓存；
   // 静态资源仍使用带哈希的文件名，可正常缓存。
-  mainWindow.loadURL(`${origin}/?desktop=${Date.now()}`).catch((error) => {
+  mainWindow.loadURL(`${origin}${normalized}?desktop=${Date.now()}`).catch((error) => {
     if (logger) logger.error(`加载管理界面失败：${error.message}`)
     loadShell()
   })
@@ -255,26 +332,45 @@ function reloadConsole(port) {
   navigateToConsole(port)
 }
 
-function createBackend(dataDir, envBase = process.env) {
-  const manager = new BackendManager({
+function backendManagerOptions(dataDir, envBase = process.env) {
+  return {
     repoRoot: paths.REPO_ROOT,
-    backendDir: paths.BACKEND_DIR,
-    pythonPath: paths.venvPython(),
+    backendDir: RUNTIME.backendDir,
+    pythonPath: RUNTIME.packaged ? '' : paths.venvPython(),
+    backendMode: RUNTIME.backendMode,
+    backendExecutable: RUNTIME.backendExecutable,
+    frontendDist: RUNTIME.frontendDist,
+    envFile: RUNTIME.envFile,
+    installerExecutable: RUNTIME.installerExecutable,
     dataDir,
-    logger,
+    connectorsDir: resolveConnectorsDir(),
     envBase,
     preferredPort: preferredBackendPort,
+  }
+}
+
+function createBackend(dataDir, envBase = process.env) {
+  const manager = new BackendManager({
+    ...backendManagerOptions(dataDir, envBase),
+    logger,
   })
   manager.on('state', (info) => {
-    if (logger) logger.info(`后端状态：${info.status}${info.port ? ` :${info.port}` : ''}`)
-    if ((info.status === 'running' || info.status === 'external') && !setupRunning && !setupState.warning) {
-      navigateToConsole(info.port)
+    if (logger && info.status !== lastBackendStatus) {
+      logger.info(`后端状态：${info.status}${info.port ? ` :${info.port}` : ''}`)
+    }
+    const wasRunning = lastBackendStatus === 'running' || lastBackendStatus === 'external'
+    const isRunning = info.status === 'running' || info.status === 'external'
+    lastBackendStatus = info.status
+    // 健康探测也会发出 state 事件；只有真正进入运行态才导航，避免把用户从向导或设置页切走。
+    if (isRunning && !wasRunning && !setupRunning && !setupState.warning) {
+      navigateToConsole(info.port, '/')
     }
     if (info.status === 'error' && !setupRunning) loadShell()
     sendState()
     updateTrayMenu()
   })
   manager.on('log', (line) => sendLog('backend', line))
+  lastBackendStatus = 'stopped'
   return manager
 }
 
@@ -294,22 +390,46 @@ async function startSystem({ demo = false, envBase = process.env } = {}) {
   resetSetupState()
   setupRunning = true
   setupState.running = true
+  const wasFirstRun = !settingsStore.load().firstRunCompleted
   loadShell()
   sendState()
   send('desktop:setup', snapshot().setup)
 
   try {
-    const runner = createCommandRunner({ logger })
     const dataDir = resolveDataDir()
 
-    setStep('environment', '检查运行环境', 'running')
-    await runSetup({
-      repoRoot: paths.REPO_ROOT,
-      runner,
-      onStep: (step) => setStep(step.id, step.label, step.status, step.detail),
-      onLog: (line) => sendLog('setup', line),
-    })
-    setStep('environment', '检查运行环境', 'ok')
+    if (RUNTIME.packaged) {
+      setStep('environment', '检查随附运行环境', 'running')
+      const packCheck = inspectPackagedRuntime({
+        backendExecutable: RUNTIME.backendExecutable,
+        frontendDist: RUNTIME.frontendDist,
+        installerExecutable: RUNTIME.installerExecutable,
+      })
+      if (!packCheck.ok) {
+        setStep('environment', '检查随附运行环境', 'error', `缺少：${packCheck.missing.join('、')}`)
+        throw new Error(`安装包不完整：缺少 ${packCheck.missing.join('、')}。请重新安装。`)
+      }
+      setStep(
+        'environment',
+        '检查随附运行环境',
+        'ok',
+        packCheck.installerExists ? '内置后端与界面，无需 Python/Node' : '内置后端与界面；连接器自动安装不可用',
+      )
+
+      setStep('env', '生成本地安全密钥', 'running')
+      const envState = ensureLocalEnvFile({ envFile: RUNTIME.envFile })
+      setStep('env', '生成本地安全密钥', 'ok', envState.created ? '已在用户目录生成' : '已存在')
+    } else {
+      const runner = createCommandRunner({ logger })
+      setStep('environment', '检查运行环境', 'running')
+      await runSetup({
+        repoRoot: paths.REPO_ROOT,
+        runner,
+        onStep: (step) => setStep(step.id, step.label, step.status, step.detail),
+        onLog: (line) => sendLog('setup', line),
+      })
+      setStep('environment', '检查运行环境', 'ok')
+    }
     sendState()
 
     setStep('backend', '启动本地后端', 'running')
@@ -338,7 +458,8 @@ async function startSystem({ demo = false, envBase = process.env } = {}) {
     send('desktop:setup', snapshot().setup)
     if (!setupState.warning) {
       const info = backend.getInfo()
-      if (info.port) navigateToConsole(info.port)
+      // 首次启动先进入接入向导；之后保留仪表盘作为入口。
+      if (info.port) navigateToConsole(info.port, wasFirstRun ? '/onboarding' : '/', { force: true })
     }
   } catch (error) {
     setupState.error = error instanceof Error ? error.message : String(error)
@@ -369,15 +490,16 @@ function updateTrayMenu() {
     running: `后端运行中 · 端口 ${info.port}`,
     external: `已连接外部后端 · 端口 ${info.port}`,
     error: '后端异常',
-  }[info.status]
+  }[info.status] ?? `后端状态：${info.status}`
 
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: '打开控制台', click: showConsole },
+      { label: '打开接入向导', enabled: running, click: () => showConsolePath('/onboarding') },
       { label: statusLabel, enabled: false },
       { type: 'separator' },
       {
-        label: running ? '停止后端' : '启动后端',
+        label: running ? (info.status === 'external' ? '断开外部后端' : '停止后端') : '启动后端',
         click: async () => {
           if (running) await backend?.stop()
           else await startSystem({ demo: false })
@@ -408,10 +530,26 @@ function updateTrayMenu() {
 }
 
 function createTray() {
-  if (!fs.existsSync(paths.ICON_PATH)) return
-  const image = nativeImage.createFromPath(paths.ICON_PATH)
-  if (image.isEmpty()) return
-  tray = new Tray(image.resize({ width: 32, height: 32 }))
+  if (!fs.existsSync(RUNTIME.iconPath)) {
+    trayState = { available: false, reason: 'icon_missing' }
+    if (logger) logger.warn('托盘图标文件缺失，关闭窗口将退出应用。')
+    return
+  }
+  const image = nativeImage.createFromPath(RUNTIME.iconPath)
+  if (image.isEmpty()) {
+    trayState = { available: false, reason: 'icon_invalid' }
+    if (logger) logger.warn('托盘图标无法读取，关闭窗口将退出应用。')
+    return
+  }
+  try {
+    tray = new Tray(image.resize({ width: 32, height: 32 }))
+    trayState = { available: true, reason: '' }
+  } catch (error) {
+    tray = null
+    trayState = { available: false, reason: 'tray_error' }
+    if (logger) logger.warn(`创建系统托盘失败：${error.message}`)
+    return
+  }
   tray.setToolTip('AI 群友')
   tray.on('double-click', showConsole)
   tray.on('click', showConsole)
@@ -435,6 +573,18 @@ function showConsole() {
   mainWindow.focus()
 }
 
+/** 从托盘直接打开指定内部页面；只在后端运行且窗口存在时生效。 */
+function showConsolePath(targetPath) {
+  const info = backend ? backend.getInfo() : null
+  if (!info || !info.port || (info.status !== 'running' && info.status !== 'external')) return
+  if (!mainWindow) createWindow()
+  if (!mainWindow) return
+  navigateToConsole(info.port, targetPath, { force: true })
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
 async function openFolder(kind) {
   if (!FOLDER_KINDS.has(kind)) throw new Error('不支持的目录类型。')
   const dataDir = resolveDataDir()
@@ -442,6 +592,7 @@ async function openFolder(kind) {
     data: dataDir,
     logs: path.join(dataDir, 'logs'),
     backups: path.join(dataDir, 'backups'),
+    connectors: resolveConnectorsDir() || path.join(paths.REPO_ROOT, 'connectors', 'napcat'),
   }[kind]
   fs.mkdirSync(target, { recursive: true })
   const error = await shell.openPath(target)
@@ -457,9 +608,35 @@ function registerIpc() {
     if (before.dataDir !== updated.dataDir && logger) {
       logger.info('数据目录设置已更新，将在重启后端后生效。')
     }
+    if (before.connectorsDir !== updated.connectorsDir && logger) {
+      logger.info('连接器目录设置已更新，将在重启后端后生效。')
+    }
     updateTrayMenu()
     sendState()
-    return { settings: updated, restartRequired: before.dataDir !== updated.dataDir }
+    return {
+      settings: updated,
+      restartRequired: before.dataDir !== updated.dataDir || before.connectorsDir !== updated.connectorsDir,
+    }
+  })
+  // 只打开系统目录选择对话框并保存选择；不读写文件、不执行命令。
+  ipcMain.handle('desktop:choose-connectors-dir', async () => {
+    const before = settingsStore.load()
+    const options = {
+      title: '选择受管连接器根目录',
+      defaultPath: before.connectorsDir || resolveConnectorsDir() || paths.REPO_ROOT,
+      properties: ['openDirectory', 'createDirectory'],
+    }
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options)
+    if (result.canceled || !result.filePaths.length) {
+      return { settings: before, restartRequired: false, canceled: true }
+    }
+    const updated = settingsStore.update({ connectorsDir: result.filePaths[0] })
+    if (logger) logger.info('连接器目录设置已更新，将在重启后端后生效。')
+    updateTrayMenu()
+    sendState()
+    return { settings: updated, restartRequired: true, canceled: false }
   })
   ipcMain.handle('desktop:start-backend', (_event, options) => {
     const demo = Boolean(options && options.demo)
@@ -515,12 +692,12 @@ function setupAppEvents() {
 
   app.on('window-all-closed', () => {
     const settings = settingsStore ? settingsStore.load() : { closeToTray: false }
-    if (process.platform !== 'darwin' && (!settings.closeToTray || !tray)) app.quit()
+    if (process.platform !== 'darwin' && (!settings.closeToTray || !trayState.available)) app.quit()
   })
 }
 
 async function smokeRun() {
-  const outputDir = path.join(paths.DESKTOP_DIR, '.smoke')
+  const outputDir = RUNTIME.smokeOutputDir
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aiqf-desktop-smoke-'))
   smokeRoot = tempRoot
   const dataDir = path.join(tempRoot, 'data')
@@ -533,13 +710,22 @@ async function smokeRun() {
   }
 
   try {
-    if (!fs.existsSync(paths.venvPython())) throw new Error('缺少 backend/.venv，请先运行桌面版向导或手工安装后端。')
-    if (!fs.existsSync(path.join(paths.FRONTEND_DIST, 'index.html'))) {
-      throw new Error('缺少 frontend/dist，请先执行 npm run build。')
+    if (RUNTIME.packaged) {
+      const packCheck = inspectPackagedRuntime({
+        backendExecutable: RUNTIME.backendExecutable,
+        frontendDist: RUNTIME.frontendDist,
+        installerExecutable: RUNTIME.installerExecutable,
+      })
+      if (!packCheck.ok) throw new Error(`安装包不完整：缺少 ${packCheck.missing.join('、')}。`)
+    } else {
+      if (!fs.existsSync(paths.venvPython())) throw new Error('缺少 backend/.venv，请先运行桌面版向导或手工安装后端。')
+      if (!fs.existsSync(path.join(RUNTIME.frontendDist, 'index.html'))) {
+        throw new Error('缺少 frontend/dist，请先执行 npm run build。')
+      }
     }
 
     // 先截取启动向导页，再清理缓存并加载管理台，确保截图来自当前构建。
-    await loadAndWait(pathToFileURL(paths.SHELL_HTML).href)
+    await loadAndWait(pathToFileURL(RUNTIME.shellHtml).href)
     await wait(900)
     fs.mkdirSync(outputDir, { recursive: true })
     await capture(path.join(outputDir, 'shell.png'))
@@ -548,13 +734,9 @@ async function smokeRun() {
     // 使用非 8000 的临时端口，避免误连用户正在运行的真实后端或截取真实数据。
     preferredBackendPort = await findFreePort(18000)
     backend = new BackendManager({
-      repoRoot: paths.REPO_ROOT,
-      backendDir: paths.BACKEND_DIR,
-      pythonPath: paths.venvPython(),
-      dataDir,
-      logger,
-      envBase,
+      ...backendManagerOptions(dataDir, envBase),
       preferredPort: preferredBackendPort,
+      logger,
     })
     backend.on('log', (line) => console.log(`[backend] ${line}`))
     await backend.start()
@@ -582,24 +764,48 @@ async function smokeRun() {
     }
     await wait(1200)
     await capture(path.join(outputDir, 'startup.png'))
+    const startupUrl = new URL(mainWindow.webContents.getURL())
+    if (startupUrl.pathname !== '/onboarding') {
+      throw new Error(`首次启动未进入接入向导（当前路径：${startupUrl.pathname}）。`)
+    }
+    await capture(path.join(outputDir, 'onboarding.png'))
+
+    const health = await backend.checkHealth()
+    if (health.health.state !== 'healthy') {
+      throw new Error(`后端健康检查未通过：${health.health.state} ${health.health.message}`)
+    }
+    if (!startup.tray || typeof startup.tray.available !== 'boolean' || typeof startup.tray.reason !== 'string') {
+      throw new Error('桌面快照缺少托盘可用性字段。')
+    }
+
+    const startupPort = started.port
+    await loadAndWait(`http://127.0.0.1:${startupPort}/diagnostics?desktop=${Date.now()}`)
+    await wait(1500)
+    await capture(path.join(outputDir, 'diagnostics.png'))
+
     console.log(
       `DESKTOP_STARTUP_OK ${JSON.stringify({
         status: started.status,
-        port: started.port,
+        port: startupPort,
         dataDir: startup.dataDir,
+        path: startupUrl.pathname,
+        health: health.health.state,
+        tray: startup.tray,
       })}`,
     )
 
     console.log(
       `DESKTOP_SMOKE_OK ${JSON.stringify({
         port: info.port,
-        startupPort: started.port,
+        startupPort,
         version: info.version,
         screenshots: [
           path.join(outputDir, 'shell.png'),
           path.join(outputDir, 'dashboard.png'),
           path.join(outputDir, 'settings.png'),
           path.join(outputDir, 'startup.png'),
+          path.join(outputDir, 'onboarding.png'),
+          path.join(outputDir, 'diagnostics.png'),
         ],
       })}`,
     )
@@ -651,9 +857,10 @@ async function capture(filePath) {
 }
 
 async function boot() {
+  hardenSession(session.defaultSession)
   settingsStore = new SettingsStore(path.join(app.getPath('userData'), 'settings.json'))
   logger = createLogger(path.join(app.getPath('userData'), 'logs'))
-  logger.info(`桌面版启动，仓库根：${paths.REPO_ROOT}`)
+  logger.info(`桌面版启动（${RUNTIME.packaged ? '安装版' : '源码版'}），资源根：${RUNTIME.packaged ? RUNTIME.desktopDir : paths.REPO_ROOT}`)
 
   if (SMOKE_MODE) {
     registerIpc()

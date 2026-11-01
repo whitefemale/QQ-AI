@@ -76,7 +76,7 @@ async def test_old_messages_are_deleted_once_and_new_messages_are_kept(settings:
     await _add(database, _message("old-1", days_old=120), _message("new-1", days_old=1))
     service, _media = _services(settings, database)
 
-    first = await service.run(trigger="manual", actor="tester")
+    first = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
     assert first["status"] == "completed"
     assert first["counts"]["messages"] == 1
     assert first["counts"]["batches"] == 1
@@ -86,7 +86,7 @@ async def test_old_messages_are_deleted_once_and_new_messages_are_kept(settings:
         remaining = list((await session.execute(select(Message.id))).scalars())
     assert remaining == ["new-1"]
 
-    second = await service.run(trigger="manual", actor="tester")
+    second = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
     assert second["counts"]["messages"] == 0
     assert second["counts"]["batches"] == 0
 
@@ -157,7 +157,7 @@ async def test_persona_evidence_and_memory_sources_are_scrubbed_before_delete(
         ),
     )
     service, _media = _services(settings, database)
-    summary = await service.run(trigger="manual", actor="tester")
+    summary = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
 
     assert summary["status"] == "completed"
     assert summary["counts"]["persona_traits_updated"] == 1
@@ -215,7 +215,7 @@ async def test_media_from_deleted_messages_is_removed_but_shared_media_is_protec
         _message("new-shared", days_old=1, segments=[{"type": "image", "media_ref": shared.id}]),
     )
 
-    summary = await service.run(trigger="manual", actor="tester")
+    summary = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
     assert summary["counts"]["media_from_messages"] == 1
     assert await media.store.exists(old_media.id) is False
     assert await media.store.exists(shared.id) is True
@@ -244,7 +244,7 @@ async def test_expired_media_is_cleaned_but_still_referenced_media_is_kept(
             asset.expires_at = utcnow() - timedelta(days=1)
         await session.commit()
 
-    summary = await service.run(trigger="manual", actor="tester")
+    summary = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
     assert summary["counts"]["media_expired"] == 1
     assert await media.store.exists(expired.id) is False
     assert await media.store.exists(referenced.id) is True
@@ -268,7 +268,7 @@ async def test_only_rotated_old_logs_are_deleted(settings: Settings, database: D
     os.utime(current, (old_time, old_time))
     service, _media = _services(settings, database)
 
-    summary = await service.run(trigger="manual", actor="tester")
+    summary = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
     assert summary["counts"]["logs"] == 1
     assert current.exists()
     assert rotated_new.exists()
@@ -282,7 +282,7 @@ async def test_global_pause_does_not_block_local_cleanup(settings: Settings, dat
     await set_global_pause(database, paused=True, reason="测试", actor="tester")
     service, _media = _services(settings, database)
 
-    summary = await service.run(trigger="manual", actor="tester")
+    summary = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
     assert summary["global_pause"] is True
     assert summary["counts"]["messages"] == 1
     pause = await get_global_pause(database)
@@ -300,7 +300,7 @@ async def test_batch_limit_reports_truncated(settings: Settings, database: Datab
     limited = settings.model_copy(update={"retention_batch_size": 1, "retention_max_batches_per_run": 1})
     service, _media = _services(limited, database)
 
-    summary = await service.run(trigger="manual", actor="tester")
+    summary = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
     assert summary["counts"]["messages"] == 1
     assert summary["truncated"] is True
     async with database.session() as session:
@@ -336,7 +336,7 @@ async def test_concurrent_run_is_rejected_and_scheduler_skips_overlap(settings: 
 
     async with service._lock:  # noqa: SLF001 - 直接模拟正在运行
         with pytest.raises(AppError) as excinfo:
-            await service.run(trigger="manual", actor="tester")
+            await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
         assert excinfo.value.code == "CONFLICT"
         assert excinfo.value.status_code == 409
         await scheduler._tick()  # noqa: SLF001 - 调度器应吞掉冲突而不是崩溃
@@ -347,7 +347,7 @@ async def test_retention_status_reports_last_run(settings: Settings, database: D
     await _add(database, _message("old-1", days_old=120))
     service, _media = _services(settings, database)
 
-    summary = await service.run(trigger="manual", actor="tester")
+    summary = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
     status = await service.status()
     assert status["last_run"] is not None
     assert status["last_run"]["status"] == "completed"
@@ -361,9 +361,14 @@ def test_retention_days_normalization() -> None:
         "log_retention_days": 30,
         "message_retention_days": 90,
         "media_retention_days": 30,
+        "memory_retention_days": 0,
     }
     assert normalize_retention_days({"message_retention_days": 0})["message_retention_days"] == 90
     assert normalize_retention_days({"message_retention_days": "7"})["message_retention_days"] == 7
+    # 记忆保留的 0 是“关闭自动清理”，必须保持为 0，不能被改写成默认天数。
+    assert normalize_retention_days({"memory_retention_days": 0})["memory_retention_days"] == 0
+    assert normalize_retention_days({"memory_retention_days": "30"})["memory_retention_days"] == 30
+    assert normalize_retention_days({"memory_retention_days": -1})["memory_retention_days"] == 0
 
 
 def test_manual_retention_endpoint_requires_confirmation_and_audits(settings: Settings) -> None:
@@ -379,7 +384,25 @@ def test_manual_retention_endpoint_requires_confirmation_and_audits(settings: Se
         assert enabled.status_code == 200, enabled.text
         assert enabled.json()["data"]["retention_status"]["auto"]["enabled"] is True
 
-        run = client.post("/api/system/retention/run")
+        # 预览只读：不写审计、不更新 last_run，也不删除任何数据。
+        preview = client.get("/api/system/retention/preview")
+        assert preview.status_code == 200, preview.text
+        preview_data = preview.json()["data"]
+        assert preview_data["counts"]["messages_expired"] == 0
+        assert preview_data["counts"]["messages_will_delete"] == 0
+        assert preview_data["running"] is False
+        assert preview_data["truncated"] is False
+        assert preview_data["limits"]["max_messages_per_run"] > 0
+        assert client.get("/api/settings").json()["data"]["retention_status"]["last_run"] is None
+        assert client.get("/api/audit?action=retention.run").json()["data"]["total"] == 0
+
+        missing_confirm = client.post("/api/system/retention/run")
+        assert missing_confirm.status_code == 400, missing_confirm.text
+        assert missing_confirm.json()["error"]["code"] == "CONFIRMATION_REQUIRED"
+        assert client.get("/api/settings").json()["data"]["retention_status"]["last_run"] is None
+        assert client.get("/api/audit?action=retention.run").json()["data"]["total"] == 0
+
+        run = client.post("/api/system/retention/run", json={"confirm": "CLEANUP"})
         assert run.status_code == 200, run.text
         summary = run.json()["data"]
         assert summary["status"] == "completed"
@@ -399,12 +422,71 @@ def test_manual_retention_endpoint_requires_confirmation_and_audits(settings: Se
         assert invalid.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
+async def test_memory_retention_zero_disables_and_positive_days_deletes_unpinned(
+    settings: Settings, database: Database
+) -> None:
+    await _seed_account(database)
+    old_time = utcnow() - timedelta(days=40)
+    await _add(
+        database,
+        Memory(
+            id="memory-old",
+            account_id="acc",
+            group_id=None,
+            memory_type="fact",
+            content="旧记忆",
+            source_message_ids_json=[],
+            confidence=0.7,
+            sensitivity="normal",
+            created_at=old_time,
+        ),
+        Memory(
+            id="memory-old-pinned",
+            account_id="acc",
+            group_id=None,
+            memory_type="fact",
+            content="固定旧记忆",
+            source_message_ids_json=[],
+            confidence=0.7,
+            sensitivity="normal",
+            is_pinned=True,
+            created_at=old_time,
+        ),
+        Memory(
+            id="memory-new",
+            account_id="acc",
+            group_id=None,
+            memory_type="fact",
+            content="新记忆",
+            source_message_ids_json=[],
+            confidence=0.7,
+            sensitivity="normal",
+        ),
+    )
+    service, _media = _services(settings, database)
+
+    # 默认 0 = 不自动清理，即使记忆很旧。
+    await set_setting(database, "retention", {"memory_retention_days": 0})
+    disabled = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
+    assert disabled["counts"]["memories_deleted"] == 0
+    async with database.session() as session:
+        assert await session.get(Memory, "memory-old") is not None
+
+    await set_setting(database, "retention", {"memory_retention_days": 7})
+    enabled = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
+    assert enabled["counts"]["memories_deleted"] == 1
+    async with database.session() as session:
+        assert await session.get(Memory, "memory-old") is None
+        assert await session.get(Memory, "memory-old-pinned") is not None
+        assert await session.get(Memory, "memory-new") is not None
+
+
 async def test_missing_logs_directory_is_tolerated(settings: Settings, database: Database) -> None:
     root = settings.logs_path
     for item in root.iterdir():
         item.unlink()
     root.rmdir()
     service, _media = _services(settings, database)
-    summary = await service.run(trigger="manual", actor="tester")
+    summary = await service.run(trigger="manual", actor="tester", confirm="CLEANUP")
     assert summary["status"] == "completed"
     assert summary["counts"]["logs"] == 0

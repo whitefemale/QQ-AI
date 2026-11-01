@@ -14,8 +14,8 @@
       type="info"
       show-icon
       :closable="false"
-      title="凭据说明"
-      description="软件仅保存你填写的 API Key（Fernet 加密）。请求由本地后端直接发往你配置的 Base URL；请确认该服务可信。"
+      title="凭据与测试说明"
+      description="软件仅保存你填写的 API Key（Fernet 加密）。请求由本地后端直接发往你配置的 Base URL；请确认该服务可信。Mock 结果不能证明真实 API 可用；测试调用会写入本地用量与预算。"
     />
 
     <el-alert v-if="error" type="error" :title="error" show-icon :closable="false" />
@@ -29,7 +29,7 @@
               <el-tag v-if="row.is_default" size="small" type="success">默认</el-tag>
               <el-tag v-if="row.is_mock" size="small" type="warning">Mock</el-tag>
             </div>
-            <div class="muted mono">{{ row.model }}</div>
+            <div class="muted mono">{{ row.model || '—' }}</div>
           </template>
         </el-table-column>
         <el-table-column label="类型" width="160">
@@ -47,10 +47,14 @@
             <span class="mono">{{ row.api_key_configured ? row.api_key_masked : '未配置' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="120">
+        <el-table-column label="配置与测试证据" min-width="270">
           <template #default="{ row }">
-            <StateTag :state="row.status" />
+            <ProviderReadinessTags :provider="row" />
+            <div v-if="row.last_tested_at" class="muted error-text">最近测试：{{ formatTime(row.last_tested_at) }}</div>
             <div v-if="row.last_error" class="muted error-text">{{ row.last_error }}</div>
+            <div v-if="row.last_test?.error_code" class="muted error-text">
+              {{ providerActionHint(row.last_test.error_code, null) || row.last_test.error_code }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="参数" width="150">
@@ -69,10 +73,24 @@
             <el-switch :model-value="row.enabled" @change="(value: string | number | boolean) => toggleEnabled(row, Boolean(value))" />
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="280" fixed="right">
+        <el-table-column label="操作" width="390" fixed="right">
           <template #default="{ row }">
             <div class="row-actions">
-              <el-button size="small" :loading="testingId === row.id" @click="testProvider(row)">测试</el-button>
+              <el-button
+                size="small"
+                :loading="activeTest?.kind === 'connectivity' && activeTest.providerId === row.id"
+                :disabled="Boolean(activeTest) && activeTest?.kind !== 'connectivity'"
+                @click="runConnectivity(row)"
+              >
+                连通性测试
+              </el-button>
+              <el-button
+                size="small"
+                :disabled="Boolean(activeTest) && (activeTest?.kind !== 'generation' || activeTest.providerId !== row.id)"
+                @click="openGeneration(row)"
+              >
+                {{ row.is_mock ? '生成测试（Mock）' : '真实生成测试' }}
+              </el-button>
               <el-button size="small" :disabled="row.is_default" @click="makeDefault(row)">设为默认</el-button>
               <el-button size="small" @click="openEdit(row)">编辑</el-button>
               <el-button size="small" type="danger" text @click="deleteProvider(row)">删除</el-button>
@@ -125,10 +143,50 @@
             </div>
           </el-form-item>
           <el-form-item label="模型 ID" required>
-            <el-input
-              v-model="form.model"
-              :placeholder="form.provider_type === 'anthropic_native' ? '例如：claude-sonnet-5' : '例如：gpt-4o-mini、qwen2.5-7b-instruct'"
-            />
+            <div class="model-field">
+              <el-select
+                v-if="useModelSelect"
+                v-model="form.model"
+                filterable
+                allow-create
+                default-first-option
+                style="width: 100%"
+                placeholder="选择或输入模型 ID"
+              >
+                <el-option
+                  v-for="model in modelList?.models ?? []"
+                  :key="model.id"
+                  :label="modelOptionLabel(model)"
+                  :value="model.id"
+                />
+              </el-select>
+              <el-input
+                v-else
+                v-model="form.model"
+                :placeholder="form.provider_type === 'anthropic_native' ? '例如：claude-sonnet-5' : '例如：gpt-4o-mini、qwen2.5-7b-instruct'"
+              />
+              <el-button
+                v-if="editing"
+                size="small"
+                :loading="modelsLoading"
+                :disabled="form.provider_type === 'mock' || !editing.api_key_configured"
+                @click="fetchModels"
+              >
+                获取模型列表
+              </el-button>
+            </div>
+            <div v-if="editing && form.provider_type !== 'mock' && !editing.api_key_configured" class="form-tip">
+              保存 API Key 后才能获取远端模型列表；也可以手动填写模型 ID。
+            </div>
+            <div v-else-if="!editing" class="form-tip">保存 Provider 后可获取远端模型列表；也可以手动填写。</div>
+            <div v-if="modelList" class="form-tip">
+              <el-tag :type="modelStateInfo.type" size="small">{{ modelStateInfo.label }}</el-tag>
+              <span v-if="modelList.message"> {{ modelList.message }}</span>
+              <span v-if="modelList.truncated">（列表已截断：最多显示 500 条）</span>
+              <span v-if="modelList.current_model_listed === false">当前模型不在列表中，仍会按手动填写的 ID 调用。</span>
+              <div v-if="modelList.note">{{ modelList.note }}</div>
+            </div>
+            <div v-if="modelsError" class="form-tip error-text">{{ modelsError }}</div>
           </el-form-item>
           <el-form-item label="API Key" :required="!editing">
             <el-input v-model="form.api_key" type="password" show-password :placeholder="editing ? '留空表示不修改现有 Key' : '粘贴 API Key'" />
@@ -137,6 +195,11 @@
                 仅加密存储在本地数据库；不会显示明文。请使用你有权使用的 Anthropic API Key。
               </template>
               <template v-else>仅加密存储在本地数据库；不会显示明文。</template>
+            </div>
+            <div v-if="editing" class="form-tip key-status">
+              <span v-if="editing.api_key_configured">已保存：<span class="mono">{{ editing.api_key_masked }}</span></span>
+              <span v-else>尚未保存 Key</span>
+              <el-button v-if="editing.api_key_configured" link type="danger" @click="clearKey">清除已保存 Key</el-button>
             </div>
           </el-form-item>
         </template>
@@ -175,6 +238,79 @@
         <el-button type="primary" :loading="saving" @click="save">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog
+      v-model="testDialog"
+      :title="testTitle"
+      width="620px"
+      :close-on-click-modal="false"
+      :show-close="!activeTest"
+    >
+      <el-alert
+        v-if="activeTest"
+        type="info"
+        show-icon
+        :closable="false"
+        title="正在等待模型响应"
+        description="真实请求可能已开始计费。取消只停止本地等待，无法保证服务商停止生成或停止计费。"
+      />
+      <div v-if="testError" class="result-error">{{ testError }}</div>
+      <ProviderTestResultView :result="testResult" />
+      <template #footer>
+        <el-button v-if="activeTest" type="danger" plain @click="cancelActiveTest">取消本地等待</el-button>
+        <el-button v-else @click="testDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="generationDialog"
+      :title="generationProvider ? `真实生成测试 · ${generationProvider.name}` : '真实生成测试'"
+      width="640px"
+      :close-on-click-modal="false"
+      :show-close="!generationLoading"
+    >
+      <el-alert
+        type="warning"
+        show-icon
+        :closable="false"
+        :title="generationProvider?.is_mock ? '这是 Mock 生成测试，不会访问任何模型服务' : '这会发起真实模型请求，可能产生费用'"
+        :description="
+          generationProvider?.is_mock
+            ? 'Mock 结果只验证本地流程，不能证明真实 API 可用。'
+            : '费用未知时显示“无法估算”，不会补成 0；测试调用会写入本地用量与预算。'
+        "
+      />
+      <el-form label-width="120px" class="generation-form">
+        <el-form-item label="提示词" required>
+          <el-input
+            v-model="generationForm.prompt"
+            type="textarea"
+            :rows="4"
+            maxlength="2000"
+            show-word-limit
+            :disabled="generationLoading"
+            placeholder="输入用于验证生成能力的提示词，不要粘贴密钥或隐私数据。"
+          />
+        </el-form-item>
+        <el-form-item label="最大输出 Token">
+          <el-input-number v-model="generationForm.max_output_tokens" :min="1" :max="128" :disabled="generationLoading" />
+        </el-form-item>
+        <el-form-item label="Temperature">
+          <el-input-number v-model="generationForm.temperature" :min="0" :max="2" :step="0.1" :disabled="generationLoading" />
+        </el-form-item>
+      </el-form>
+      <div v-if="generationError" class="result-error">{{ generationError }}</div>
+      <ProviderTestResultView :result="generationResult" />
+      <template #footer>
+        <template v-if="generationLoading">
+          <el-button type="danger" plain @click="cancelActiveTest">取消本地等待</el-button>
+        </template>
+        <template v-else>
+          <el-button @click="generationDialog = false">关闭</el-button>
+          <el-button type="primary" @click="runGeneration">开始测试</el-button>
+        </template>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -182,9 +318,20 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 
 import { api, errorMessage } from '@/api/client'
-import type { LLMProvider } from '@/api/types'
+import {
+  cancelProviderOperation,
+  clearProviderApiKey,
+  listProviderModels,
+  testProviderConnectivity,
+  testProviderGeneration,
+} from '@/api/providers'
+import type { LLMProvider, ProviderModelList, ProviderTestResult } from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
+import ProviderReadinessTags from '@/components/ProviderReadinessTags.vue'
+import ProviderTestResultView from '@/components/ProviderTestResult.vue'
 import StateTag from '@/components/StateTag.vue'
+import { formatTime } from '@/utils/format'
+import { makeOperationId, providerActionHint, providerModelListState } from '@/utils/providers'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 interface ProviderTypeOption {
@@ -195,15 +342,49 @@ interface ProviderTypeOption {
   note: string
 }
 
+interface ActiveTest {
+  providerId: string
+  operationId: string
+  kind: 'connectivity' | 'generation'
+  controller: AbortController
+}
+
 const providers = ref<LLMProvider[]>([])
 const types = ref<ProviderTypeOption[]>([])
 const loading = ref(false)
 const saving = ref(false)
-const testingId = ref<string | null>(null)
 const error = ref<string | null>(null)
 
 const dialog = ref(false)
 const editing = ref<LLMProvider | null>(null)
+const modelList = ref<ProviderModelList | null>(null)
+const modelsLoading = ref(false)
+const modelsError = ref<string | null>(null)
+
+const activeTest = ref<ActiveTest | null>(null)
+const testDialog = ref(false)
+const testTitle = ref('')
+const testResult = ref<ProviderTestResult | null>(null)
+const testError = ref<string | null>(null)
+
+const generationDialog = ref(false)
+const generationProvider = ref<LLMProvider | null>(null)
+const generationResult = ref<ProviderTestResult | null>(null)
+const generationError = ref<string | null>(null)
+const generationForm = reactive({
+  prompt: '请用一句中文介绍你自己。',
+  max_output_tokens: 32,
+  temperature: 0.7,
+})
+
+const generationLoading = computed(
+  () => activeTest.value?.kind === 'generation' && activeTest.value.providerId === generationProvider.value?.id,
+)
+
+const modelStateInfo = computed(() => providerModelListState(modelList.value?.state))
+const useModelSelect = computed(
+  () => modelList.value?.state === 'available' && Boolean(modelList.value.models.length),
+)
 
 function emptyForm() {
   return {
@@ -241,6 +422,10 @@ function costTrackingTag(value?: string): 'success' | 'warning' | 'info' {
   return 'warning'
 }
 
+function modelOptionLabel(model: { id: string; display_name: string | null }): string {
+  return model.display_name && model.display_name !== model.id ? `${model.display_name}（${model.id}）` : model.id
+}
+
 async function load(): Promise<void> {
   loading.value = true
   error.value = null
@@ -255,7 +440,13 @@ async function load(): Promise<void> {
   }
 }
 
+function resetEvidenceState(): void {
+  modelList.value = null
+  modelsError.value = null
+}
+
 function onTypeChange(): void {
+  resetEvidenceState()
   if (form.provider_type === 'mock' && !form.name.trim()) {
     form.name = 'Mock 模型'
   }
@@ -274,26 +465,71 @@ function onTypeChange(): void {
 function openCreate(): void {
   editing.value = null
   Object.assign(form, emptyForm())
+  resetEvidenceState()
   dialog.value = true
 }
 
 function openEdit(provider: LLMProvider): void {
   editing.value = provider
+  resetEvidenceState()
   Object.assign(form, {
     provider_type: provider.provider_type,
     name: provider.name,
     base_url: provider.base_url ?? '',
-    model: provider.model,
+    model: provider.model ?? '',
     api_key: '',
     timeout_seconds: provider.timeout_seconds,
     max_output_tokens: provider.max_output_tokens,
     temperature: provider.temperature,
     is_default: provider.is_default,
     enabled: provider.enabled,
-    input_price_per_1k: Number((provider as unknown as { config?: Record<string, number> }).config?.input_price_per_1k ?? 0),
-    output_price_per_1k: Number((provider as unknown as { config?: Record<string, number> }).config?.output_price_per_1k ?? 0),
+    input_price_per_1k: Number(provider.config?.input_price_per_1k ?? 0),
+    output_price_per_1k: Number(provider.config?.output_price_per_1k ?? 0),
   })
   dialog.value = true
+}
+
+async function fetchModels(): Promise<void> {
+  if (!editing.value) return
+  modelsLoading.value = true
+  modelsError.value = null
+  try {
+    const data = await listProviderModels(editing.value.id, {
+      timeoutMs: (editing.value.timeout_seconds + 20) * 1000,
+    })
+    modelList.value = data
+    if (data.current_model_listed === false && form.model.trim()) {
+      ElMessage.info('当前模型 ID 不在服务商返回的列表中，可能是自定义名称、代理别名或未公开模型。')
+    }
+  } catch (err) {
+    modelsError.value = errorMessage(err)
+  } finally {
+    modelsLoading.value = false
+  }
+}
+
+async function clearKey(): Promise<void> {
+  const provider = editing.value
+  if (!provider) return
+  try {
+    await ElMessageBox.confirm(
+      `确定清除「${provider.name}」已保存的 API Key？清除后配置变为不完整，此前的连通性与真实生成测试证据也会一并失效。`,
+      '清除 API Key',
+      { type: 'warning', confirmButtonText: '清除 Key', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await clearProviderApiKey(provider.id)
+    form.api_key = ''
+    resetEvidenceState()
+    ElMessage.success('已清除 API Key，测试证据已失效。请重新填写 Key 后才能真实调用。')
+    await load()
+    editing.value = providers.value.find((item) => item.id === provider.id) ?? null
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  }
 }
 
 function validationError(): string | null {
@@ -339,7 +575,7 @@ async function save(): Promise<void> {
   try {
     if (editing.value) {
       await api(`/providers/${editing.value.id}`, { method: 'PATCH', body })
-      ElMessage.success('Provider 已更新。')
+      ElMessage.success('Provider 已更新；配置变更会清空旧测试证据。')
     } else {
       await api('/providers', { method: 'POST', body })
       ElMessage.success('Provider 已创建。')
@@ -374,29 +610,134 @@ async function makeDefault(provider: LLMProvider): Promise<void> {
   }
 }
 
-async function testProvider(provider: LLMProvider): Promise<void> {
-  testingId.value = provider.id
+/** 真实远端测试会计费；必须在发起前明确提示，Mock 除外。 */
+async function confirmRealCall(provider: LLMProvider, action: string): Promise<boolean> {
+  if (provider.is_mock) return true
   try {
-    const result = await api<{
-      ok: boolean
-      message?: string | null
-      error_code?: string | null
-      details?: { elapsed_ms?: number | null; reply_preview?: string | null }
-    }>(`/providers/${provider.id}/test`, { method: 'POST' })
-    if (result.ok) {
-      const details = result.details ?? {}
-      ElMessage.success(
-        `连接成功：${details.elapsed_ms ?? '—'} ms${details.reply_preview ? ` · ${details.reply_preview}` : ''}`,
-      )
-    } else {
-      ElMessage.error(`连接失败（${result.error_code ?? 'UNKNOWN'}）：${result.message || '未知错误'}`)
-    }
+    await ElMessageBox.confirm(
+      `即将向「${provider.name}」发起${action}。这是真实模型请求，可能产生费用；` +
+        '若未填写单价或服务商未返回用量，费用会显示“无法估算”，不会记为 0。' +
+        '测试调用会写入本地用量与预算。取消只停止本地等待，无法保证服务商停止生成或停止计费。',
+      '真实模型调用提醒',
+      { type: 'warning', confirmButtonText: '继续测试', cancelButtonText: '取消' },
+    )
+    return true
+  } catch {
+    return false
+  }
+}
+
+function beginOperation(provider: LLMProvider, kind: ActiveTest['kind']): ActiveTest {
+  const active: ActiveTest = {
+    providerId: provider.id,
+    operationId: makeOperationId(),
+    kind,
+    controller: new AbortController(),
+  }
+  activeTest.value = active
+  return active
+}
+
+function testTimeoutMs(provider: LLMProvider): number {
+  return (provider.timeout_seconds + 15) * 1000
+}
+
+function operationErrorMessage(err: unknown, active: ActiveTest): string {
+  if (active.controller.signal.aborted) {
+    return '已取消本地等待；无法保证服务商停止生成或停止计费。'
+  }
+  return errorMessage(err)
+}
+
+async function runConnectivity(provider: LLMProvider): Promise<void> {
+  if (activeTest.value) {
+    ElMessage.warning('已有测试正在进行，请等待完成或先取消。')
+    return
+  }
+  if (!(await confirmRealCall(provider, '连通性测试（极短真实请求）'))) return
+  const active = beginOperation(provider, 'connectivity')
+  testTitle.value = `连通性测试 · ${provider.name}`
+  testResult.value = null
+  testError.value = null
+  testDialog.value = true
+  try {
+    testResult.value = await testProviderConnectivity(
+      provider.id,
+      { operation_id: active.operationId },
+      { signal: active.controller.signal, timeoutMs: testTimeoutMs(provider) },
+    )
   } catch (err) {
-    ElMessage.error(errorMessage(err))
+    testError.value = operationErrorMessage(err, active)
   } finally {
-    testingId.value = null
+    activeTest.value = null
     await load()
   }
+}
+
+function openGeneration(provider: LLMProvider): void {
+  if (activeTest.value) {
+    ElMessage.warning('已有测试正在进行，请等待完成或先取消。')
+    return
+  }
+  generationProvider.value = provider
+  generationResult.value = null
+  generationError.value = null
+  generationDialog.value = true
+}
+
+async function runGeneration(): Promise<void> {
+  const provider = generationProvider.value
+  if (!provider) return
+  const prompt = generationForm.prompt.trim()
+  if (!prompt) {
+    ElMessage.warning('请输入测试提示词。')
+    return
+  }
+  if (prompt.length > 2000) {
+    ElMessage.warning('提示词不能超过 2000 个字符。')
+    return
+  }
+  if (
+    !Number.isInteger(generationForm.max_output_tokens) ||
+    generationForm.max_output_tokens < 1 ||
+    generationForm.max_output_tokens > 128
+  ) {
+    ElMessage.warning('最大输出 Token 必须在 1–128 之间。')
+    return
+  }
+  if (!(await confirmRealCall(provider, '真实生成测试'))) return
+  const active = beginOperation(provider, 'generation')
+  generationResult.value = null
+  generationError.value = null
+  try {
+    generationResult.value = await testProviderGeneration(
+      provider.id,
+      {
+        operation_id: active.operationId,
+        prompt,
+        max_output_tokens: generationForm.max_output_tokens,
+        temperature: generationForm.temperature,
+      },
+      { signal: active.controller.signal, timeoutMs: testTimeoutMs(provider) },
+    )
+  } catch (err) {
+    generationError.value = operationErrorMessage(err, active)
+  } finally {
+    activeTest.value = null
+    await load()
+  }
+}
+
+async function cancelActiveTest(): Promise<void> {
+  const active = activeTest.value
+  if (!active) return
+  try {
+    await cancelProviderOperation(active.providerId, active.operationId)
+  } catch {
+    // 取消端点只是尽力而为；即使失败也停止本地等待。
+  }
+  active.controller.abort()
+  ElMessage.info('已请求取消本地等待；无法保证服务商停止生成或停止计费。')
 }
 
 async function deleteProvider(provider: LLMProvider): Promise<void> {
@@ -432,5 +773,28 @@ onMounted(load)
   font-size: 11px;
   margin-top: 2px;
   word-break: break-all;
+}
+
+.model-field {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.key-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.result-error {
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--el-color-danger);
+  word-break: break-word;
+}
+
+.generation-form {
+  margin-top: 12px;
 }
 </style>

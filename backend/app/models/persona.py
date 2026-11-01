@@ -30,7 +30,7 @@ class Persona(Base, TimestampMixin):
     self_description: Mapped[str | None] = mapped_column(Text, nullable=True)
     authored_fields_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     system_prompt_overlay: Mapped[str | None] = mapped_column(Text, nullable=True)
-    growth_policy: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
+    growth_policy: Mapped[str] = mapped_column(String(16), default="review", nullable=False)
     growth_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     learning_scope: Mapped[str] = mapped_column(String(32), default="admin_only", nullable=False)
     thresholds_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)

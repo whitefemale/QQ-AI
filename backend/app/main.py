@@ -17,20 +17,37 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp
 
-from app.api import accounts, backups, demo, extensions, groups, messages, personas, playground, providers, system
-from app.core.config import PROJECT_ROOT, Settings, get_settings
+from app.api import (
+    accounts,
+    backups,
+    connectors,
+    demo,
+    diagnostics,
+    extensions,
+    groups,
+    messages,
+    onboarding,
+    personas,
+    playground,
+    providers,
+    system,
+)
+from app.api.local_guard import ConnectorLocalGuard
+from app.core.config import Settings, get_settings, resolve_backend_root
 from app.core.context import request_id_var
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import setup_logging
 from app.core.response import fail, ok
 from app.core.security import is_loopback_host, redact_value
+from app.core.security_headers import SecurityHeadersMiddleware
 from app.runtime import AppRuntime
 
 logger = logging.getLogger(__name__)
 
-BACKEND_ROOT = PROJECT_ROOT / "backend"
+BACKEND_ROOT = resolve_backend_root()
 _LOCAL_HOSTS = {"testclient", "testserver"}
 
 
@@ -218,6 +235,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
 
     app.add_middleware(RemoteAdminGuard, settings=settings)
+    # 连接器端点无论远程管理是否开启都只接受回环客户端；放在远端守卫内侧。
+    app.add_middleware(ConnectorLocalGuard, prefix=settings.api_prefix)
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(
         CORSMiddleware,
@@ -228,11 +247,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         expose_headers=["X-Request-ID"],
         max_age=600,
     )
+    allowed_hosts = settings.allowed_host_list
+    if allowed_hosts == ["*"]:
+        logger.warning("ALLOWED_HOSTS=* 已关闭 Host 校验；仅应在受控环境中使用")
+    else:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+    # 安全响应头放在最外层，确保错误页同样带有基础防护头。
+    app.add_middleware(SecurityHeadersMiddleware)
 
     prefix = settings.api_prefix.rstrip("/") or "/api"
     for module in (
         system,
         accounts,
+        onboarding,
+        diagnostics,
+        connectors,
         groups,
         personas,
         providers,

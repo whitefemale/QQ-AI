@@ -39,6 +39,9 @@
             />
             <el-button type="primary" @click="loadMessages(1)">查询</el-button>
             <el-button @click="resetFilters">重置</el-button>
+            <el-tooltip content="按当前筛选导出，含消息正文与发送者标识，不含媒体文件、提示词或凭证。" placement="top">
+              <el-button type="primary" plain :loading="exporting" @click="exportMessages">导出 CSV</el-button>
+            </el-tooltip>
           </div>
 
           <el-table v-loading="loading" :data="messages" row-key="id">
@@ -138,8 +141,8 @@
             type="info"
             :closable="false"
             show-icon
-            title="未知发送状态不会重发"
-            description="网络超时导致的 unknown 状态保持不动，避免重复发送；只有明确可重试的失败才会重新排队。"
+            title="待确认回复不会自动发送"
+            description="manual_confirm 模式生成的回复只进入「待确认」队列；「处理到期消息」绝不会发送待确认内容。通过前会重新检查暂停、安静时段、静音、限频、长度与敏感信息，失败时记录保持待确认。"
           />
           <el-table v-loading="outboxLoading" :data="outbox" row-key="id">
             <el-table-column label="创建时间" width="152">
@@ -169,9 +172,27 @@
                 <span v-else class="muted">—</span>
               </template>
             </el-table-column>
+            <el-table-column label="来源 / 类型" width="150">
+              <template #default="{ row }">
+                <div class="mono">{{ row.origin_member_platform_user_id || '—' }}</div>
+                <div class="muted">{{ replyKindLabel(row.reply_kind) }}</div>
+              </template>
+            </el-table-column>
             <el-table-column label="已发送 ID" width="160">
               <template #default="{ row }">
                 <span class="mono">{{ row.sent_platform_message_id || '—' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="220" fixed="right">
+              <template #default="{ row }">
+                <div v-if="row.status === 'pending_approval'" class="row-actions">
+                  <el-button size="small" type="primary" :loading="approvingId === row.id" @click="approveNow(row)">
+                    通过并发送
+                  </el-button>
+                  <el-button size="small" @click="openApproval(row)">编辑</el-button>
+                  <el-button size="small" type="danger" text @click="rejectReply(row)">拒绝</el-button>
+                </div>
+                <span v-else class="muted">—</span>
               </template>
             </el-table-column>
           </el-table>
@@ -267,7 +288,7 @@
             </el-table-column>
             <el-table-column prop="error_code" label="错误" min-width="130" />
           </el-table>
-          <el-empty v-if="!usageLoading && !usage.length" description="暂无模型调用记录。" />
+          <el-empty v-if="!usageLoading && !usage.length" description="尚无模型调用用量。" />
           <div class="pager">
             <el-pagination
               v-model:current-page="usagePage"
@@ -282,18 +303,33 @@
         </div>
       </el-tab-pane>
     </el-tabs>
+
+    <el-dialog v-model="approvalDialog" title="编辑并批准回复" width="640px" :close-on-click-modal="false">
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="批准后会立即尝试发送一次"
+        description="发送前会重新执行暂停、安静时段、静音、限频、群级长度与敏感信息检查；检查失败时不会发送，记录保持待确认。"
+      />
+      <el-input v-model="approvalContent" type="textarea" :rows="6" maxlength="2000" show-word-limit />
+      <template #footer>
+        <el-button @click="approvalDialog = false">取消</el-button>
+        <el-button type="primary" :loading="approvingId !== null" @click="submitApproval">确认并发送</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 
-import { api, errorMessage } from '@/api/client'
+import { api, downloadApiFile, errorMessage } from '@/api/client'
 import type { Account, Group, MessageRecord, OutboxRecord, UsageRecord, UsageSummary } from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
 import { costStatusLabel, costStatusTag, formatCost, formatNumber, formatTime, truncate } from '@/utils/format'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 const activeTab = ref('messages')
 const loading = ref(false)
@@ -308,6 +344,7 @@ const messageStatuses = [
   { value: 'generating', label: '生成中' },
   { value: 'replied', label: '已回复' },
   { value: 'queued', label: '已入队' },
+  { value: 'awaiting_approval', label: '等待人工确认' },
   { value: 'sent', label: '发送记录' },
   { value: 'send_unknown', label: '发送状态未知' },
   { value: 'send_failed', label: '发送失败' },
@@ -317,8 +354,11 @@ const messageStatuses = [
 
 const outboxStatuses = [
   { value: 'pending', label: '待发送' },
+  { value: 'pending_approval', label: '待人工确认' },
   { value: 'sending', label: '发送中' },
   { value: 'sent', label: '已发送' },
+  { value: 'cancelled', label: '已取消' },
+  { value: 'rejected', label: '已拒绝' },
   { value: 'failed', label: '失败（可重试）' },
   { value: 'unknown', label: '状态未知' },
 ]
@@ -336,6 +376,7 @@ const messages = ref<MessageRecord[]>([])
 const page = ref(1)
 const pageSize = ref(50)
 const total = ref(0)
+const exporting = ref(false)
 
 const outbox = ref<OutboxRecord[]>([])
 const outboxStatus = ref('')
@@ -344,6 +385,10 @@ const outboxPageSize = ref(50)
 const outboxTotal = ref(0)
 const outboxLoading = ref(false)
 const dispatching = ref(false)
+const approvalDialog = ref(false)
+const approvalContent = ref('')
+const approvalTarget = ref<OutboxRecord | null>(null)
+const approvingId = ref<string | null>(null)
 
 const usage = ref<UsageRecord[]>([])
 const usageSummary = ref<UsageSummary | null>(null)
@@ -366,24 +411,26 @@ async function loadReferences(): Promise<void> {
   }
 }
 
+function messageFilterQuery(): Record<string, string> {
+  const query: Record<string, string> = {}
+  if (filters.search.trim()) query.search = filters.search.trim()
+  if (filters.account_id) query.account_id = filters.account_id
+  if (filters.group_id) query.group_id = filters.group_id
+  if (filters.direction) query.direction = filters.direction
+  if (filters.status) query.status = filters.status
+  if (dateRange.value) {
+    query.since = dateRange.value[0].toISOString()
+    query.until = dateRange.value[1].toISOString()
+  }
+  return query
+}
+
 async function loadMessages(targetPage?: number): Promise<void> {
   if (targetPage) page.value = targetPage
   loading.value = true
   error.value = null
   try {
-    const query: Record<string, string | number> = {
-      page: page.value,
-      page_size: pageSize.value,
-    }
-    if (filters.search.trim()) query.search = filters.search.trim()
-    if (filters.account_id) query.account_id = filters.account_id
-    if (filters.group_id) query.group_id = filters.group_id
-    if (filters.direction) query.direction = filters.direction
-    if (filters.status) query.status = filters.status
-    if (dateRange.value) {
-      query.since = dateRange.value[0].toISOString()
-      query.until = dateRange.value[1].toISOString()
-    }
+    const query = { ...messageFilterQuery(), page: String(page.value), page_size: String(pageSize.value) }
     const data = await api<{ items: MessageRecord[]; total: number }>('/messages', { query })
     messages.value = data.items
     total.value = data.total
@@ -391,6 +438,31 @@ async function loadMessages(targetPage?: number): Promise<void> {
     error.value = errorMessage(err)
   } finally {
     loading.value = false
+  }
+}
+
+async function exportMessages(): Promise<void> {
+  if (exporting.value) return
+  exporting.value = true
+  try {
+    const file = await downloadApiFile('/messages/export.csv', {
+      query: messageFilterQuery(),
+      timeoutMs: 120_000,
+    })
+    const url = URL.createObjectURL(file.blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = file.filename || 'messages.csv'
+    link.style.display = 'none'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    ElMessage.success('已开始导出消息 CSV。')
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+  } finally {
+    exporting.value = false
   }
 }
 
@@ -457,6 +529,86 @@ async function dispatchDue(): Promise<void> {
     ElMessage.error(errorMessage(err))
   } finally {
     dispatching.value = false
+  }
+}
+
+function replyKindLabel(kind?: string): string {
+  if (kind === 'command') return '管理员命令'
+  if (kind === 'reply') return 'AI 回复'
+  return kind || '—'
+}
+
+async function approveReply(id: string, content?: string): Promise<void> {
+  approvingId.value = id
+  try {
+    const data = await api<{ item: OutboxRecord; sent_immediately: boolean; note: string }>(
+      `/outbox/${id}/approve`,
+      { method: 'POST', body: content === undefined ? {} : { content } },
+    )
+    ElMessage.success(data.sent_immediately ? '已批准并发送。' : data.note)
+    approvalDialog.value = false
+    await loadOutbox()
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+    await loadOutbox()
+  } finally {
+    approvingId.value = null
+  }
+}
+
+async function approveNow(row: OutboxRecord): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      '将通过原内容并立即尝试发送一次。发送前仍会重新检查暂停、安静时段、静音、限频、长度与敏感信息。',
+      '通过并发送',
+      { type: 'warning', confirmButtonText: '通过并发送', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  await approveReply(row.id)
+}
+
+function openApproval(row: OutboxRecord): void {
+  approvalTarget.value = row
+  approvalContent.value = row.content
+  approvalDialog.value = true
+}
+
+async function submitApproval(): Promise<void> {
+  if (!approvalTarget.value) return
+  if (!approvalContent.value.trim()) {
+    ElMessage.warning('回复内容不能为空。')
+    return
+  }
+  await approveReply(approvalTarget.value.id, approvalContent.value)
+}
+
+async function rejectReply(row: OutboxRecord): Promise<void> {
+  let reason: string
+  try {
+    const result = await ElMessageBox.prompt(
+      '拒绝后不会发送，也不会自动重试。可填写原因（留空也可）。',
+      '拒绝待确认回复',
+      {
+        type: 'warning',
+        confirmButtonText: '拒绝',
+        cancelButtonText: '取消',
+        inputPlaceholder: '可选：原因',
+        inputValue: '',
+      },
+    )
+    reason = result.value || ''
+  } catch {
+    return
+  }
+  try {
+    await api(`/outbox/${row.id}/reject`, { method: 'POST', body: { reason } })
+    ElMessage.success('已拒绝该回复。')
+    await loadOutbox()
+  } catch (err) {
+    ElMessage.error(errorMessage(err))
+    await loadOutbox()
   }
 }
 

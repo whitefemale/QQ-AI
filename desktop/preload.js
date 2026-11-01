@@ -23,6 +23,7 @@ contextBridge.exposeInMainWorld('aiGroupFriendDesktop', {
   startBackend: (options) => ipcRenderer.invoke('desktop:start-backend', { demo: Boolean(options?.demo) }),
   stopBackend: () => ipcRenderer.invoke('desktop:stop-backend'),
   restartBackend: () => ipcRenderer.invoke('desktop:restart-backend'),
+  chooseConnectorsDir: () => ipcRenderer.invoke('desktop:choose-connectors-dir'),
   openFolder: (kind) => ipcRenderer.invoke('desktop:open-folder', kind),
   openReleases: () => ipcRenderer.invoke('desktop:open-releases'),
   openConsole: () => ipcRenderer.invoke('desktop:open-console'),

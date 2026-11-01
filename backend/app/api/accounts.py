@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.api.deps import as_payload, get_runtime
+from app.api.deps import as_payload, get_actor, get_runtime, require_confirmation
 from app.core.errors import AppError, ErrorCode
 from app.core.response import ok
 from app.runtime import AppRuntime
 from app.services.settings_store import get_global_pause
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query, Request
 
 router = APIRouter()
 
@@ -19,27 +19,8 @@ async def list_accounts(runtime: AppRuntime = Depends(get_runtime)) -> dict[str,
     return ok(
         {
             "items": await runtime.accounts.list_accounts(),
-            "connection_modes": [
-                {
-                    "value": "mock",
-                    "label": "Mock 连接器（本地演示）",
-                    "available": True,
-                    "note": "不会连接真实 QQ。",
-                },
-                {
-                    "value": "onebot11",
-                    "label": "OneBot 11（NapCat 等）",
-                    "available": True,
-                    "note": "需用户自行安装并登录连接器；默认只允许本机/内网地址。",
-                },
-                {
-                    "value": "official",
-                    "label": "官方 QQ 机器人",
-                    "available": False,
-                    "state": "planned",
-                    "note": "尚未实现，仅为规划占位。",
-                },
-            ],
+            # 由适配器工厂注册表派生，新增适配器无需在此手写分支。
+            "connection_modes": runtime.manager.adapter_factory.modes(),
             "global_pause": await get_global_pause(runtime.database),
         }
     )
@@ -76,8 +57,14 @@ async def update_account(
 
 
 @router.delete("/accounts/{account_id}")
-async def delete_account(account_id: str, runtime: AppRuntime = Depends(get_runtime)) -> dict[str, Any]:
-    await runtime.accounts.delete_account(account_id)
+async def delete_account(
+    account_id: str,
+    request: Request,
+    confirm: str | None = Query(default=None),
+    runtime: AppRuntime = Depends(get_runtime),
+) -> dict[str, Any]:
+    require_confirmation(confirm, "DELETE", "删除账号会永久删除其群、消息、记忆与发送队列，请输入 DELETE 以确认。")
+    await runtime.accounts.delete_account(account_id, actor=get_actor(request))
     return ok({"deleted": True, "id": account_id})
 
 

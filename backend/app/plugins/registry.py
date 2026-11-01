@@ -24,6 +24,7 @@ from app.plugins.manifest import (
     load_manifests,
     version_at_least,
 )
+from app.plugins.runtime import runtime_requirements
 
 
 class PluginService:
@@ -142,6 +143,8 @@ class PluginService:
                 if record.is_builtin
                 else "当前版本仅登记清单，不加载或执行第三方代码；运行时插件将在后续版本提供。"
             ),
+            "execution": "builtin_in_process" if record.is_builtin else "not_executed",
+            "runtime_requirements": runtime_requirements() if not record.is_builtin else [],
             "last_error": record.last_error,
             "is_builtin": record.is_builtin,
             "manifest_path": record.manifest_path,

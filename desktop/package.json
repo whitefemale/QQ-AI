@@ -1,15 +1,69 @@
 {
   "name": "ai-group-friend-desktop",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "description": "AI 群友本地桌面版：一键启动本地后端并打开管理控制台",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "test": "node --test",
-    "smoke": "electron . --smoke"
+    "smoke": "electron . --smoke",
+    "pack:dir": "node --use-system-ca ./node_modules/electron-builder/cli.js --win --dir --x64 --config.electronDist=node_modules/electron/dist --publish never",
+    "dist": "node --use-system-ca ./node_modules/electron-builder/cli.js --win --x64 --config.electronDist=node_modules/electron/dist --publish never"
+  },
+  "build": {
+    "appId": "com.aigroupfriend.desktop",
+    "productName": "AI 群友",
+    "copyright": "MIT",
+    "asar": false,
+    "npmRebuild": false,
+    "directories": {
+      "output": "../release",
+      "buildResources": "assets"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "lib/**/*",
+      "shell/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../frontend/dist",
+        "to": "frontend/dist"
+      },
+      {
+        "from": "../backend/dist/aiqf-backend",
+        "to": "backend"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "artifactName": "AI-Group-Friend-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AI 群友",
+      "uninstallDisplayName": "AI 群友",
+      "deleteAppDataOnUninstall": false
+    }
   },
   "devDependencies": {
-    "electron": "45.0.0"
+    "electron": "45.0.0",
+    "electron-builder": "^26.18.0"
   }
 }

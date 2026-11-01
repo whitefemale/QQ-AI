@@ -333,6 +333,9 @@ class MediaJobService:
             job = await session.get(MediaJob, job_id)
             if job is None:
                 raise AppError(ErrorCode.MEDIA_JOB_NOT_FOUND, "媒体任务不存在。", status_code=404)
+            # 停用扩展会取消运行中的任务；迟到的异常不能把已取消状态改回排队/失败。
+            if job.status == "cancelled":
+                return job
             job.error_code = code
             job.error_message = message
             if not terminal and job.attempts < job.max_attempts:
@@ -345,21 +348,55 @@ class MediaJobService:
             return job
 
     async def cancel_job(self, job_id: str) -> MediaJob:
+        """取消排队或运行中的任务；运行中的结果会在保存前被丢弃。"""
         async with self.database.session() as session:
             job = await session.get(MediaJob, job_id)
             if job is None:
                 raise AppError(ErrorCode.MEDIA_JOB_NOT_FOUND, "媒体任务不存在。", status_code=404)
-            if job.status != "queued":
+            if job.status not in {"queued", "running"}:
                 raise AppError(
                     ErrorCode.MEDIA_JOB_CANNOT_CANCEL,
-                    "只能取消尚未开始处理的任务。",
+                    "只能取消排队中或运行中的任务。",
                     status_code=400,
                 )
             job.status = "cancelled"
+            job.error_message = "任务已由管理员取消。"
             job.finished_at = utcnow()
             await session.commit()
             await session.refresh(job)
             return job
+
+    async def cancel_jobs_for_unavailable_capabilities(
+        self,
+        capabilities: set[str] | list[str],
+        *,
+        reason: str = "相关媒体 Provider 已停用，任务已取消。",
+        error_code: str = ErrorCode.PROVIDER_CAPABILITY_MISSING,
+    ) -> dict[str, Any]:
+        """扩展停用后的即时止损：取消这些能力下排队与运行中的任务。
+
+        返回取消数量与任务 ID，调用方写入审计。运行中的任务无法中断已经发出的
+        上游请求，但结果会在保存前检测到 cancelled 并丢弃。
+        """
+        caps = sorted({str(item) for item in capabilities if item})
+        if not caps:
+            return {"cancelled": 0, "job_ids": [], "capabilities": []}
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(MediaJob).where(
+                    MediaJob.capability.in_(caps),
+                    MediaJob.status.in_(("queued", "running")),
+                )
+            )
+            jobs = list(result.scalars())
+            for job in jobs:
+                job.status = "cancelled"
+                job.error_code = error_code
+                job.error_message = reason
+                job.finished_at = utcnow()
+            await session.commit()
+            job_ids = [job.id for job in jobs]
+        return {"cancelled": len(job_ids), "job_ids": job_ids, "capabilities": caps}
 
     async def retry_job(self, job_id: str) -> MediaJob:
         async with self.database.session() as session:
@@ -370,6 +407,15 @@ class MediaJobService:
                 raise AppError(ErrorCode.MEDIA_JOB_CANNOT_CANCEL, "当前状态不能重试。", status_code=400)
             if job.attempts >= job.max_attempts:
                 raise AppError(ErrorCode.MEDIA_JOB_RETRY_EXHAUSTED, "已达到最大重试次数。", status_code=400)
+            try:
+                self.router.select(job.capability)
+            except AppError as exc:
+                raise AppError(
+                    ErrorCode.PROVIDER_CAPABILITY_MISSING,
+                    "该能力当前没有可用 Provider，不能重新排队；请先启用 Provider。",
+                    status_code=400,
+                    details={"capability": job.capability, "reason": exc.message},
+                ) from exc
             job.status = "queued"
             job.error_code = None
             job.error_message = None

@@ -14,10 +14,28 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: '仪表盘', icon: 'Odometer' },
       },
       {
+        path: 'onboarding',
+        name: 'onboarding',
+        component: () => import('@/views/OnboardingView.vue'),
+        meta: { title: '接入向导', icon: 'Guide' },
+      },
+      {
+        path: 'diagnostics',
+        name: 'diagnostics',
+        component: () => import('@/views/DiagnosticsView.vue'),
+        meta: { title: '诊断与日志', icon: 'DocumentChecked' },
+      },
+      {
         path: 'accounts',
         name: 'accounts',
         component: () => import('@/views/AccountsView.vue'),
         meta: { title: 'QQ 接入', icon: 'Connection' },
+      },
+      {
+        path: 'connectors',
+        name: 'connectors',
+        component: () => import('@/views/ConnectorsView.vue'),
+        meta: { title: '连接器', icon: 'Link' },
       },
       {
         path: 'providers',

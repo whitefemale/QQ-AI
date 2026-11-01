@@ -59,8 +59,14 @@ describe('state labels and tags', () => {
   it('maps known backend states to Chinese labels', () => {
     expect(stateLabel('mention_only')).toBe('仅 @ 回复')
     expect(stateLabel('mock_only')).toBe('仅 Mock')
+    expect(stateLabel('connected_unverified')).toBe('已连接 · 身份未验证')
+    expect(stateLabel('not_verified')).toBe('未验证')
     expect(stateLabel('planned')).toBe('规划中')
     expect(stateLabel('candidate')).toBe('候选')
+    expect(stateLabel('manual_confirm')).toBe('手动确认')
+    expect(stateLabel('pending_approval')).toBe('待确认发送')
+    expect(stateLabel('awaiting_approval')).toBe('待人工确认')
+    expect(stateLabel('sensitive_output')).toBe('疑似敏感内容')
     expect(stateLabel(null)).toBe('—')
     expect(stateLabel('custom_state')).toBe('custom_state')
   })
@@ -68,10 +74,16 @@ describe('state labels and tags', () => {
   it('never marks mock or planned capabilities as success', () => {
     expect(stateTag('available')).toBe('success')
     expect(stateTag('mock_only')).toBe('warning')
+    expect(stateTag('connected_unverified')).toBe('warning')
+    expect(stateTag('identity_verified')).toBe('warning')
+    expect(stateTag('not_verified')).toBe('warning')
     expect(stateTag('planned')).toBe('info')
     expect(stateTag('unconfigured')).toBe('info')
     expect(stateTag('failed')).toBe('danger')
     expect(stateTag('unknown')).toBe('warning')
+    expect(stateTag('pending_approval')).toBe('warning')
+    expect(stateTag('awaiting_approval')).toBe('warning')
+    expect(stateTag('sensitive_output')).toBe('danger')
   })
 
   it('labels risk levels without downgrading high risk', () => {
@@ -85,6 +97,7 @@ describe('event display', () => {
   it('translates known event types and preserves unknown ones', () => {
     expect(eventLabel('message.intercepted')).toBe('消息被拦截')
     expect(eventLabel('budget.alert')).toBe('预算告警')
+    expect(eventLabel('reply.awaiting_approval')).toBe('回复待人工确认')
     expect(eventLabel('custom.event')).toBe('custom.event')
   })
 

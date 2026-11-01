@@ -91,7 +91,10 @@ const desktopMode = isDesktop()
 
 const navItems = [
   { path: '/', title: '仪表盘', icon: 'Odometer' },
+  { path: '/onboarding', title: '接入向导', icon: 'Guide' },
+  { path: '/diagnostics', title: '诊断与日志', icon: 'DocumentChecked' },
   { path: '/accounts', title: 'QQ 接入', icon: 'Connection' },
+  { path: '/connectors', title: '连接器', icon: 'Link' },
   { path: '/providers', title: '模型 API', icon: 'Cpu' },
   { path: '/capabilities', title: '能力中心', icon: 'MagicStick' },
   { path: '/personas', title: '人格工作台', icon: 'UserFilled' },

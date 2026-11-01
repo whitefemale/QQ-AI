@@ -39,14 +39,18 @@ class CapabilityRouter:
             raise AppError(ErrorCode.PROVIDER_CAPABILITY_MISSING, "未知的媒体能力。", status_code=400)
         providers = self.candidates(capability)
         if not providers:
-            planned = any(
-                entry.planned or not entry.enabled for entry in self.registry.list_entries(CAPABILITY_TYPES[capability])
-            )
+            entries = self.registry.list_entries(CAPABILITY_TYPES[capability])
+            # 只有全部已注册实现都是规划占位时才是 planned；仅仅“已停用”是实现存在但未启用。
+            planned = bool(entries) and all(entry.planned for entry in entries)
             raise AppError(
                 ErrorCode.PROVIDER_CAPABILITY_MISSING,
                 "该媒体能力当前未配置可用 Provider。请先在「能力中心」启用 Mock Provider，或配置真实 Provider。",
                 status_code=503,
-                details={"capability": capability, "planned": planned},
+                details={
+                    "capability": capability,
+                    "planned": planned,
+                    "state": "planned" if planned else "unconfigured",
+                },
             )
         provider = providers[0]
         decision = RouteDecision(

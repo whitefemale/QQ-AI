@@ -14,9 +14,10 @@ import asyncio
 import logging
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import String, cast, delete, func, select
 
 from app.core.config import Settings
 from app.core.errors import AppError, ErrorCode
@@ -24,6 +25,7 @@ from app.core.security import redact_text
 from app.core.time import iso_utc, utcnow
 from app.db.session import Database
 from app.media.service import MediaService
+from app.models.media import MediaAsset
 from app.models.message import Message
 from app.services.audit import write_audit
 from app.services.memory_service import MemoryService
@@ -40,23 +42,36 @@ RETENTION_DEFAULTS = {
     "log_retention_days": 30,
     "message_retention_days": 90,
     "media_retention_days": 30,
+    # 0 表示不自动清理记忆；不能沿用 1~3650 的归一化，否则 0 会被改写。
+    "memory_retention_days": 0,
 }
 
 
+def normalize_memory_retention_days(raw: Any) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return value if value == 0 or 1 <= value <= 3650 else 0
+
+
 def normalize_retention_days(raw: Any) -> dict[str, int]:
-    """把数据库/接口中的保留天数规范化到 1 到 3650 天。"""
+    """把数据库/接口中的保留天数规范化；记忆保留允许 0（关闭自动清理）。"""
     result = dict(RETENTION_DEFAULTS)
-    if isinstance(raw, dict):
-        for key in result:
-            candidate = raw.get(key)
-            if candidate is None:
-                continue
-            try:
-                value = int(candidate)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= value <= 3650:
-                result[key] = value
+    if not isinstance(raw, dict):
+        return result
+    for key in ("log_retention_days", "message_retention_days", "media_retention_days"):
+        candidate = raw.get(key)
+        if candidate is None:
+            continue
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= value <= 3650:
+            result[key] = value
+    if "memory_retention_days" in raw:
+        result["memory_retention_days"] = normalize_memory_retention_days(raw.get("memory_retention_days"))
     return result
 
 
@@ -75,6 +90,7 @@ def _empty_counts() -> dict[str, int]:
         "memories_scrubbed": 0,
         "memory_candidates_updated": 0,
         "memory_candidates_deleted": 0,
+        "memories_deleted": 0,
     }
 
 
@@ -147,11 +163,98 @@ class RetentionService:
                 "清理不会发送消息、调用模型或处理媒体任务，全局暂停也不会阻止本地删除。",
                 "日志只删除 logs 目录下 app.log.* 轮转文件，当前 app.log 始终保留。",
                 "人格证据与记忆来源先擦除再删除消息；记忆正文本身不会被改写。",
+                "记忆保留天数为 0 表示不自动删除记忆；固定记忆永远不参与自动清理。",
+            ],
+        }
+
+    # ------------------------------------------------------------------ 预览
+    async def preview(self) -> dict[str, Any]:
+        """只读统计将被清理的数据；不取运行锁、不写审计、不更新 last_run。"""
+        now = utcnow()
+        days = await self.retention_days()
+        batch_size = max(1, int(self.settings.retention_batch_size))
+        max_batches = max(1, int(self.settings.retention_max_batches_per_run))
+        will_delete_limit = batch_size * max_batches
+        message_cutoff = now - timedelta(days=days["message_retention_days"])
+        async with self.database.session() as session:
+            messages_expired = int(
+                await session.scalar(select(func.count(Message.id)).where(Message.event_timestamp < message_cutoff))
+                or 0
+            )
+            messages_with_media = int(
+                await session.scalar(
+                    select(func.count(Message.id)).where(
+                        Message.event_timestamp < message_cutoff,
+                        cast(Message.segments_json, String).like("%media_ref%"),
+                    )
+                )
+                or 0
+            )
+            media_expired = int(
+                await session.scalar(
+                    select(func.count(MediaAsset.id)).where(
+                        MediaAsset.deleted_at.is_(None),
+                        MediaAsset.expires_at.is_not(None),
+                        MediaAsset.expires_at < now,
+                    )
+                )
+                or 0
+            )
+        log_candidates = await asyncio.to_thread(self._log_candidates, days["log_retention_days"])
+        memories = 0
+        if days["memory_retention_days"] > 0:
+            try:
+                result = await self.memories.cleanup(
+                    mode="older_than",
+                    days=days["memory_retention_days"],
+                    dry_run=True,
+                )
+                memories = int(result["matched"])
+            except Exception as exc:  # noqa: BLE001 - 预览失败只降级计数，不阻断页面
+                logger.warning("统计可清理记忆失败", extra={"reason": type(exc).__name__})
+        will_delete = min(messages_expired, will_delete_limit)
+        return {
+            "generated_at": iso_utc(now),
+            "running": self._lock.locked(),
+            "retention_days": days,
+            "counts": {
+                "messages_expired": messages_expired,
+                "messages_will_delete": will_delete,
+                "messages_remaining_after": max(0, messages_expired - will_delete),
+                "messages_with_media": messages_with_media,
+                "media_expired": media_expired,
+                "logs": len(log_candidates),
+                "memories": memories,
+            },
+            "memory_retention_enabled": days["memory_retention_days"] > 0,
+            "limits": {
+                "batch_size": batch_size,
+                "max_batches": max_batches,
+                "max_messages_per_run": will_delete_limit,
+            },
+            "truncated": messages_expired > will_delete,
+            "notes": [
+                "预览只统计，不删除任何数据，也不写审计或上次运行记录。",
+                "实际运行时先擦除人格证据与记忆来源，再删除消息；派生数据数量以实际运行摘要为准。",
+                "日志只统计 logs 目录下早于保留期的 app.log.* 轮转文件，当前 app.log 永不删除。",
+                "记忆保留天数为 0 表示不自动清理记忆；固定记忆永远不参与清理。",
             ],
         }
 
     # ------------------------------------------------------------------ 执行
-    async def run(self, *, trigger: str = "manual", actor: str = "local-admin") -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        trigger: str = "manual",
+        actor: str = "local-admin",
+        confirm: str | None = None,
+    ) -> dict[str, Any]:
+        if trigger == "manual" and confirm != "CLEANUP":
+            raise AppError(
+                ErrorCode.CONFIRMATION_REQUIRED,
+                "清理不可恢复，请输入 CLEANUP 以确认。",
+                status_code=400,
+            )
         if self._lock.locked():
             raise AppError(ErrorCode.CONFLICT, "已有清理任务正在运行，请稍后再试。", status_code=409)
         async with self._lock:
@@ -175,6 +278,7 @@ class RetentionService:
         }
         try:
             await self._cleanup_messages(days["message_retention_days"], summary, actor=actor)
+            await self._cleanup_memories(days["memory_retention_days"], summary)
             summary["counts"]["media_expired"] = await self.media.cleanup_expired(protect_referenced=True)
             summary["counts"]["logs"] = await asyncio.to_thread(self._cleanup_logs, days["log_retention_days"])
         except asyncio.CancelledError:
@@ -265,23 +369,43 @@ class RetentionService:
             found = await session.scalar(select(Message.id).where(Message.event_timestamp < cutoff).limit(1))
         return found is not None
 
-    def _cleanup_logs(self, retention_days: int) -> int:
+    async def _cleanup_memories(self, retention_days: int, summary: dict[str, Any]) -> None:
+        """0 表示关闭；只删除未固定且创建时间超过保留期的记忆。"""
+        if retention_days <= 0:
+            return
+        try:
+            result = await self.memories.cleanup(mode="older_than", days=retention_days, dry_run=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            summary["status"] = "partial"
+            summary["error"] = redact_text(f"记忆保留清理失败：{type(exc).__name__}: {exc}")[:500]
+            logger.exception("清理过期记忆失败")
+            return
+        summary["counts"]["memories_deleted"] += int(result["deleted"])
+
+    def _log_candidates(self, retention_days: int) -> list[Path]:
+        """只返回 logs 目录下早于保留期的 app.log.* 轮转文件；当前 app.log 永不删除。"""
         root = self.settings.logs_path
         if not root.is_dir():
-            return 0
+            return []
         cutoff = utcnow() - timedelta(days=retention_days)
-        deleted = 0
+        candidates: list[Path] = []
         for path in root.iterdir():
             try:
-                if path.is_symlink() or not path.is_file():
-                    continue
-                name = path.name
-                # 只处理轮转文件；当前 app.log 永不删除。
-                if not name.startswith("app.log."):
+                if path.is_symlink() or not path.is_file() or not path.name.startswith("app.log."):
                     continue
                 mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
-                if mtime >= cutoff:
-                    continue
+                if mtime < cutoff:
+                    candidates.append(path)
+            except OSError:
+                logger.warning("跳过无法读取的日志文件", extra={"name": path.name})
+        return candidates
+
+    def _cleanup_logs(self, retention_days: int) -> int:
+        deleted = 0
+        for path in self._log_candidates(retention_days):
+            try:
                 path.unlink()
                 deleted += 1
             except OSError:

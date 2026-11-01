@@ -29,11 +29,12 @@ from app.models.tool import ToolRun
 from app.pipeline.context import ContextBuilder
 from app.pipeline.events import EventBus
 from app.pipeline.llm_gateway import LLMGateway
-from app.pipeline.orchestrator import MessagePipeline, sanitize_reply
+from app.pipeline.orchestrator import MessagePipeline
 from app.pipeline.outbox import OutboxService
+from app.pipeline.output_guard import sanitize_reply
 from app.pipeline.policy import PolicyEngine
 from app.pipeline.prompt import PromptBuilder
-from app.schemas.llm import ConnectionTestResult, LLMRequest, LLMResponse
+from app.schemas.llm import LLMRequest, LLMResponse
 from app.schemas.message import CanonicalMessage, MessageSegment
 from app.services.memory_auto import MemoryAutoExtractionScheduler
 from app.services.memory_extraction import MemoryExtractionService
@@ -60,8 +61,20 @@ class FailingAdapter(BaseLLMProvider):
         self.calls += 1
         raise AppError(ErrorCode.LLM_TIMEOUT, "模拟主模型超时。", status_code=504)
 
-    async def test_connection(self) -> ConnectionTestResult:
-        return ConnectionTestResult(ok=False, message="模拟故障")
+
+class ScriptedSuccessAdapter(BaseLLMProvider):
+    """测试专用真实类型适配器；不访问网络。"""
+
+    provider_type = "openai_compatible"
+
+    def __init__(self, provider_id: str, *, text: str = "备用模型回复") -> None:
+        super().__init__(provider_id=provider_id, name="备用模型", model="fallback-model")
+        self.text = text
+        self.calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.calls += 1
+        return LLMResponse(text=self.text, input_tokens=3, output_tokens=2)
 
 
 @dataclass
@@ -244,21 +257,31 @@ async def test_fallback_reply_still_sends_exactly_once(env: Env, monkeypatch: py
             model="failing-model",
             enabled=True,
         )
-        session.add(primary)
+        fallback = LLMProvider(
+            name="备用真实模型",
+            provider_type="openai_compatible",
+            model="fallback-model",
+            enabled=True,
+        )
+        session.add_all([primary, fallback])
         await session.flush()
         group = await session.get(Group, env.group.id)
         assert group is not None
         group.llm_provider_id = primary.id
-        group.llm_fallback_provider_id = env.provider.id
+        group.llm_fallback_provider_id = fallback.id
         await session.commit()
         primary_id = primary.id
+        fallback_id = fallback.id
 
     failing = FailingAdapter(provider_id=primary_id)
+    succeeding = ScriptedSuccessAdapter(provider_id=fallback_id)
     original = env.gateway._adapter_for
 
     def adapter_for(record: LLMProvider) -> BaseLLMProvider:
         if record.id == primary_id:
             return failing
+        if record.id == fallback_id:
+            return succeeding
         return original(record)
 
     monkeypatch.setattr(env.gateway, "_adapter_for", adapter_for)
@@ -266,12 +289,13 @@ async def test_fallback_reply_still_sends_exactly_once(env: Env, monkeypatch: py
     result = await env.pipeline.handle(mention(env.adapter), account=env.account, group=env.group, adapter=env.adapter)
 
     assert result.action == "replied"
-    assert result.provider_id == env.provider.id
+    assert result.provider_id == fallback_id
     assert result.fallback_used is True
     assert result.primary_provider_id == primary_id
     assert result.primary_error_code == ErrorCode.LLM_TIMEOUT
     assert result.route_source == "group_binding"
     assert failing.calls == 1
+    assert succeeding.calls == 1
     assert len(env.adapter.sent_messages) == 1
     assert await count_rows(env.database, OutboxMessage) == 1
 

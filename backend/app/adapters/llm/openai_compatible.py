@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 import json
-import time
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from app.adapters.llm.base import BaseLLMProvider
+from app.adapters.llm.http_utils import (
+    RETRY_SAFETY_NONE,
+    RETRY_SAFETY_SAFE,
+    http_error_details,
+    parse_retry_after,
+    transport_error,
+)
 from app.core.errors import AppError, ErrorCode
-from app.core.security import redact_text
-from app.schemas.llm import ConnectionTestResult, LLMRequest, LLMResponse, LLMToolCall
+from app.core.time import iso_utc, utcnow
+from app.schemas.llm import LLMModelInfo, LLMRequest, LLMResponse, LLMToolCall, ModelListResult
+
+MAX_MODEL_LIST_ITEMS = 500
 
 
 class OpenAICompatibleProvider(BaseLLMProvider):
     provider_type = "openai_compatible"
+    supports_model_list = True
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -29,36 +39,63 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         if not self.api_key:
             raise AppError(ErrorCode.LLM_NOT_CONFIGURED, "尚未配置模型 API Key。", status_code=400)
 
-    def _get_client(self, timeout_seconds: float) -> httpx.AsyncClient:
+    def _require_model_list_config(self) -> None:
+        if not self.base_url:
+            raise AppError(ErrorCode.LLM_NOT_CONFIGURED, "尚未配置模型 Base URL。", status_code=400)
+        if not self.api_key:
+            raise AppError(ErrorCode.LLM_NOT_CONFIGURED, "尚未配置模型 API Key。", status_code=400)
+
+    def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=timeout_seconds)
+            # 不跟随重定向，避免 Authorization 被转发到未配置的主机。
+            self._client = httpx.AsyncClient(follow_redirects=False)
         return self._client
 
     def _endpoint(self) -> str:
         assert self.base_url is not None
         return self.base_url.rstrip("/") + "/chat/completions"
 
+    def _models_endpoint(self) -> str:
+        assert self.base_url is not None
+        return self.base_url.rstrip("/") + "/models"
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        extra_headers = self.config.get("extra_headers")
+        if isinstance(extra_headers, dict):
+            headers.update({str(k): str(v) for k, v in extra_headers.items()})
+        return headers
+
     def _classify_response(self, response: httpx.Response) -> AppError:
-        body = redact_text(response.text[:500]) if response.text else ""
-        details = {"status_code": response.status_code, "body": body}
+        retry_after = parse_retry_after(response.headers.get("retry-after"))
+        lowered = (response.text or "").lower()
         if response.status_code in (401, 403):
             return AppError(
                 ErrorCode.LLM_AUTH_FAILED,
                 "模型 API 认证失败，请检查 API Key。",
                 status_code=502,
-                details=details,
+                details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
             )
         if response.status_code == 404:
             return AppError(
                 ErrorCode.LLM_MODEL_NOT_FOUND,
                 "模型或接口不存在，请检查 Base URL 与模型 ID。",
                 status_code=502,
-                details=details,
+                details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
             )
         if response.status_code == 402:
-            return AppError(ErrorCode.LLM_QUOTA_EXCEEDED, "模型账户额度不足。", status_code=502, details=details)
+            return AppError(
+                ErrorCode.LLM_QUOTA_EXCEEDED,
+                "模型账户额度不足。",
+                status_code=502,
+                details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
+            )
         if response.status_code == 429:
-            lowered = body.lower()
+            details = http_error_details(
+                response,
+                retry_safety=RETRY_SAFETY_NONE,
+                retry_after_seconds=retry_after,
+            )
             if "quota" in lowered or "insufficient" in lowered:
                 return AppError(
                     ErrorCode.LLM_QUOTA_EXCEEDED,
@@ -66,6 +103,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                     status_code=502,
                     details=details,
                 )
+            details["retry_safety"] = RETRY_SAFETY_SAFE
             return AppError(
                 ErrorCode.LLM_RATE_LIMITED,
                 "模型请求被限流，请稍后再试或降低频率。",
@@ -78,18 +116,26 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 ErrorCode.LLM_NETWORK_ERROR,
                 "模型服务暂时不可用。",
                 status_code=502,
-                details=details,
+                details=http_error_details(
+                    response,
+                    retry_safety=RETRY_SAFETY_SAFE,
+                    retry_after_seconds=retry_after,
+                ),
                 retryable=True,
             )
-        lowered = body.lower()
         if "context" in lowered and ("length" in lowered or "token" in lowered):
             return AppError(
                 ErrorCode.LLM_INVALID_RESPONSE,
                 "上下文超出模型长度限制，请缩短上下文或更换模型。",
                 status_code=502,
-                details=details,
+                details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
             )
-        return AppError(ErrorCode.LLM_INVALID_RESPONSE, "模型接口返回错误。", status_code=502, details=details)
+        return AppError(
+            ErrorCode.LLM_INVALID_RESPONSE,
+            "模型接口返回错误。",
+            status_code=502,
+            details=http_error_details(response, retry_safety=RETRY_SAFETY_NONE),
+        )
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         self._require_config()
@@ -103,37 +149,17 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         if request.tools:
             payload["tools"] = request.tools
             payload["tool_choice"] = "auto"
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        extra_headers = self.config.get("extra_headers")
-        if isinstance(extra_headers, dict):
-            headers.update({str(k): str(v) for k, v in extra_headers.items()})
 
-        client = self._get_client(request.timeout_seconds or self.timeout_seconds)
+        timeout = request.timeout_seconds or self.timeout_seconds
         try:
-            response = await client.post(self._endpoint(), json=payload, headers=headers)
-        except httpx.TimeoutException as exc:
-            raise AppError(
-                ErrorCode.LLM_TIMEOUT,
-                "模型请求超时。",
-                status_code=504,
-                retryable=True,
-            ) from exc
-        except httpx.TransportError as exc:
-            raise AppError(
-                ErrorCode.LLM_NETWORK_ERROR,
-                "无法连接模型服务，请检查网络与 Base URL。",
-                status_code=502,
-                details={"reason": type(exc).__name__},
-                retryable=True,
-            ) from exc
+            response = await self._get_client().post(
+                self._endpoint(),
+                json=payload,
+                headers=self._headers(),
+                timeout=timeout,
+            )
         except httpx.HTTPError as exc:
-            raise AppError(
-                ErrorCode.LLM_NETWORK_ERROR,
-                "模型请求发生网络错误。",
-                status_code=502,
-                details={"reason": type(exc).__name__},
-                retryable=True,
-            ) from exc
+            raise transport_error(exc, label="模型") from exc
 
         if response.status_code >= 400:
             raise self._classify_response(response)
@@ -187,40 +213,83 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             raw={"model": data.get("model")},
         )
 
-    async def test_connection(self) -> ConnectionTestResult:
-        started = time.perf_counter()
+    async def list_models(self, timeout_seconds: float | None = None) -> ModelListResult:
+        self._require_model_list_config()
+        timeout = timeout_seconds or self.timeout_seconds
         try:
-            response = await self.generate(
-                LLMRequest(
-                    model=self.model,
-                    messages=[{"role": "user", "content": "请只回复 OK"}],
-                    temperature=0,
-                    max_output_tokens=8,
-                    timeout_seconds=min(self.timeout_seconds, 20.0),
-                    purpose="test",
+            response = await self._get_client().get(
+                self._models_endpoint(),
+                headers=self._headers(),
+                timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise transport_error(exc, label="模型") from exc
+
+        if response.status_code in (404, 405, 501):
+            return ModelListResult(
+                supported=False,
+                state="unsupported",
+                message="服务商未提供模型列表接口，请手动填写模型 ID。",
+                note="404/405/501 被视为不支持模型列表，而不是连通性失败。",
+            )
+        if response.status_code >= 400:
+            raise self._classify_response(response)
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            raise AppError(
+                ErrorCode.LLM_INVALID_RESPONSE,
+                "模型列表返回了无法解析的响应。",
+                status_code=502,
+            ) from exc
+        raw_items = data.get("data") if isinstance(data, dict) else data
+        if not isinstance(raw_items, list):
+            raise AppError(ErrorCode.LLM_INVALID_RESPONSE, "模型列表响应缺少 data 数组。", status_code=502)
+
+        models: list[LLMModelInfo] = []
+        seen: set[str] = set()
+        truncated = False
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or item.get("name") or "").strip()
+            if not model_id or model_id in seen:
+                continue
+            if len(models) >= MAX_MODEL_LIST_ITEMS:
+                truncated = True
+                break
+            seen.add(model_id)
+            models.append(
+                LLMModelInfo(
+                    id=model_id[:128],
+                    display_name=str(item.get("display_name") or item.get("name") or model_id)[:200],
+                    created_at=_format_created(item.get("created")),
+                    owned_by=str(item.get("owned_by") or "")[:128] or None,
                 )
             )
-        except AppError as exc:
-            return ConnectionTestResult(
-                ok=False,
-                message=exc.message,
-                error_code=exc.code,
-                details={
-                    **exc.details,
-                    "elapsed_ms": round((time.perf_counter() - started) * 1000),
-                },
-            )
-        return ConnectionTestResult(
-            ok=True,
-            message="模型连接成功。",
-            details={
-                "model": self.model,
-                "elapsed_ms": round((time.perf_counter() - started) * 1000),
-                "reply_preview": response.text[:80],
-            },
+        return ModelListResult(
+            supported=True,
+            state="available",
+            models=models,
+            current_model_listed=(self.model in seen) if self.model else None,
+            truncated=truncated,
+            fetched_at=iso_utc(utcnow()),
+            note="模型列表来自服务商实时接口；是否可调用仍以实际生成测试为准。",
         )
 
     async def close(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+
+def _format_created(value: Any) -> str | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(float(value), tz=UTC).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:64]
+    return None

@@ -31,7 +31,7 @@ from websockets.exceptions import (
 
 from app.adapters.qq.base import AdapterCapabilities, BaseQQAdapter
 from app.core.errors import AppError, ErrorCode
-from app.core.time import utcnow
+from app.core.time import iso_utc, utcnow
 from app.schemas.message import CanonicalMessage, MessageSegment, SentMessage
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,12 @@ logger = logging.getLogger(__name__)
 _RECONNECT_MIN_SECONDS = 1.0
 _RECONNECT_MAX_SECONDS = 30.0
 _ACTION_TIMEOUT_SECONDS = 15.0
+_IDENTITY_TIMEOUT_SECONDS = 8.0
+_IDENTITY_RETRY_SECONDS = 10.0
 _MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
+
+# 只有这些状态允许执行非发送动作；Online 本身不再作为动作通道的充分条件。
+_ACTION_READY_STATUSES = {"connected_unverified", "online"}
 
 
 def _parse_endpoint(url: str | None, label: str, *, websocket: bool) -> str | None:
@@ -50,8 +55,10 @@ def _parse_endpoint(url: str | None, label: str, *, websocket: bool) -> str | No
     allowed_schemes = {"ws", "wss"} if websocket else {"http", "https"}
     if parsed.scheme not in allowed_schemes:
         # 允许用户把 http(s) 填到 WS 位置，自动转换，减少配置错误。
+        # 使用 _replace 而不是按字符串位置切片，避免大写的 HTTPS:// 变成 wsS://。
         if websocket and parsed.scheme in {"http", "https"}:
-            value = "ws" + value[len(parsed.scheme) :] if parsed.scheme == "http" else "ws" + value[4:]
+            target_scheme = "wss" if parsed.scheme == "https" else "ws"
+            value = parsed._replace(scheme=target_scheme).geturl()
             parsed = urlparse(value)
         else:
             expected = "ws:// 或 wss://" if websocket else "http:// 或 https://"
@@ -225,6 +232,15 @@ class OneBot11Adapter(BaseQQAdapter):
         self._closing = False
         self._reconnect_delay = _RECONNECT_MIN_SECONDS
         self.connected_at: datetime | None = None
+        # 只由连接器主动推送的事件帧更新，不包含动作响应 echo。
+        self.last_event_at: datetime | None = None
+        # 身份验证：WS 握手成功只代表传输可用，必须拿到 get_login_info 的 user_id
+        # 才能进入 online。epoch 用来丢弃旧连接上迟到的身份查询结果。
+        self._identity_verified = False
+        self._identity_verified_at: datetime | None = None
+        self._identity_task: asyncio.Task[None] | None = None
+        self._identity_last_attempt_at: datetime | None = None
+        self._connection_epoch = 0
 
     def capabilities(self) -> AdapterCapabilities:
         # 只声明协议层面确定的能力；图片/语音回复未实现，因此为 False。
@@ -247,7 +263,7 @@ class OneBot11Adapter(BaseQQAdapter):
 
     @property
     def online(self) -> bool:
-        return self.status == "online" and self._ws is not None
+        return self.status == "online" and self._identity_verified and self._ws is not None
 
     def _headers(self) -> dict[str, str]:
         if self.token:
@@ -267,7 +283,12 @@ class OneBot11Adapter(BaseQQAdapter):
         )
         self._ws = ws
         self.connected_at = utcnow()
-        self.last_heartbeat_at = utcnow()
+        # 心跳时间只由真实收到的帧更新；握手成功不等于收到心跳。
+        self.last_heartbeat_at = None
+        self._connection_epoch += 1
+        self._identity_verified = False
+        self._identity_verified_at = None
+        self._identity_last_attempt_at = None
 
     async def connect(self) -> None:
         if self._supervisor is not None and not self._supervisor.done():
@@ -302,31 +323,104 @@ class OneBot11Adapter(BaseQQAdapter):
                 details={"reason": type(exc).__name__},
             ) from exc
         self._reconnect_delay = _RECONNECT_MIN_SECONDS
-        await self._set_status("online")
+        await self._set_status("connected_unverified")
         self._supervisor = asyncio.create_task(self._receive_loop(), name=f"onebot11-recv-{self.instance_id}")
-        await self._refresh_login_info()
-        logger.info("OneBot11 已连接", extra={"adapter_instance_id": self.instance_id})
+        # 初始连接等待一次身份探测，保持 connect() 返回时状态已确定的语义。
+        task = self._schedule_identity_check(force=True)
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                if self._closing:
+                    return
+                raise
+        logger.info("OneBot11 WebSocket 已连接", extra={"adapter_instance_id": self.instance_id})
 
-    async def _refresh_login_info(self) -> None:
+    def _invalidate_identity(self) -> asyncio.Task[None] | None:
+        """连接失效时递增 epoch，确保旧连接上迟到的身份结果被丢弃。"""
+        self._identity_verified = False
+        self._identity_verified_at = None
+        self._connection_epoch += 1
+        task = self._identity_task
+        self._identity_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        return task
+
+    def _schedule_identity_check(self, *, force: bool = False) -> asyncio.Task[None] | None:
+        if self._closing or self._ws is None:
+            return None
+        if self._identity_task is not None and not self._identity_task.done():
+            return self._identity_task
+        now = utcnow()
+        if not force and self._identity_last_attempt_at is not None:
+            elapsed = (now - self._identity_last_attempt_at).total_seconds()
+            if elapsed < _IDENTITY_RETRY_SECONDS:
+                return None
+        self._identity_last_attempt_at = now
+        task = asyncio.create_task(
+            self._verify_identity(self._connection_epoch),
+            name=f"onebot11-identity-{self.instance_id}",
+        )
+        self._identity_task = task
+        return task
+
+    async def _verify_identity(self, epoch: int) -> None:
         try:
-            info = await self.get_login_info()
-        except AppError as exc:
-            logger.warning(
-                "OneBot11 获取登录信息失败",
-                extra={"adapter_instance_id": self.instance_id, "error_code": exc.code},
-            )
+            info = await asyncio.wait_for(self.get_login_info(), timeout=_IDENTITY_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            await self._identity_failed(epoch, "连接器未在 8 秒内返回登录账号。")
             return
-        if info and info.get("user_id") is not None:
-            self.self_platform_user_id = str(info["user_id"])
+        except AppError as exc:
+            if exc.code == ErrorCode.ADAPTER_AUTH_FAILED:
+                await self._identity_auth_failed(epoch, exc.message)
+            else:
+                await self._identity_failed(epoch, exc.message)
+            return
+        except Exception as exc:  # 不让身份查询异常打断接收循环
+            logger.exception("OneBot11 身份查询异常", extra={"adapter_instance_id": self.instance_id})
+            await self._identity_failed(epoch, f"身份查询异常（{type(exc).__name__}）。")
+            return
+        if epoch != self._connection_epoch or self._closing or self._ws is None:
+            return
+        user_id = info.get("user_id") if isinstance(info, dict) else None
+        if user_id is None:
+            await self._identity_failed(epoch, "连接器已连接，但 get_login_info 未返回 QQ 账号，无法确认机器人身份。")
+            return
+        self.self_platform_user_id = str(user_id)
+        self._identity_verified = True
+        self._identity_verified_at = utcnow()
+        await self._set_status("online")
+        logger.info(
+            "OneBot11 身份已验证",
+            extra={"adapter_instance_id": self.instance_id, "self_platform_user_id": self.self_platform_user_id},
+        )
+
+    async def _identity_failed(self, epoch: int, message: str) -> None:
+        if epoch != self._connection_epoch or self._closing:
+            return
+        self._identity_verified = False
+        await self._set_status("connected_unverified", ErrorCode.ADAPTER_IDENTITY_UNVERIFIED, message)
+
+    async def _identity_auth_failed(self, epoch: int, message: str) -> None:
+        if epoch != self._connection_epoch or self._closing:
+            return
+        self._identity_verified = False
+        await self._set_status("error", ErrorCode.ADAPTER_AUTH_FAILED, message)
 
     async def disconnect(self) -> None:
         self._closing = True
+        identity_task = self._invalidate_identity()
         supervisor = self._supervisor
         self._supervisor = None
-        if supervisor is not None:
-            supervisor.cancel()
+        for task in (identity_task, supervisor):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await supervisor
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
         self._fail_pending("连接已断开。")
@@ -381,9 +475,10 @@ class OneBot11Adapter(BaseQQAdapter):
                     )
                     continue
                 self._reconnect_delay = _RECONNECT_MIN_SECONDS
-                await self._set_status("online")
-                logger.info("OneBot11 重连成功", extra={"adapter_instance_id": self.instance_id})
-                await self._refresh_login_info()
+                await self._set_status("connected_unverified")
+                # 不能在接收循环内 await 动作，否则身份查询与响应读取会互相等待。
+                self._schedule_identity_check(force=True)
+                logger.info("OneBot11 重连成功，等待身份验证", extra={"adapter_instance_id": self.instance_id})
                 continue
             try:
                 raw = await ws.recv()
@@ -393,6 +488,7 @@ class OneBot11Adapter(BaseQQAdapter):
                 if self._closing:
                     return
                 self._ws = None
+                self._invalidate_identity()
                 self._fail_pending("WebSocket 连接已关闭。")
                 await self._set_status(
                     "reconnecting",
@@ -404,6 +500,7 @@ class OneBot11Adapter(BaseQQAdapter):
                 if self._closing:
                     return
                 self._ws = None
+                self._invalidate_identity()
                 self._fail_pending("WebSocket 连接异常。")
                 await self._set_status(
                     "reconnecting",
@@ -441,6 +538,7 @@ class OneBot11Adapter(BaseQQAdapter):
                 future.set_result(payload)
             return
 
+        self.last_event_at = utcnow()
         post_type = payload.get("post_type")
         if post_type == "meta_event":
             await self._handle_meta(payload)
@@ -458,15 +556,19 @@ class OneBot11Adapter(BaseQQAdapter):
         meta_type = payload.get("meta_event_type")
         if meta_type == "heartbeat":
             self.last_heartbeat_at = utcnow()
-            if self.status in {"reconnecting", "connected", "unknown"}:
-                await self._set_status("online")
+            # 心跳只证明传输存活，不能证明 QQ 身份；未验证时最多触发节流重试。
+            if self.status == "connected_unverified":
+                self._schedule_identity_check()
             else:
                 await self._notify_status()
         elif meta_type == "lifecycle":
             sub_type = payload.get("sub_type")
-            if sub_type in {"enable", "connect"}:
-                await self._set_status("online")
+            if sub_type in {"enable", "connect"} and not self._closing:
+                if self.status != "online":
+                    await self._set_status("connected_unverified")
+                    self._schedule_identity_check()
             elif sub_type == "disable" and not self._closing:
+                self._invalidate_identity()
                 await self._set_status("disconnected", error_message="连接器已断开。")
 
     def _parse_message(self, payload: dict[str, Any]) -> CanonicalMessage | None:
@@ -618,7 +720,7 @@ class OneBot11Adapter(BaseQQAdapter):
 
     async def _ws_action(self, action: str, params: dict[str, Any], *, send: bool) -> Any:
         ws = self._ws
-        if ws is None or not self.online:
+        if ws is None:
             if send:
                 raise AppError(
                     ErrorCode.SEND_FAILED,
@@ -629,6 +731,21 @@ class OneBot11Adapter(BaseQQAdapter):
             raise AppError(
                 ErrorCode.ADAPTER_UNAVAILABLE,
                 "OneBot WebSocket 当前未连接。",
+                status_code=503,
+                retryable=True,
+            )
+        if send:
+            if not self.online:
+                raise AppError(
+                    ErrorCode.SEND_FAILED,
+                    "OneBot 身份尚未验证，消息未发送，可稍后重试。",
+                    status_code=503,
+                    retryable=True,
+                )
+        elif self.status not in _ACTION_READY_STATUSES:
+            raise AppError(
+                ErrorCode.ADAPTER_UNAVAILABLE,
+                "OneBot WebSocket 尚未就绪。",
                 status_code=503,
                 retryable=True,
             )
@@ -678,6 +795,11 @@ class OneBot11Adapter(BaseQQAdapter):
             return data
         return None
 
+    async def probe_action(self) -> dict[str, Any]:
+        """无害动作探测；只确认动作通道可用，不发送消息、不修改任何状态。"""
+        data = await self._action("get_status", {})
+        return data if isinstance(data, dict) else {}
+
     async def get_group_list(self) -> list[dict[str, Any]]:
         data = await self._action("get_group_list", {})
         if not isinstance(data, list):
@@ -704,6 +826,14 @@ class OneBot11Adapter(BaseQQAdapter):
     ) -> SentMessage:
         if not text.strip():
             raise AppError(ErrorCode.SEND_FAILED, "回复内容为空，已取消发送。", status_code=400)
+        # HTTP 动作不需要 WS 对象，但同样要求已完成身份验证。
+        if not self._identity_verified or self.status != "online":
+            raise AppError(
+                ErrorCode.SEND_FAILED,
+                "OneBot 身份尚未验证，消息未发送，可稍后重试。",
+                status_code=503,
+                retryable=True,
+            )
         segments: list[dict[str, Any]] = []
         if reply_to_message_id:
             segments.append({"type": "reply", "data": {"id": reply_to_message_id}})
@@ -727,9 +857,7 @@ class OneBot11Adapter(BaseQQAdapter):
             )
             message_id = f"onebot-unconfirmed-{uuid.uuid4().hex[:12]}"
         self.touch_sent()
-        self.last_heartbeat_at = utcnow()
-        if self.status != "online":
-            await self._set_status("online")
+        # 发送成功不改变连接身份状态；online 只能由 get_login_info 成功产生。
         return SentMessage(
             platform_message_id=message_id,
             conversation_id=conversation_id,
@@ -739,14 +867,20 @@ class OneBot11Adapter(BaseQQAdapter):
 
     async def health_check(self) -> dict[str, Any]:
         result = await super().health_check()
+        heartbeat_age = (
+            (utcnow() - self.last_heartbeat_at).total_seconds() if self.last_heartbeat_at is not None else None
+        )
         result.update(
             {
                 "mode": "onebot11",
                 "api_endpoint_configured": bool(self.api_endpoint),
                 "connected_at": self.connected_at.isoformat() if self.connected_at else None,
-                "heartbeat_age_seconds": (
-                    (utcnow() - self.last_heartbeat_at).total_seconds() if self.last_heartbeat_at is not None else None
-                ),
+                "heartbeat_age_seconds": heartbeat_age,
+                "identity_verified": self._identity_verified,
+                "identity_verified_at": iso_utc(self._identity_verified_at),
+                "self_platform_user_id": self.self_platform_user_id,
+                "status_source": "adapter_process",
+                "observed_at": iso_utc(utcnow()),
             }
         )
         return result

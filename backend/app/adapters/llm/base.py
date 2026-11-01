@@ -5,12 +5,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from app.schemas.llm import ConnectionTestResult, LLMRequest, LLMResponse
+from app.schemas.llm import LLMRequest, LLMResponse, ModelListResult
 
 
 class BaseLLMProvider(ABC):
     provider_type: str = "base"
     is_mock: bool = False
+    supports_model_list: bool = False
 
     def __init__(
         self,
@@ -39,9 +40,13 @@ class BaseLLMProvider(ABC):
     async def generate(self, request: LLMRequest) -> LLMResponse:
         raise NotImplementedError
 
-    @abstractmethod
-    async def test_connection(self) -> ConnectionTestResult:
-        raise NotImplementedError
+    async def list_models(self, timeout_seconds: float | None = None) -> ModelListResult:
+        """返回服务商模型列表；不支持时明确标记，不伪造条目。"""
+        return ModelListResult(
+            supported=False,
+            state="unsupported",
+            message="该 Provider 不支持获取模型列表，请手动填写模型 ID。",
+        )
 
     async def close(self) -> None:
         return None
