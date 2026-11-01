@@ -25,10 +25,13 @@
 
 ### 验证状态
 
-- 定向检查已通过：后端备份/发送/打包/API 测试、ruff format/check、mypy、桌面打包静态
-  测试、三个发布脚本 `py_compile`。
-- 全量检查、0.2.1 安装包构建与发布冒烟在提交 A 之后执行；实际输出记录于
-  [ROADMAP](../ROADMAP.md) 与 [TEST_MATRIX](TEST_MATRIX.md)，未执行项保持未验证。
+- 定向与全量检查均通过：ruff format/check、mypy、pytest **442 passed**、前端
+  **76 tests passed** 与生产构建、桌面 **39 passed**、`check.ps1`、源码进程冒烟、
+  桌面 6 张截图。
+- 0.2.1 安装包构建成功（`git_dirty=false`，安装包 155,824,181 bytes），发布冒烟通过
+  （冻结后端 `packaged`、Alembic `f4a7b2c9d801`、桌面 0.2.1 / 6 张截图）。
+- 实际输出与哈希记录于 [ROADMAP](../ROADMAP.md)、[TEST_MATRIX](TEST_MATRIX.md) 与
+  [FINAL_REPORT](FINAL_REPORT.md)；未执行项保持未验证。
 
 ### 外部未完成
 

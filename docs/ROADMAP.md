@@ -468,8 +468,10 @@ backend\.venv\Scripts\python.exe scripts\release_smoke.py
 | 桌面 `npm test` / `npm run smoke` | **39 passed / 0 failed**；`DESKTOP_SMOKE_OK`，版本 0.2.1，6 张截图 |
 | `scripts/check.ps1` | 全部检查通过；明确提示不含 GUI 截图冒烟 |
 | `scripts/smoke_test.py` | 全部通过，未接触真实 QQ 或真实模型 |
-| `scripts/build_release.py` / `release_smoke.py` | 0.2.1 构建与发布冒烟在提交 A 之后执行，结果回填于本节与最终报告 |
-| 安装包 | 待构建回填 |
+| `scripts/build_release.py` | 成功；版本 0.2.1；`git_dirty=false`；四处版本一致；Electron 45.0.0；安装包 155,824,181 bytes |
+| `scripts/release_smoke.py` | 通过；冻结后端 `packaged`、Alembic `f4a7b2c9d801`、内置前端、隔离目录；桌面 0.2.1 / 6 张截图 / 12.2s |
+| 安装包 | `AI-Group-Friend-Setup-0.2.1-x64.exe`，SHA-256 `bf3e95ba5520a0b97d14e766be27869a7c8033ad6e23c3495450b9d664af70be`；未签名 |
+| `win-unpacked/AI 群友.exe` | 249,797,632 bytes，SHA-256 `e92bee0e0ee98e6ed490636a02ba949b8fc5a1311cfa1392bee1be3f66eb3ae0` |
 | NSIS 安装/卸载 | **未在独立干净机器执行** |
 | 真实 QQ / 真实模型 | **未执行** |
 

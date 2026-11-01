@@ -161,18 +161,22 @@ start-desktop.cmd
 
 ## 6. 0.2.1 发布记录
 
-> 本节在提交 A 之后由实际构建与发布冒烟结果回填；不填写未执行的结果。
+以下结果来自提交 A `1aa8e9f` 后的实际构建与发布冒烟；`release/` 不进入 Git。
 
 | 项目 | 结果 |
 | --- | --- |
-| `scripts/build_release.py` | 待回填 |
-| 安装包 | 待回填 |
-| `win-unpacked/AI 群友.exe` | 待回填 |
-| `BUILD_INFO.json` | 待回填 |
-| `scripts/release_smoke.py` | 待回填 |
-| `RELEASE_SMOKE.json` | 待回填 |
+| `scripts/build_release.py` | 退出码 0；版本 0.2.1；`git_dirty=false`；四处版本一致；Electron 45.0.0 |
+| 安装包 | `AI-Group-Friend-Setup-0.2.1-x64.exe`，155,824,181 bytes，SHA-256 `bf3e95ba5520a0b97d14e766be27869a7c8033ad6e23c3495450b9d664af70be`；未签名 |
+| `win-unpacked/AI 群友.exe` | 249,797,632 bytes，SHA-256 `e92bee0e0ee98e6ed490636a02ba949b8fc5a1311cfa1392bee1be3f66eb3ae0` |
+| `BUILD_INFO.json` | `version=0.2.1`、`git_commit=1aa8e9f…`、`git_branch=v1.3-phase1`、`git_dirty=false`、`real_qq_verified=false`、`real_model_verified=false`、`installer_executed_on_clean_machine=false` |
+| `scripts/release_smoke.py` | 退出码 0；布局/哈希通过；冻结后端 `runtime_mode=packaged`、Alembic `f4a7b2c9d801`、内置前端、隔离数据目录；安装版 Electron 版本 0.2.1、6 张截图、12.2s |
+| `RELEASE_SMOKE.json` | `status=ok`、`real_qq_verified=false`、`real_model_verified=false`、`real_env_file_used=false`、`real_connectors_dir_used=false` |
 | 干净机 NSIS 安装/升级/回滚/卸载 | **未执行** |
 | 真实 QQ / 真实模型 | **未执行** |
+
+构建机：Windows 11 x64，Python 3.14.5，Node v24.19.0，Electron 45.0.0。安装包构建于
+`2026-11-01T10:38:53+0800`。构建与冒烟只验证本机隔离环境，不等于干净机安装或真实平台
+验收。
 
 ## 7. 明确不宣称生产就绪
 

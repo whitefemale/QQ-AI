@@ -32,6 +32,19 @@ Node。完整变更见 [../CHANGELOG.md](../CHANGELOG.md)。
 `release/` 已被 `.gitignore` 排除。发布时只需分发安装程序与构建信息；不要把
 `release/win-unpacked`、本机 `.env`、`data/` 或连接器目录一起打包。
 
+### 0.2.1 本机构建记录（2026-11-01）
+
+| 项目 | 实测值 |
+| --- | --- |
+| 版本 / Git | 0.2.1；提交 `1aa8e9f`；分支 `v1.3-phase1`；`git_dirty=false` |
+| 安装包 | 155,824,181 bytes；SHA-256 `bf3e95ba5520a0b97d14e766be27869a7c8033ad6e23c3495450b9d664af70be` |
+| `win-unpacked/AI 群友.exe` | 249,797,632 bytes；SHA-256 `e92bee0e0ee98e6ed490636a02ba949b8fc5a1311cfa1392bee1be3f66eb3ae0` |
+| 发布冒烟 | 通过；冻结后端 `runtime_mode=packaged`、Alembic `f4a7b2c9d801`、内置前端、6 张截图、12.2s |
+| 签名 / 干净机安装 | **未签名；未在独立干净机器执行安装/升级/回滚/卸载** |
+
+构建机为 Windows 11 x64、Python 3.14.5、Node v24.19.0、Electron 45.0.0。以上哈希只对应
+本次本机构建，不能证明安装包来自可复现的公共构建，也不能替代代码签名。
+
 ### 校验哈希
 
 PowerShell：

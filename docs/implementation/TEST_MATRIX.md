@@ -153,7 +153,9 @@ Python 3.14.5、Node v24.19.0、Electron 45.0.0。
 | 桌面 `npm run smoke` | `DESKTOP_SMOKE_OK`，版本 **0.2.1**，6 张截图 |
 | `scripts/check.ps1` | 全部检查通过；脚本末尾提示 GUI 截图冒烟未在 check 中运行 |
 | `scripts/smoke_test.py` | 全部通过；未接触真实 QQ 或真实模型 |
-| `scripts/build_release.py` / `scripts/release_smoke.py` | 提交 A 后执行，结果回填于 [FINAL_REPORT.md](FINAL_REPORT.md) 第 6 节 |
+| `scripts/build_release.py` | 成功；版本 0.2.1；`git_dirty=false`；安装包 155,824,181 bytes，SHA-256 `bf3e95ba…4af70be`；未签名 |
+| `scripts/release_smoke.py` | 通过；冻结后端 `packaged`、Alembic `f4a7b2c9d801`、内置前端、隔离数据目录；桌面 0.2.1 / 6 张截图 / 12.2s |
+| 安装版 Electron | 6 张截图；`RELEASE_SMOKE.json` `status=ok`、真实 QQ/模型标记为 false |
 
 0.2.1 定向新增测试均包含在 442 项后端测试与 39 项桌面测试中：损坏/截断备份恢复、
 空文本发送前拒绝、版本单一来源、已移除端点回归、NSIS 静态配置。静态 NSIS 测试只证明

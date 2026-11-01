@@ -28,6 +28,14 @@
   测试、版本单一来源测试、已移除端点回归测试。
 - 静态 NSIS 测试只证明配置值，**不证明真实卸载行为**；干净机安装/卸载仍未执行。
 
+### 发布
+
+- 使用提交 `1aa8e9f` 在本机重新构建：`AI-Group-Friend-Setup-0.2.1-x64.exe`
+  155,824,181 bytes，SHA-256 `bf3e95ba5520a0b97d14e766be27869a7c8033ad6e23c3495450b9d664af70be`；
+  `git_dirty=false`，四个版本来源一致，Electron 45.0.0。
+- 隔离发布冒烟通过：冻结后端 `runtime_mode=packaged`、Alembic `f4a7b2c9d801`、内置前端、
+  安装版 Electron 0.2.1 与 6 张截图。`release/` 产物不进入 Git。
+
 ### 已知限制
 
 - 与 0.2.0 相同：真实 QQ 收发、真实模型 Key、干净机 NSIS 安装/升级/回滚/卸载、代码签名
