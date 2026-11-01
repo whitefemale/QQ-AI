@@ -30,7 +30,7 @@
 | `cd backend && .venv/Scripts/python.exe -m ruff format --check app tests` | 格式 | 通过：168 files already formatted |
 | `... -m ruff check app tests` | 静态规则 | 通过：All checks passed |
 | `... -m mypy app` | 类型 | 通过：no issues found in 134 source files |
-| `... -m pytest -q` | 单元、集成、API、Mock 端到端 | 435 passed，1 warning（Starlette TestClient 的 httpx 弃用提示），101.26s |
+| `... -m pytest -q` | 单元、集成、API、Mock 端到端 | **459 passed**，1 warning（Starlette TestClient 的 httpx 弃用提示）；0.2.2 实测见 3.2 |
 | `... -m pytest -q tests/test_packaging.py` | 源码/冻结路径、环境文件、安装器可执行文件、入口参数 | 8 passed（阶段 8 定向） |
 
 重点测试文件：
@@ -50,6 +50,10 @@
   `BACKUP_INVALID`，不触碰当前库、不写恢复审计、不产生安全备份或 `*.restore-*` 文件。
 - `tests/test_onebot11.py`：空串/空白文本在发起任何 HTTP 请求前返回 `SEND_FAILED`，
   不更新 `last_sent_at`。
+- `tests/test_connectors_api.py`：向导自动配置必须输入 `AUTO CONFIG`；成功后创建
+  `onebot11` 受管账号、只返回掩码 Token、`auto_connect=false` 且不因配置变为在线。
+- `tests/test_napcat_installer.py`、`tests/test_connectors_jobs.py`：安装复用/修复/
+  未知目录、下载重试、ZIP 完整性与任务 `reused` 事件。
 
 ### 2.2 前端
 
@@ -67,8 +71,8 @@
 
 | 命令 | 覆盖 | 当前结果 |
 | --- | --- | --- |
-| `cd desktop && npm test` | 设置、路径、端口、后端环境、首次向导、安全边界、安装版布局 | 38 passed，0 failed，9.47s |
-| `npm run smoke` | 源码版 Electron 首次启动、健康、`/onboarding`、截图 | 通过：`DESKTOP_SMOKE_OK`，版本 0.2.0，6 张截图 |
+| `cd desktop && npm test` | 设置、路径、端口、后端环境、首次向导、安全边界、安装版布局 | **39 passed，0 failed**（0.2.2 实测） |
+| `npm run smoke` | 源码版 Electron 首次启动、健康、`/onboarding`、截图 | 0.2.1 实测通过：`DESKTOP_SMOKE_OK`，版本 0.2.1，6 张截图；0.2.2 未重跑桌面壳源码版 smoke（桌面壳代码未改），安装版 `release_smoke` 已通过 |
 
 阶段 8 新增：
 
@@ -161,7 +165,40 @@ Python 3.14.5、Node v24.19.0、Electron 45.0.0。
 空文本发送前拒绝、版本单一来源、已移除端点回归、NSIS 静态配置。静态 NSIS 测试只证明
 配置值，不证明真实卸载行为。
 
+### 3.2 0.2.2 连接器可恢复安装与自动接入实测记录（2026-11-01）
+
+| 命令 | 实际结果 |
+| --- | --- |
+| 后端 `ruff format --check app tests` / `ruff check app tests` / `mypy app` | 通过（mypy：134 source files） |
+| 后端 `pytest -q` | **459 passed**，1 warning（Starlette TestClient/httpx 弃用提示） |
+| 前端 `npm run type-check` / `npm run test` / `npm run build` | 类型通过；9 files / **76 tests passed**；构建通过（既有 chunk 体积警告） |
+| 桌面 `npm test` | **39 passed / 0 failed** |
+| `scripts/smoke_test.py` | 全部通过；末行「冒烟测试全部通过。未接触真实 QQ 或真实模型。」 |
+| `scripts/build_release.py --allow-dirty` | 退出码 0；版本 0.2.2；基础提交 `da5f5dd`；**`git_dirty=true`**；安装包 155,842,669 bytes，SHA-256 `35f7fb67…6f3546`；未签名 |
+| `scripts/release_smoke.py` | 退出码 0；冻结后端 `packaged`、版本 0.2.2、Alembic `f4a7b2c9d801`、内置前端、隔离目录；安装版 Electron 0.2.2 / 6 张截图 / 13.7s；`status=ok`、真实 QQ/模型为 false |
+
+0.2.2 定向新增测试：
+
+- `tests/test_napcat_installer.py`：完整同版本复用、受管损坏目录隔离修复、未知目录拒绝
+  且不触碰、陈旧 staging 清理、下载重试恢复/耗尽、截断 ZIP 完整性错误、可疑压缩比；
+  稳定区分磁盘不足、权限不足、目录被占用与 ZIP 损坏，并验证隔离移动遇到
+  `PermissionError` 时不会被误报为“目录被占用”。
+- `tests/test_connectors_jobs.py`：已有同版本目标重新校验后返回 `reused`，不再直接拒绝。
+- `tests/test_connectors_api.py`：向导自动配置缺少/错误 `AUTO CONFIG` 被拒绝；正确确认后
+  创建 `onebot11` 受管账号、Token 掩码、`auto_connect=false`、状态不因配置变为在线；
+  每个向导步骤包含新增元数据字段；远程客户端与非回环 `Origin` 均返回
+  `CONNECTOR_LOCAL_ONLY` 且不创建账号。
+- `tests/test_phase5_onboarding.py`：原有 GET 只读、敏感错误不泄漏与 Mock 门禁继续通过。
+
+这些测试只使用临时目录、假进程、假 I/O 与测试内 HTTP 响应；不运行真实安装器，不登录
+QQ，不调用真实模型。**自动配置通过不等于连接器或 QQ 可用。**
+
 ## 4. 手工验收（尚未执行）
+
+完整步骤与证据填写见
+[docs/testing/V0.2.2_REAL_ENV_ACCEPTANCE.md](../testing/V0.2.2_REAL_ENV_ACCEPTANCE.md)。
+安装器启动、NapCat 安装、进程启动、WS 连接、身份确认、真实入站与真实出站必须分别
+记录，不能用一个“连接成功”合并。
 
 | 项目 | 需要什么 | 当前状态 |
 | --- | --- | --- |

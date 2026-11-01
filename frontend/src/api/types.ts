@@ -117,16 +117,35 @@ export type OnboardingStepState =
   | 'not_verified'
 export type OnboardingFreshness = 'fresh' | 'aging' | 'stale' | 'missing' | 'not_applicable'
 
+export type OnboardingActionKind = 'navigate' | 'auto_configure_connector'
+
+export interface OnboardingNextAction {
+  label: string
+  route: string
+  kind: OnboardingActionKind
+  enabled: boolean
+  disabled_reason: string | null
+  installation_id?: string | null
+}
+
 export interface OnboardingStep {
   key: string
   order: number
   title: string
   state: OnboardingStepState
+  status: OnboardingStepState
   summary: string
   next_step: string | null
   route: string
   freshness: OnboardingFreshness | string
   evidence: Record<string, unknown>
+  started_at: string | null
+  completed_at: string | null
+  attempt_count: number
+  last_error_code: string | null
+  last_error_message: string | null
+  can_retry: boolean
+  next_action: OnboardingNextAction
 }
 
 export interface OnboardingPayload {
@@ -136,10 +155,22 @@ export interface OnboardingPayload {
   ready_for_replies: boolean
   mock_only: boolean
   global_paused: boolean
+  counts: {
+    real_instances: number
+    mock_instances: number
+    real_installations: number
+    ready_installations: number
+    real_providers: number
+    configured_real_providers: number
+    tested_real_providers: number
+    mock_providers: number
+    real_groups: number
+    mock_groups: number
+  }
   steps: OnboardingStep[]
   warnings: string[]
   blockers: string[]
-  next_action: { key: string; label: string; route: string } | null
+  next_action: (OnboardingNextAction & { key: string; step_title: string }) | null
   notes: string[]
 }
 
@@ -1262,9 +1293,12 @@ export interface ConnectorInstallation {
   shell_path: string | null
   config_files: ConnectorConfigFileSummary[]
   license: Record<string, unknown>
+  installed_at?: string | null
   installer_launched_at: string | null
   last_seen_at: string | null
   last_state: string | null
+  last_error_code?: string | null
+  last_error_message?: string | null
   state: ConnectorState
   next_steps: string[]
   can_start: boolean

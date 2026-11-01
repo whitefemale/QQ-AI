@@ -18,7 +18,8 @@
 | OneBot 11 协议解析、WS 收事件、HTTP/WS action | 真实实现（本地假服务器验证；真实环境未验收） | `tests/test_onebot11.py`、`tests/onebot_fakes.py`、`tests/test_connection_diagnostics.py` | 否 | 只用本机假服务器；未接触真实 NapCat；空文本在 HTTP 前拒绝 |
 | 连接身份门控（WS 连接 ≠ 在线） | 真实实现 | `tests/test_connection_diagnostics.py` | 否 | 必须 `get_login_info` 返回 `user_id` 才 `online` |
 | 9 项连接诊断与证据范围 | 真实实现 | `tests/test_connection_diagnostics.py`、`tests/test_api_smoke.py` | 否 | 真实入站/出站永远不会被诊断伪造为已验证 |
-| 接入向导证据聚合 | 真实实现（本地） | `tests/test_phase5_onboarding.py`、`scripts/smoke_test.py` | 否 | 八步状态来自配置、内存适配器与既有审计；Mock 永远不满足 `ready_for_replies`；GET 不写审计 |
+| 接入向导证据聚合 | 真实实现（本地） | `tests/test_phase5_onboarding.py`、`tests/test_connectors_api.py`、`scripts/smoke_test.py` | 否 | 八步状态来自配置、内存适配器与既有审计；每步含状态/时间/尝试次数/错误码/重试与 `next_action`；Mock 永远不满足 `ready_for_replies`；GET 不写审计、不触发动作 |
+| 受管连接器一键自动配置 | 真实实现（本地）；真实环境未验收 | `tests/test_connectors_api.py`、`frontend/tests/onboarding.test.ts` | 否 | 只对唯一可用的受管 Shell 自动分配本机端口、加密 Token、写配置并创建账号；需 `AUTO CONFIG` 确认；不启动连接器、不登录 QQ、`auto_connect=false`；仅 `v4.18.42` 自动写配置 |
 | 脱敏诊断摘要 | 真实实现（本地） | `tests/test_phase5_diagnostics.py`、`scripts/smoke_test.py` | 否 | 显式 allowlist；不含 Token/Key/QQ 标识/群名/消息正文/路径/日志行；不提供日志 HTTP 接口 |
 | 桌面运行期健康与托盘可用性 | 真实实现（本机） | `desktop/tests/backend.test.js`、`electron . --smoke` | 部分（本机测试） | 12 秒/1.5 秒/单飞；3 次失败降级但不改进程状态；托盘不可用时关闭窗口退出 |
 | 真实 QQ 登录 | 外部能力 | — | 否 | 由 NapCat/用户完成；本项目不接触密码 |
@@ -55,12 +56,12 @@
 | 消息 CSV 导出 | 真实实现 | `tests/test_phase6_messages_export.py`、`scripts/smoke_test.py` | 不适用 | 含正文与发送者标识，不含媒体/提示词/凭证；50,000 行上限；审计不含正文/搜索词 |
 | Electron 安全边界（webSecurity/权限/CSP） | 真实实现（静态与冒烟测试） | `desktop/tests/security.test.js`、`npm run smoke` | 部分（本机测试） | 权限处理器仅允许 clipboard-sanitized-write；真实系统权限交互需人工验收 |
 | Electron 源码桌面一键启动 | 真实实现 | `desktop/tests/`、`npm test` | 部分（本机单元测试） | 需本机 Python/Node；复用仓库 `.venv` 与 `frontend/dist` |
-| Windows 独立安装包（自带运行时） | 真实实现（构建 + 隔离冒烟） | `scripts/build_release.py`、`desktop/tests/packaged.test.js`、`desktop/tests/packaging.test.js`、`scripts/release_smoke.py` | 部分（本机隔离环境） | NSIS x64；无需 Python/Node；未签名；静态测试断言可改目录且默认保留数据，但**不证明真实卸载行为**；NSIS 安装/卸载未在独立干净机器执行 |
+| Windows 独立安装包（自带运行时） | 真实实现（构建 + 隔离冒烟） | `scripts/build_release.py`、`desktop/tests/packaged.test.js`、`desktop/tests/packaging.test.js`、`scripts/release_smoke.py` | 部分（本机隔离环境） | 0.2.2 本机构建 `git_dirty=true`、155,842,669 bytes、未签名；冻结后端与安装版 Electron 隔离冒烟通过；NSIS x64；无需 Python/Node；静态测试断言可改目录且默认保留数据，但**不证明真实卸载行为**；NSIS 安装/卸载未在独立干净机器执行 |
 | 安装版冻结后端 | 真实实现（打包冒烟） | `tests/test_packaging.py`、`release_smoke.py` | 部分（本机隔离环境） | 固定回环/端口/日志白名单；临时数据目录迁移与健康检查通过 |
 | 自动更新 / 代码签名 / 自动回滚 | 未实现（明确不支持） | `BUILD_INFO.json`、文档 | 否 | 只提供 SHA-256；升级需手动运行新安装包；不得宣称已签名或可自动更新 |
-| NapCat 官方下载/校验/安全解压脚本 | 真实实现（默认下载+解压，不执行安装器） | `tests/test_napcat_installer.py` | 已实际下载、校验并解压 `v4.18.42` | 安装器未运行；未登录 QQ |
+| NapCat 官方下载/校验/安全解压脚本 | 真实实现（默认下载+解压，不执行安装器） | `tests/test_napcat_installer.py` | 已实际下载、校验并解压 `v4.18.42`；修复/复用/隔离仅假 I/O 测试 | 安装器未运行；未登录 QQ；同版本完整目录复用、受管损坏目录隔离修复、未知目录拒绝不触碰；下载有界重试；ZIP 完整性/压缩比/符号链接校验 |
 | Connector Manager 抽象与受管安装检测 | 真实实现 | `tests/test_connectors_napcat.py`、`tests/test_connectors_manager.py` | 否（临时目录/假布局） | 只实现 NapCat profile；只扫描 `CONNECTORS_DIR` |
-| 连接器安装任务（下载/校验/解压、取消、重启中断） | 真实实现（子进程为假 I/O 测试） | `tests/test_connectors_jobs.py` | 否 | 单任务互斥；不自动续跑/重试 |
+| 连接器安装任务（下载/校验/解压、取消、重启中断） | 真实实现（子进程为假 I/O 测试） | `tests/test_connectors_jobs.py` | 否 | 单任务互斥；下载有界重试；后端重启不自动续跑；成功事件区分 `installed/reused/repaired`，并明确“安装器尚未运行” |
 | 官方安装器显式启动 | 部分实现 | `tests/test_connectors_process.py` | 否 | 交互式第三方 GUI，平台不代替用户操作 |
 | 受管进程启动/停止/归属 | 部分实现 | `tests/test_connectors_process.py`、`test_connectors_manager.py` | 否 | 只停本会话进程；后端重启后拒绝接管或杀旧 PID |
 | 连接器配置预览、加密快照与回滚 | 真实实现 | `tests/test_connectors_manager.py` | 否 | 仅 `v4.18.42` 自动写配置；失败自动恢复 |
@@ -70,7 +71,7 @@
 | 连接器配置导入 / 外部安装只读 | 真实实现 | `tests/test_connectors_manager.py`、`test_connectors_api.py` | 否 | 导入不写外部文件；Token 只返回掩码 |
 | 桌面版选择连接器目录 | 真实实现 | `desktop/tests/settings.test.js`、`backend-env.test.js`、`preload.test.js` | 部分（本机单元测试） | 只打开系统目录对话框；重启后端生效 |
 | 连接器自动更新 / 自动卸载 | 未实现（明确不支持） | `/api/connectors/capabilities` | 否 | 页面诚实标记 `false` |
-| 真实 QQ 端到端验收 | 未执行 | `docs/CONNECTOR.md` 清单 | 否 | 必须由用户完成并记录 |
+| 真实 QQ 端到端验收 | 未执行 | [docs/testing/V0.2.2_REAL_ENV_ACCEPTANCE.md](../testing/V0.2.2_REAL_ENV_ACCEPTANCE.md) | 否 | 七个验收节点必须分开记录；连接成功不等于真实收发 |
 | 多账号、评测回放、MCP、插件市场 | 规划 | 模块级占位 | 否 | 不在当前范围 |
 
 ## 最需要显式标注的五项
@@ -79,9 +80,12 @@
    入站与出站证据，本仓库未产生。
 2. **真实模型 Key 未联调**：真实 Provider 适配器只有 `httpx.MockTransport` 请求映射、错误分类、重试与模型列表测试；阶段 3 的连通性、真实生成、取消、预算与清空 Key 流程需用户用自有 Key 在本机验收。
 3. **NapCat 安装器未执行**：官方包已下载、校验并解压，但未运行安装器、未登录 QQ；
-   仓库未捆绑连接器，也不自动登录。
+   仓库未捆绑连接器，也不自动登录。安装目录复用、损坏隔离与下载重试只有假 I/O 测试，
+   真实安装器行为仍需用户验收。
 4. **连接器进程/配置只经假进程验证**：启动、停止、安装器与写配置路径有自动化测试，
    但没有在真实 NapCat 上执行；受管版本的自动配置仅覆盖文档验证的 `v4.18.42`。
+   向导的“一键自动配置”会创建受管账号并写入加密 Token，但仍需用户自行启动 NapCat
+   并完成 QQ 登录。
 5. **安装包未签名、未在干净机器验收**：Windows NSIS 安装包已构建并通过隔离冒烟，但
    没有代码签名或自动更新；NSIS 安装/升级/回滚/卸载尚未在独立干净 Windows 机器执行，
    不得宣称生产就绪。

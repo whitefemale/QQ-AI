@@ -6,6 +6,11 @@
 
 > **阶段 8：Windows 安装包与发布回归（2026-11-01）**：提供 Windows x64 NSIS 安装包，内含 PyInstaller 冻结后端、受管 NapCat 安装器、前端构建产物与 Electron 运行时；普通用户无需安装 Python/Node。新增固定命令的发布流水线（`scripts/build_release.py`）、哈希清单 `release/BUILD_INFO.json`、干净环境发布冒烟（`scripts/release_smoke.py`）、安装版运行时布局与「安装版 / 源码版」诚实的运行模式显示。安装包**未签名、无自动更新**；NSIS 安装器/卸载器尚未在独立干净机器执行。**真实 QQ 端到端尚未验证，真实模型 Key 未联调，不宣称生产就绪。** 详见 [docs/RELEASE.md](docs/RELEASE.md) 与 [CHANGELOG.md](CHANGELOG.md)。
 
+> **0.2.2：连接器可恢复安装与普通用户自动接入（2026-11-01）**：受管 NapCat 同版本完整目录会在校验后复用，损坏的受管目录先隔离再修复，未知目录拒绝并保持原样；下载有固定次数退避重试，截断/损坏 ZIP 返回稳定错误码。接入向导新增每步状态、时间、尝试次数、错误码、可重试与 `next_action`；当只有一个可用受管 Shell 时，普通用户只需在向导输入 `AUTO CONFIG` 即可自动分配本机端口、生成加密 Token、写配置并创建账号，无需手填 WS/HTTP 地址或端口。自动配置不会启动连接器、不会登录 QQ、`auto_connect=false`。本机已构建
+`release/AI-Group-Friend-Setup-0.2.2-x64.exe`（155,842,669 bytes，SHA-256
+`35f7fb67…6f3546`，**`git_dirty=true`**，未签名），并通过隔离发布冒烟；正式分发前需在
+干净提交上重建。**真实 NapCat 安装器、真实 QQ 收发、真实模型 Key 与干净机安装仍未验收。**
+
 > **桌面版有两种运行方式**：安装版自带运行时，直接启动安装后的「AI 群友」，无需 Python/Node；源码版双击根目录 `start-desktop.cmd`，由本机桌面窗口补齐依赖、构建前端、生成密钥并启动后端。两者首次启动都进入接入向导，后端运行后每 12 秒探测一次 `/api/health`（1.5 秒超时，单飞）；连续 3 次失败仅把健康状态标为降级，不改变后端进程状态，外部后端永不被停止。安装包未签名且不提供自动更新。详见 [docs/DESKTOP.md](docs/DESKTOP.md) 与 [docs/RELEASE.md](docs/RELEASE.md)。
 
 ---
@@ -48,9 +53,9 @@
 | 删除与数据可携带 | ✅ 可用 | 删除账号/群/人格/备份需输入 `DELETE` 并写审计；账号删除清理未共享媒体文件并保留共享媒体；群删除保留历史消息但解除群关联、取消待发送队列；消息与记忆均支持 CSV 导出 |
 | 长期记忆（本群范围） | ✅ 可用 | 手动管理 + 手动或群级后台增量 AI 候选提取；后台默认关闭、只生成待审核候选，批准前不保存、不注入；短期上下文按账号/群隔离；CSV 导出默认排除敏感记忆；来源消息查看与手动清理（支持仅统计）；语义检索仍规划中 |
 | 数据保留与清理 | ✅ 可用（自动清理默认关闭） | 先只读预览将清理的计数，再输入 `CLEANUP` 执行；手动清理消息/媒体/转写/媒体任务/轮转日志/人格证据/记忆来源与超期未固定记忆；管理员可显式开启定时清理，记忆保留天数 `0` 表示不自动删除。只删 `app.log.*`，不动当前 `app.log`；全局暂停不阻止本地清理。消息清理只擦除来源 ID，手动记忆清理会删除未固定记忆正文 |
-| 接入向导与脱敏诊断 | ✅ 已实现 | `GET /api/onboarding` 聚合八步证据（后端、连接器、QQ 登录、连接测试、模型、群、观察、开启回复）；`GET /api/diagnostics` 只返回 allowlist 摘要与后端生成的脱敏文本。两者 GET 均只读，不写审计、不触发网络/模型/连接器动作；Mock 与未验证状态不会被标成真实就绪 |
+| 接入向导与脱敏诊断 | ✅ 已实现 | `GET /api/onboarding` 聚合八步证据（后端、连接器、QQ 登录、连接测试、模型、群、观察、开启回复），每步含状态、时间、尝试次数、错误码、可重试与唯一 `next_action`；只有一个可用受管 Shell 时可输入 `AUTO CONFIG` 自动配置，不启动连接器、不登录 QQ、`auto_connect=false`。`GET /api/diagnostics` 只返回 allowlist 摘要与后端生成的脱敏文本。GET 均只读，不写审计、不触发网络/模型/连接器动作；Mock 与未验证状态不会被标成真实就绪 |
 | HTTP 安全边界 | ✅ 可用 | 默认 TrustedHost 仅本机、CORS 必须显式来源且拒绝通配符、HTML 安全头与 CSP（Swagger 页豁免 CSP）；Provider Base URL 拒绝云元数据/链路本地地址，保留本机与内网自建模型；适配器不跟随重定向。残余 DNS rebinding 风险已记录 |
-| Windows 安装版（自带运行时） | ✅ 已构建并隔离冒烟，未签名 | NSIS x64 安装包内含冻结后端、受管 NapCat 安装器、前端与 Electron；无需 Python/Node；首次启动在用户目录生成独立 `.env`；未签名、无自动更新；**NSIS 安装/卸载尚未在独立干净机器执行** |
+| Windows 安装版（自带运行时） | ✅ 0.2.2 已本机构建并隔离冒烟，未签名 | NSIS x64 安装包内含冻结后端、受管 NapCat 安装器、前端与 Electron；无需 Python/Node；首次启动在用户目录生成独立 `.env`；未签名、无自动更新；0.2.2 包在未提交工作树构建（`git_dirty=true`）；**NSIS 安装/卸载尚未在独立干净机器执行** |
 | 源码桌面版（本机一键启动） | ✅ 已交付，需本机 Python/Node | 首次启动进入接入向导；托盘、后端进程管理与健康探测、维护入口；健康降级只表示 HTTP 不可达，不改变进程状态；复用本仓库 `.venv` |
 | 安装包签名 / 自动更新 | ⛔ 未实现 | 不检查更新、不后台下载或执行代码；升级由用户手动运行新安装包 |
 | 评测回放、插件市场、MCP、多账号 | ⏳ 规划中 | 仅数据骨架或接口占位 |
@@ -259,6 +264,10 @@ cd ..\backend
 
 推荐使用控制台「连接器」受管页（仅本机可访问）。平台不会在后台静默执行第三方程序，
 每个动作都需要输入确认词。完整说明见 [docs/CONNECTOR.md](docs/CONNECTOR.md)。
+
+普通用户推荐从「接入向导」开始：安装并启动受管 Shell 后，若只有一个可用安装，向导会
+给出「自动配置并创建受管账号（推荐）」，输入 `AUTO CONFIG` 即可。地址与端口由平台在
+本机分配，**不需要手工填写**；连接器仍需你自行启动并在 NapCat 内完成 QQ 登录。
 
 1. 打开「连接器」，可先点「选择连接器目录」（桌面版）指定受管根目录。默认
    `<仓库根>/connectors/napcat/`；改动目录后需重启后端。
@@ -491,5 +500,7 @@ backend\.venv\Scripts\python.exe scripts\release_smoke.py
 - [连接器接入与真实 QQ 验收清单](docs/CONNECTOR.md)
 - [测试矩阵与证据分层](docs/implementation/TEST_MATRIX.md)
 - [最终总结报告与外部验收清单](docs/implementation/FINAL_REPORT.md)
+- [V0.2.2 实施审计与修复证据](docs/audit/V0.2.2_IMPLEMENTATION_AUDIT.md)
+- [V0.2.2 真实环境验收手册（七节点）](docs/testing/V0.2.2_REAL_ENV_ACCEPTANCE.md)
 - [阶段 0–8 审计、能力真实性、进度与连接器分发决策](docs/implementation/)
 - 原始需求资料：`Claude代码与AI群友笔记/`

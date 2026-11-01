@@ -3,6 +3,34 @@
 日期：2026-11-01
 分支：`v1.3-phase1`
 
+## 0.2.2 连接器可恢复安装与普通用户自动接入
+
+### 已完成的本地实现
+
+- 受管 NapCat 安装支持同版本完整目录复用、受管损坏目录隔离修复、未知目录拒绝且不
+  触碰、陈旧 staging 清理；下载有界重试；ZIP 完整性/路径/重复项/符号链接/大小/压缩比
+  校验；占用与权限错误映射为稳定错误码；安装事件区分 `installed/reused/repaired`。
+- 新增 `POST /api/onboarding/actions/auto-configure-connector` 与向导一键入口：唯一可用
+  受管 Shell 下输入 `AUTO CONFIG` 自动分配端口、生成加密 Token、写配置并创建
+  `auto_connect=false` 的受管账号；不启动连接器、不登录 QQ。
+- 向导每步返回 `status/started_at/completed_at/attempt_count/last_error_code/
+  last_error_message/can_retry/next_action`；顶层返回 `counts` 与唯一 `next_action`；
+  只有真实 OneBot 实例才把“连接器准备”标为完成。
+- 账号页把手动地址/端口降级为高级模式，连接器页增加自动配置入口。
+
+### 验证状态
+
+- 后端 **459 passed**（1 条第三方弃用 warning）、ruff format/check 与 mypy 通过；
+  前端 type-check、**76 tests passed**、生产构建通过；桌面 **39 passed**。
+- 安装包构建与发布冒烟结果见 [FINAL_REPORT](FINAL_REPORT.md) 与
+  [TEST_MATRIX](TEST_MATRIX.md)；真实 NapCat/QQ/模型/干净机仍未验收。
+- 本机自动化测试不能替代 [真实环境验收手册](../testing/V0.2.2_REAL_ENV_ACCEPTANCE.md)。
+
+### 外部未完成
+
+- 七个连接器/QQ 节点、真实模型 Key、干净机 NSIS 安装/升级/回滚/卸载、代码签名与
+  SmartScreen、NapCat 许可证与隐私合规。
+
 ## 0.2.1 最终审计（本机收口）
 
 ### 审计发现与本机修复

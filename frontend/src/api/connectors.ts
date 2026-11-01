@@ -20,6 +20,7 @@ export const CONNECTOR_CONFIRMATIONS = {
   start: 'START NAPCAT',
   stop: 'STOP NAPCAT',
   applyConfig: 'WRITE CONFIG',
+  autoConfigure: 'AUTO CONFIG',
   restoreConfig: 'RESTORE CONFIG',
   switchVersion: 'SWITCH VERSION',
   confirmIdentity: 'CONFIRM IDENTITY',
@@ -112,6 +113,17 @@ export function applyConnectorConfig(
   return api(`/connectors/installations/${encodeURIComponent(installationId)}/config/apply`, {
     method: 'POST',
     body: { requested_relative: requestedRelative || undefined, confirm_text: confirmText },
+  })
+}
+
+/** 向导专用：为受管连接器自动分配本地端口与 Token 并创建受管账号；不会启动连接器或登录 QQ。 */
+export function autoConfigureManagedConnector(
+  installationId: string | null,
+  confirmText: string,
+): Promise<Record<string, unknown>> {
+  return api('/onboarding/actions/auto-configure-connector', {
+    method: 'POST',
+    body: { installation_id: installationId || undefined, confirm_text: confirmText },
   })
 }
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai-group-friend"
-version = "0.2.1"
+version = "0.2.2"
 description = "本地优先的 AI 群友 QQ 管理平台"
 readme = "README.md"
 requires-python = ">=3.12"

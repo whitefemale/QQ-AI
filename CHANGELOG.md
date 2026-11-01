@@ -3,6 +3,63 @@
 所有构建与测试结论以仓库内实际执行记录为准；`release/BUILD_INFO.json` 与
 `release/RELEASE_SMOKE.json` 是构建机生成的产物，不进入 Git。
 
+## 0.2.2 — 连接器可恢复安装与普通用户自动接入（2026-11-01）
+
+### 修复与加固
+
+- **受管 NapCat 安装可恢复**：同版本完整目录会在重新校验后复用，不再因目录已存在而
+  直接失败；受管但损坏的目录隔离到 `.quarantine-*` 后原子切换；未知或非受管目录拒绝并
+  保持原样，不删除用户文件。
+- **ZIP 错误分类稳定**：截断包、损坏中央目录、空文件、加密条目、路径穿越、大小写重复、
+  符号链接、可疑压缩比与超限条目都会返回稳定错误码；`InstallerError` 不再被宽泛的
+  `RuntimeError` 捕获掩盖。
+- **下载重试**：固定次数、带退避的下载重试；每次失败删除临时文件；最终失败仍返回
+  `CONNECTOR_DOWNLOAD_FAILED`，不会把残留文件当成功。
+- **Windows 占用与权限错误**：安装/解压目录被占用或权限不足时映射为
+  `CONNECTOR_TARGET_BUSY` / `CONNECTOR_PERMISSION_DENIED`，并清理本次 staging。
+- **安装任务事件**：成功事件区分 `installed` / `reused` / `repaired`，消息明确
+  “安装器尚未运行”，避免把解压完成说成已安装。
+- **连接测试错误可见**：受管诊断与保存实例测试的审计白名单新增 `error_code` 与截断后的
+  `error_message`；接入向导只映射安全文案，不泄漏 Provider 原始错误。
+- **普通用户自动接入**：新增
+  `POST /api/onboarding/actions/auto-configure-connector`，只对唯一可用的受管 Shell
+  自动分配本机端口、生成加密 Token、写配置并创建受管账号；必须提交精确确认词
+  `AUTO CONFIG`，仍然 `auto_connect=false`，不启动连接器、不登录 QQ、不自动发消息。
+  该端点与 `/api/connectors/*` 共用本机回环守卫，远程管理不可调用。
+- **接入向导动作化**：每个步骤新增 `status`、`started_at`、`completed_at`、
+  `attempt_count`、`last_error_code`、`last_error_message`、`can_retry` 与
+  `next_action`；顶层新增 `counts` 与唯一 `next_action`。只有存在真实 OneBot 实例时
+  “连接器准备”才算完成；仅有已安装 Shell 时返回“自动配置”动作而不是完成。
+- **账号页主路径**：默认引导到向导自动接入；手动填写 WebSocket/HTTP 地址与端口降级为
+  “高级手动新建”，并明确普通用户无需填写。
+- **连接器页**：增加自动配置入口与说明，保留原有显式启动/写配置确认。
+
+### 测试
+
+- 新增安装目录复用、损坏目录隔离、未知目录不触碰、陈旧 staging 清理、下载重试耗尽、
+  截断 ZIP 完整性错误和可疑压缩比测试。
+- 新增向导自动配置 API 测试：缺少/错误确认词被拒绝、步骤返回可执行动作、配置后创建
+  `onebot11` 受管账号、Token 只返回掩码、`auto_connect=false` 且状态不因配置变为在线。
+- 前端向导测试覆盖新增步骤字段与 `next_action` 回退。
+- `scripts/smoke_test.py` 同步向导新增的顶层 `counts` 字段；此前该断言会失败。
+  修正后重跑源码进程冒烟全部通过，末行仍为「冒烟测试全部通过。未接触真实 QQ 或真实模型。」
+
+### 发布
+
+- 本机构建 `AI-Group-Friend-Setup-0.2.2-x64.exe`：155,842,669 bytes，SHA-256
+  `35f7fb67ae00b116b105cd1ab04850446f60cb2b67d291fc21bd80237b6f3546`。
+  工作树未提交，`BUILD_INFO.json` 记录 `git_dirty=true` 与指纹；该包只用于本机验证，
+  不是正式可复现构建。
+- 隔离发布冒烟通过：冻结后端 `runtime_mode=packaged`、版本 0.2.2、Alembic
+  `f4a7b2c9d801`、内置前端、隔离数据目录；安装版 Electron 0.2.2、6 张截图、13.7s；
+  `RELEASE_SMOKE.json` `status=ok`、真实 QQ/模型标记为 false。
+
+### 已知限制
+
+- 真实 NapCat 安装器仍未由本项目执行；自动配置只覆盖文档验证的 `v4.18.42`。
+- 真实 QQ 收发、真实模型 Key、干净机 NSIS 安装/升级/回滚/卸载、代码签名与自动更新
+  均未验证；不宣称生产就绪。
+
 ## 0.2.1 — 最终审计与发布可复现性（2026-11-01）
 
 ### 修复与加固

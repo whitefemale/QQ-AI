@@ -7,7 +7,8 @@
       <template #actions>
         <el-button :loading="loading" @click="load">刷新</el-button>
         <el-button @click="goConnectors">连接器管理</el-button>
-        <el-button type="primary" @click="openCreate">新建账号</el-button>
+        <el-button type="primary" @click="goOnboarding">自动接入（推荐）</el-button>
+        <el-button @click="openCreate">高级手动新建</el-button>
       </template>
     </PageHeader>
 
@@ -191,7 +192,16 @@
       </el-empty>
     </div>
 
-    <el-dialog v-model="createDialog" title="新建账号" width="900px" :close-on-click-modal="false">
+    <el-dialog v-model="createDialog" title="高级手动新建账号" width="900px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        show-icon
+        :closable="false"
+        title="普通用户请使用「自动接入」：无需填写 WebSocket/HTTP 地址或端口"
+        description="本对话框用于高级手动接入，需要你自行填写连接地址与 Token。受管 NapCat 的端口、Token、账号与实例可由接入向导自动生成。"
+      >
+        <el-button size="small" @click="goOnboarding">前往自动接入向导</el-button>
+      </el-alert>
       <el-form label-width="110px">
         <el-form-item label="账号名称" required>
           <el-input v-model="form.display_name" maxlength="128" placeholder="例如：群友助手（专用小号）" />
@@ -463,6 +473,8 @@ const InstanceFormFields = defineComponent({
         ),
         props.modelValue.connection_mode === 'onebot11'
           ? h('div', [
+              h('div', { class: 'form-tip', style: 'margin: 0 0 12px 110px' },
+                '高级手动设置：通常无需手填地址。受管 NapCat 请在「接入向导」使用自动配置，由后端分配本机端口与随机 Token。'),
               h(ElFormItem, { label: 'WebSocket 地址' }, () =>
                 h(ElInput, {
                   modelValue: props.modelValue.endpoint,
@@ -551,6 +563,10 @@ const router = useRouter()
 
 function goConnectors(): void {
   void router.push('/connectors')
+}
+
+function goOnboarding(): void {
+  void router.push('/onboarding')
 }
 
 const statusDialog = ref(false)

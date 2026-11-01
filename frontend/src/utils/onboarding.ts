@@ -82,7 +82,7 @@ export function overallBanner(payload: OnboardingPayload): OverallBanner {
     type: 'info',
     title: '还有待办步骤',
     description: payload.next_action
-      ? `下一步：${payload.next_action.label}。请按顺序完成，状态会从后端重新读取。`
+      ? `下一步：${payload.next_action.step_title ?? payload.next_action.label}。请按顺序完成，状态会从后端重新读取。`
       : '请按顺序检查各步骤。',
   }
 }

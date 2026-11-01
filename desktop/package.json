@@ -1,6 +1,6 @@
 {
   "name": "ai-group-friend-desktop",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "AI 群友本地桌面版：一键启动本地后端并打开管理控制台",
   "main": "main.js",

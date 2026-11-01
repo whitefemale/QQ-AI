@@ -1198,6 +1198,7 @@ def run(api: Api, temp: Path, expected_version: str) -> None:
             "ready_for_replies",
             "mock_only",
             "global_paused",
+            "counts",
             "steps",
             "warnings",
             "blockers",

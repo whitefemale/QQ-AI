@@ -535,6 +535,8 @@ class AccountService:
                 "mode": mode,
                 "ok": result.get("ok"),
                 "state": result.get("state"),
+                "error_code": result.get("error_code"),
+                "error_message": str(result.get("error_message") or "")[:300] or None,
             },
         )
         return redact_value(result)

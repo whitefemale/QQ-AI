@@ -7,21 +7,24 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from app.core.security import CredentialCipher
 from app.core.time import ensure_utc, iso_utc, utcnow
 from app.db.session import Database
 from app.models.account import Account, AdapterInstance
+from app.models.governance import AuditLog
 from app.models.group import Group
 from app.models.message import Message
 from app.models.provider import LLMProvider
 from app.services.provider_service import REMOTE_LLM_TYPES
 from app.services.settings_store import get_global_pause
 from app.services.system_evidence import (
+    CONNECTION_TEST_ACTIONS,
     freshness_for,
     latest_connection_test,
     live_instance_facts,
@@ -64,6 +67,44 @@ _READY_INSTALLATION_STATES = {
 
 _REAL_PROVIDER_TYPES = REMOTE_LLM_TYPES
 
+# 错误正文可能包含上游响应、地址或账号标识；向导只展示稳定的通用说明。
+_ERROR_MESSAGES: dict[str, str] = {
+    "ADAPTER_CONNECT_FAILED": "连接器连接失败，请检查连接器进程与端口。",
+    "ADAPTER_AUTH_FAILED": "连接器认证失败，请检查 Token 与配置。",
+    "ADAPTER_IDENTITY_UNVERIFIED": "连接器在线，但尚未确认当前登录的 QQ 身份。",
+    "ADAPTER_UNAVAILABLE": "适配器当前不可用，请检查实例是否已连接。",
+    "LLM_TIMEOUT": "模型调用超时，请检查网络或稍后重试。",
+    "LLM_NETWORK_ERROR": "模型网络请求失败，请检查网络与 Base URL。",
+    "LLM_AUTH_FAILED": "模型认证失败，请检查 API Key。",
+    "LLM_RATE_LIMITED": "模型触发速率限制，请稍后重试。",
+    "LLM_QUOTA_EXCEEDED": "模型额度不足，请检查账户余额或配额。",
+    "LLM_MODEL_NOT_FOUND": "模型名称不存在或不可用。",
+    "LLM_INVALID_RESPONSE": "模型返回了无效响应。",
+    "CONNECTOR_INSTALL_FAILED": "连接器安装失败，请查看安装任务详情。",
+    "CONNECTOR_DOWNLOAD_FAILED": "连接器下载失败，请检查网络后重试。",
+    "CONNECTOR_DIGEST_MISMATCH": "安装包校验失败，已拒绝使用。",
+    "CONNECTOR_TARGET_BUSY": "连接器目录被占用，请关闭相关进程后重试。",
+    "CONNECTOR_PERMISSION_DENIED": "连接器目录权限不足，请检查目录权限。",
+    "CONNECTOR_ZIP_INVALID": "安装包损坏或不完整，已拒绝解压。",
+    "BUDGET_EXCEEDED": "预算已超限，回复被阻止。",
+}
+
+
+def _safe_error_message(code: str | None) -> str | None:
+    if not code:
+        return None
+    return _ERROR_MESSAGES.get(code, "最近一次操作失败；请在对应页面查看错误码与诊断信息。")
+
+
+def _iso_values(values: Iterable[datetime | None]) -> list[str]:
+    """把可选时间转换为 ISO 字符串列表；None 被丢弃，避免在向导中伪造时间。"""
+    result: list[str] = []
+    for item in values:
+        converted = iso_utc(item)
+        if converted is not None:
+            result.append(converted)
+    return result
+
 
 def _step(
     key: str,
@@ -73,18 +114,40 @@ def _step(
     next_step: str | None = None,
     freshness: str = "not_applicable",
     evidence: dict[str, Any] | None = None,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    attempt_count: int = 0,
+    last_error_code: str | None = None,
+    can_retry: bool = False,
+    action: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     title = dict(STEP_ORDER)[key]
+    route = _STEP_ROUTES[key]
     return {
         "key": key,
         "order": [item[0] for item in STEP_ORDER].index(key) + 1,
         "title": title,
         "state": state,
+        "status": state,
         "summary": summary,
         "next_step": next_step,
-        "route": _STEP_ROUTES[key],
+        "route": route,
         "freshness": freshness,
         "evidence": evidence or {},
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "attempt_count": max(0, attempt_count),
+        "last_error_code": last_error_code,
+        "last_error_message": _safe_error_message(last_error_code),
+        "can_retry": bool(can_retry),
+        "next_action": action
+        or {
+            "label": next_step or f"前往「{title}」相关页面",
+            "route": route,
+            "kind": "navigate",
+            "enabled": True,
+            "disabled_reason": None,
+        },
     }
 
 
@@ -126,6 +189,7 @@ def _provider_health(provider: LLMProvider, now: datetime) -> dict[str, Any]:
         "freshness": fresh["state"],
         "latency_ms": latency,
         "success": success,
+        "error_code": record.get("error_code") if record and isinstance(record.get("error_code"), str) else None,
     }
 
 
@@ -176,6 +240,18 @@ class OnboardingService:
                     )
                 ).scalars()
             )
+            observed_earliest_at = await session.scalar(
+                select(func.min(Message.event_timestamp)).where(
+                    Message.direction == "inbound",
+                    Message.group_id.is_not(None),
+                )
+            )
+            observed_latest_at = await session.scalar(
+                select(func.max(Message.event_timestamp)).where(
+                    Message.direction == "inbound",
+                    Message.group_id.is_not(None),
+                )
+            )
 
         instances: list[tuple[Account, AdapterInstance]] = [
             (account, instance) for account in accounts for instance in account.instances
@@ -216,6 +292,39 @@ class OnboardingService:
             if instance.identity_confirmed_at is not None
         ]
         mock_instances = [(account, instance) for account, instance in instances if instance.connection_mode == "mock"]
+
+        real_instance_ids = [instance.id for _, instance in real_instances]
+        real_provider_ids = [provider.id for provider in providers if provider.provider_type in _REAL_PROVIDER_TYPES]
+        async with self.database.session() as session:
+            connector_attempts = int(
+                await session.scalar(
+                    select(func.count(AuditLog.id)).where(AuditLog.action == "connector.install.start")
+                )
+                or 0
+            )
+            connection_attempts = 0
+            if real_instance_ids:
+                connection_attempts = int(
+                    await session.scalar(
+                        select(func.count(AuditLog.id)).where(
+                            AuditLog.action.in_(CONNECTION_TEST_ACTIONS),
+                            AuditLog.target_type == "adapter_instance",
+                            AuditLog.target_id.in_(real_instance_ids),
+                        )
+                    )
+                    or 0
+                )
+            provider_attempts = 0
+            if real_provider_ids:
+                provider_attempts = int(
+                    await session.scalar(
+                        select(func.count(AuditLog.id)).where(
+                            AuditLog.action == "provider.llm.test",
+                            AuditLog.target_id.in_(real_provider_ids),
+                        )
+                    )
+                    or 0
+                )
 
         provider_tests = {provider.id: _provider_health(provider, now) for provider in providers}
         ready_real_providers = {
@@ -267,12 +376,39 @@ class OnboardingService:
             if item.get("shell_installed") is True
             and str((item.get("state") or {}).get("state") or "") in _READY_INSTALLATION_STATES
         )
-        if real_instances or ready_installation_count:
+        installation_started = sorted(
+            str(item["installed_at"]) for item in installations if isinstance(item.get("installed_at"), str)
+        )
+        connector_started_at = installation_started[0] if installation_started else None
+        connector_completed_at = installation_started[-1] if shell_installed_count else None
+        connector_error_code = next(
+            (
+                item.get("last_error_code")
+                for item in reversed(installations)
+                if isinstance(item.get("last_error_code"), str) and item.get("last_error_code")
+            ),
+            None,
+        )
+        auto_configure_candidates = [
+            item
+            for item in installations
+            if item.get("managed") is True
+            and item.get("shell_installed") is True
+            and item.get("auto_configure_allowed") is True
+            and item.get("active_job") is None
+        ]
+        if real_instances:
             connector_state = "done"
             connector_summary = (
                 f"已配置 {len(real_instances)} 个 OneBot 11 实例，检测到 {real_installation_count} 个连接器安装。"
             )
             connector_next = "安装或进程存在不等于已登录；请继续完成 QQ 登录与连接测试。"
+        elif ready_installation_count:
+            connector_state = "action_required"
+            connector_summary = (
+                f"检测到 {ready_installation_count} 个已安装连接器，但尚未写入受管配置或创建 OneBot 11 实例。"
+            )
+            connector_next = "使用自动配置分配本机端口与随机 Token，并创建受管账号；不会自动登录 QQ。"
         elif mock_instances or mock_providers:
             connector_state = "mock_only"
             connector_summary = "当前只有 Mock 连接器；不会连接真实 QQ。"
@@ -282,6 +418,34 @@ class OnboardingService:
             connector_state = "action_required"
             connector_summary = "尚未配置连接器，也没有检测到受管连接器安装。"
             connector_next = "在连接器页下载/导入 NapCat，或在 QQ 接入页添加 OneBot 11 实例。"
+
+        if connector_state != "done" and len(auto_configure_candidates) == 1:
+            connector_action = {
+                "label": "自动配置并创建受管账号（推荐）",
+                "route": "/onboarding",
+                "kind": "auto_configure_connector",
+                "enabled": True,
+                "disabled_reason": None,
+                "installation_id": str(auto_configure_candidates[0]["id"]),
+            }
+        elif connector_state != "done" and len(auto_configure_candidates) > 1:
+            connector_action = {
+                "label": "选择连接器并自动配置",
+                "route": "/connectors",
+                "kind": "navigate",
+                "enabled": True,
+                "disabled_reason": "检测到多个可自动配置的安装；为避免写错目录，请在连接器页选择目标。",
+                "installation_id": None,
+            }
+        else:
+            connector_action = {
+                "label": "打开连接器页面",
+                "route": "/connectors",
+                "kind": "navigate",
+                "enabled": True,
+                "disabled_reason": None,
+                "installation_id": None,
+            }
         steps.append(
             _step(
                 "connector",
@@ -294,7 +458,14 @@ class OnboardingService:
                     "installations": real_installation_count,
                     "shell_installed": shell_installed_count,
                     "ready_installations": ready_installation_count,
+                    "auto_configurable_installations": len(auto_configure_candidates),
                 },
+                started_at=connector_started_at,
+                completed_at=connector_completed_at if connector_state == "done" else None,
+                attempt_count=max(connector_attempts, real_installation_count),
+                last_error_code=connector_error_code,
+                can_retry=connector_state in {"action_required", "blocked"} or connector_error_code is not None,
+                action=connector_action,
             )
         )
 
@@ -320,6 +491,18 @@ class OnboardingService:
             qq_state = "action_required"
             qq_summary = "没有可用的 QQ 接入实例。"
             qq_next = "先配置 OneBot 11 实例并连接。"
+        qq_started_at = min(_iso_values(instance.created_at for _, instance in real_instances), default=None)
+        confirmed_times = sorted(
+            _iso_values(instance.identity_confirmed_at for _, instance in confirmed_live_instances)
+        )
+        qq_error_code = next(
+            (
+                instance.last_error_code
+                for _, instance in real_instances
+                if isinstance(instance.last_error_code, str) and instance.last_error_code
+            ),
+            None,
+        )
         steps.append(
             _step(
                 "qq_login",
@@ -330,6 +513,11 @@ class OnboardingService:
                     "live_online_instances": len(live_real_instances),
                     "identity_confirmed_instances": len(confirmed_live_instances),
                 },
+                started_at=qq_started_at,
+                completed_at=confirmed_times[-1] if qq_state == "done" and confirmed_times else None,
+                attempt_count=len(real_instances),
+                last_error_code=qq_error_code,
+                can_retry=qq_state != "done",
             )
         )
 
@@ -357,6 +545,7 @@ class OnboardingService:
                 "group_list_verified": latest_test["group_list_verified"],
                 "real_inbound_verified": latest_test["real_inbound_verified"],
                 "real_outbound_verified": latest_test["real_outbound_verified"],
+                "error_code": latest_test["error_code"],
             }
             test_freshness = latest_test["freshness"]
             if test_freshness == "stale":
@@ -395,6 +584,11 @@ class OnboardingService:
                 next_step=test_next,
                 freshness=test_freshness,
                 evidence=test_evidence,
+                started_at=latest_test["tested_at"] if latest_test else None,
+                completed_at=latest_test["tested_at"] if latest_test and test_state == "done" else None,
+                attempt_count=connection_attempts,
+                last_error_code=latest_test["error_code"] if latest_test else None,
+                can_retry=test_state in {"action_required", "not_verified"},
             )
         )
 
@@ -464,6 +658,16 @@ class OnboardingService:
             "configured_real_providers": len(configured_real_providers),
             "tested_real_providers": len(readiness_providers),
         }
+        model_started_at = min(_iso_values(provider.created_at for provider in real_providers), default=None)
+        model_completed_at = (
+            max(
+                (provider_tests[provider.id]["tested_at"] for provider in readiness_providers),
+                key=lambda value: value or "",
+                default=None,
+            )
+            if model_state == "done"
+            else None
+        )
         steps.append(
             _step(
                 "model",
@@ -472,6 +676,11 @@ class OnboardingService:
                 next_step=model_next,
                 freshness=model_freshness,
                 evidence=model_evidence,
+                started_at=model_started_at,
+                completed_at=model_completed_at,
+                attempt_count=provider_attempts,
+                last_error_code=(latest_provider_test or {}).get("error_code"),
+                can_retry=model_state != "done" and bool(real_providers),
             )
         )
 
@@ -503,6 +712,9 @@ class OnboardingService:
                     "enabled_real_groups": len(enabled_real_groups),
                     "mock_groups": len(mock_groups),
                 },
+                started_at=min(_iso_values(group.created_at for group in real_groups), default=None),
+                attempt_count=len(real_groups),
+                can_retry=groups_state != "done",
             )
         )
 
@@ -542,6 +754,12 @@ class OnboardingService:
                     "real_observe_groups": len(real_observe_groups),
                     "observed_currently": len(observed_real_observe_groups),
                 },
+                started_at=iso_utc(observed_earliest_at) if observed_earliest_at is not None else None,
+                completed_at=(
+                    iso_utc(observed_latest_at) if observe_state == "done" and observed_latest_at is not None else None
+                ),
+                attempt_count=len(real_observe_groups),
+                can_retry=observe_state == "optional",
             )
         )
 
@@ -626,6 +844,16 @@ class OnboardingService:
                     "ready_mock_groups": len(mock_ready_groups),
                     "global_paused": bool(pause.get("paused")),
                 },
+                started_at=min(
+                    _iso_values(
+                        group.created_at
+                        for group in groups
+                        if group.account_id in real_account_ids and group.reply_mode != "observe"
+                    ),
+                    default=None,
+                ),
+                attempt_count=len(real_ready_groups) + len(real_manual_groups),
+                can_retry=enable_state in {"action_required", "blocked"},
             )
         )
 
@@ -652,13 +880,18 @@ class OnboardingService:
             if next_step is None:
                 next_step = next((step for step in steps if step["state"] == "optional"), None)
             next_action = (
-                {"key": next_step["key"], "label": next_step["title"], "route": next_step["route"]}
+                {
+                    "key": next_step["key"],
+                    "step_title": next_step["title"],
+                    **next_step["next_action"],
+                }
                 if next_step is not None
                 else None
             )
 
         notes = [
-            "本向导只读：不会自动登录 QQ、自动测试模型、自动导入群或自动开启回复。",
+            "向导只读聚合状态；仅在你显式输入确认词后，才会执行受管连接器自动配置。",
+            "向导不会自动登录 QQ、自动测试模型、自动导入群或自动开启回复。",
             "实时在线来自后端内存适配器；历史测试证据可能过期，过期不会被视为通过。",
             "Mock 始终只是演示；真实 QQ 入站、出站与真实模型调用仍需用户自行验收。",
         ]
@@ -669,6 +902,18 @@ class OnboardingService:
             "ready_for_replies": overall == "ready_real" and enable_state == "done",
             "mock_only": overall == "ready_mock_only",
             "global_paused": bool(pause.get("paused")),
+            "counts": {
+                "real_instances": len(real_instances),
+                "mock_instances": len(mock_instances),
+                "real_installations": real_installation_count,
+                "ready_installations": ready_installation_count,
+                "real_providers": len(real_providers),
+                "configured_real_providers": len(configured_real_providers),
+                "tested_real_providers": len(readiness_providers),
+                "mock_providers": len(mock_providers),
+                "real_groups": len(real_groups),
+                "mock_groups": len(mock_groups),
+            },
             "steps": steps,
             "warnings": warnings,
             "blockers": blockers,
@@ -702,11 +947,27 @@ class OnboardingService:
             "ready_for_replies": False,
             "mock_only": False,
             "global_paused": False,
+            "counts": {
+                "real_instances": 0,
+                "mock_instances": 0,
+                "real_installations": 0,
+                "ready_installations": 0,
+                "real_providers": 0,
+                "configured_real_providers": 0,
+                "tested_real_providers": 0,
+                "mock_providers": 0,
+                "real_groups": 0,
+                "mock_groups": 0,
+            },
             "steps": steps,
             "warnings": [],
             "blockers": [reason],
-            "next_action": {"key": "backend", "label": "运行环境", "route": "/diagnostics"},
-            "notes": ["本向导只读，不会尝试修复数据库或执行任何外部动作。"],
+            "next_action": {
+                "key": "backend",
+                "step_title": "运行环境",
+                **steps[0]["next_action"],
+            },
+            "notes": ["本向导不会尝试修复数据库；请先恢复本地数据库连接。"],
         }
 
 

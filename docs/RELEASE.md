@@ -1,9 +1,9 @@
 # 发行、安装、升级与卸载
 
-本文件说明 AI 群友 0.2.1 的 Windows 发行包、构建流水线、干净环境冒烟、升级/回滚、
+本文件说明 AI 群友 0.2.2 的 Windows 发行包、构建流水线、干净环境冒烟、升级/回滚、
 卸载与数据保留策略。**所有结论以实际构建与测试记录为准。**
 
-## 0.2.1 发布说明
+## 0.2.2 发布说明
 
 > **真实 QQ 端到端尚未验证。** 本版本没有在真实 NapCat 登录环境完成群消息入站与出站
 > 发送验收。安装包、内置后端启动与 Mock 冒烟通过，不等于真实 QQ 可用。
@@ -14,17 +14,18 @@
 > **不宣称生产就绪。** 安装包未签名、无自动更新；NSIS 安装器/卸载器尚未在独立的干净
 > Windows 机器上执行。
 
-0.2.1 在 0.2.0 的 **Windows x64 独立安装包**基础上完成最终审计修复：构建前置校验
-Git 工作树并清理旧 `release/`、版本以 `app.__version__` 为单一来源、损坏备份结构化拒绝、
-空文本发送在 HTTP 前拒绝，并补充 NSIS 静态配置回归测试。安装后仍自带 Python 后端、
-NapCat 受管安装器、前端构建产物与 Electron 运行时，普通用户不需要手工安装 Python 或
-Node。完整变更见 [../CHANGELOG.md](../CHANGELOG.md)。
+0.2.2 在 0.2.1 的基础上强化受管 NapCat 安装：同版本完整目录复用、受管损坏目录隔离修复、
+未知目录拒绝且不触碰、陈旧 staging 清理、有界下载重试与稳定 ZIP/占用/权限错误码。
+接入向导新增可执行动作：只有一个可用受管 Shell 时，普通用户输入 `AUTO CONFIG` 即可
+自动分配端口、生成加密 Token、写配置并创建账号，无需手填 WS/HTTP 地址；仍不会启动
+连接器或登录 QQ。安装后仍自带 Python 后端、NapCat 受管安装器、前端构建产物与 Electron
+运行时。完整变更见 [../CHANGELOG.md](../CHANGELOG.md)。
 
 ## 1. 发行产物
 
 | 产物 | 说明 |
 | --- | --- |
-| `release/AI-Group-Friend-Setup-0.2.1-x64.exe` | NSIS 安装程序；per-user，可选安装目录，创建开始菜单与桌面快捷方式 |
+| `release/AI-Group-Friend-Setup-0.2.2-x64.exe` | NSIS 安装程序；per-user，可选安装目录，创建开始菜单与桌面快捷方式 |
 | `release/win-unpacked/` | 与安装包同源的未打包目录；发布冒烟使用此目录，避免自动安装 |
 | `release/BUILD_INFO.json` | 版本、构建时间、Git commit、Python/Node/Electron 版本、产物大小与 SHA-256 |
 | `release/RELEASE_SMOKE.json` | 干净环境冒烟结果；只在构建机生成，不进入 Git |
@@ -32,7 +33,27 @@ Node。完整变更见 [../CHANGELOG.md](../CHANGELOG.md)。
 `release/` 已被 `.gitignore` 排除。发布时只需分发安装程序与构建信息；不要把
 `release/win-unpacked`、本机 `.env`、`data/` 或连接器目录一起打包。
 
-### 0.2.1 本机构建记录（2026-11-01）
+### 0.2.2 本机构建记录（2026-11-01）
+
+| 项目 | 实测值 |
+| --- | --- |
+| 版本 / Git | 0.2.2；基础提交 `da5f5dd`；分支 `v1.3-phase1`；**`git_dirty=true`** |
+| 工作树指纹 | status `7f2a9e68…`、diff `e9c56ae8…`（完整值见 `BUILD_INFO.json`） |
+| 安装包 | `AI-Group-Friend-Setup-0.2.2-x64.exe`；155,842,669 bytes；SHA-256 `35f7fb67ae00b116b105cd1ab04850446f60cb2b67d291fc21bd80237b6f3546` |
+| `win-unpacked/AI 群友.exe` | 249,797,632 bytes；SHA-256 `e17c2e4185c16341cb63336c180e6dd5c08194be8eb375efb6386eabe8842e20` |
+| 版本来源 | desktop/frontend/backend `__init__`/pyproject 均为 0.2.2；Electron 45.0.0 |
+| 签名 / 干净机安装 | **未签名；未在独立干净机器执行安装/升级/回滚/卸载** |
+| 发布冒烟 | 退出码 0；冻结后端 `runtime_mode=packaged`、版本 0.2.2、Alembic `f4a7b2c9d801`、内置前端、隔离数据目录；安装版 Electron 0.2.2、6 张截图、13.7s；`RELEASE_SMOKE.json` `status=ok` |
+
+> **重要：本次 0.2.2 安装包在未提交工作树上构建，`BUILD_INFO.json` 明确记录
+> `git_dirty=true` 与工作树指纹。** 它用于本机验证 0.2.2 代码，不代表可复现的已提交
+> 构建；正式分发前应在干净提交上重新构建。
+>
+> 构建完成后仅修改了不进入安装包的 `scripts/smoke_test.py`（补齐向导 `counts` 断言）并
+> 重跑源码进程冒烟；安装包内的后端、前端、桌面壳与连接器代码均未因此变化，故未重新
+> 打包。当前工作树 diff 指纹会与 `BUILD_INFO.json` 中的构建时指纹不同。
+
+### 0.2.1 本机构建记录（2026-11-01，历史）
 
 | 项目 | 实测值 |
 | --- | --- |
@@ -50,14 +71,14 @@ Node。完整变更见 [../CHANGELOG.md](../CHANGELOG.md)。
 PowerShell：
 
 ```powershell
-Get-FileHash .\release\AI-Group-Friend-Setup-0.2.1-x64.exe -Algorithm SHA256
+Get-FileHash .\release\AI-Group-Friend-Setup-0.2.2-x64.exe -Algorithm SHA256
 Get-Content .\release\BUILD_INFO.json
 ```
 
 Git Bash：
 
 ```bash
-sha256sum release/AI-Group-Friend-Setup-0.2.1-x64.exe
+sha256sum release/AI-Group-Friend-Setup-0.2.2-x64.exe
 ```
 
 哈希以 `BUILD_INFO.json` 中对应条目为准。若哈希不一致，不要运行安装包。
@@ -73,7 +94,7 @@ sha256sum release/AI-Group-Friend-Setup-0.2.1-x64.exe
 
 ## 3. 安装与首次启动
 
-1. 校验哈希后运行 `AI-Group-Friend-Setup-0.2.1-x64.exe`。
+1. 校验哈希后运行 `AI-Group-Friend-Setup-0.2.2-x64.exe`。
 2. 安装器为 per-user，可修改安装目录；不要求管理员权限。安装包未签名，Windows
    SmartScreen 可能显示「未知发布者」，请先核对哈希再决定是否运行。
 3. 启动「AI 群友」。首次启动会：

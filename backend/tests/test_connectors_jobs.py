@@ -28,6 +28,8 @@ class FakeInstaller:
         self.target: Path | None = None
         self.fail: tuple[str, str] | None = None
         self.events: list[dict[str, Any]] = []
+        self.action = "installed"
+        self.final_message = "下载、校验与解压完成；安装器尚未运行"
 
     async def run_install(self, *, dest: Path, version: str, on_event: Any = None) -> InstallProcessResult:
         assert self.target is not None
@@ -46,7 +48,12 @@ class FakeInstaller:
         return InstallProcessResult(
             returncode=0,
             stderr_tail="",
-            final_event={"event": "installed", "target": str(self.target)},
+            final_event={
+                "event": "installed",
+                "target": str(self.target),
+                "action": self.action,
+                "message": self.final_message,
+            },
         )
 
 
@@ -122,6 +129,20 @@ async def test_install_success_reports_installer_ready_not_installed(
     assert done["progress"] == 100
     assert done["version"] == "v4.18.42"
     assert "安装器尚未运行" in done["message"]
+
+
+async def test_existing_version_target_is_revalidated_not_rejected(
+    runner: tuple[ConnectorJobRunner, FakeInstaller],
+) -> None:
+    jobs, fake = runner
+    fake.action = "reused"
+    fake.final_message = "已有完整同版本受管安装，安装器校验通过，无需重复下载。"
+    job = await jobs.start_install(version="v4.18.42", actor="test")
+    await fake.started.wait()
+    fake.gate.set()
+    done = await _wait_state(jobs, job["id"], "succeeded")
+    assert done["error_code"] is None
+    assert "已有完整同版本" in done["message"]
 
 
 async def test_only_one_install_job_and_cancel(

@@ -568,6 +568,26 @@ backend\.venv\Scripts\python.exe scripts\release_smoke.py
 
 ## 7. 版本记录
 
+### 0.2.2 — 连接器可恢复安装与普通用户自动接入（2026-11-01）
+
+- 受管 NapCat 安装支持同版本复用、受管损坏目录隔离修复、未知目录拒绝、陈旧 staging
+  清理、有界下载重试与稳定 ZIP/占用/权限错误码；安装事件区分
+  `installed/reused/repaired`。
+- 新增向导自动配置动作与前端一键入口：仅有唯一可用受管 Shell 时，输入 `AUTO CONFIG`
+  即自动分配端口、加密 Token、写配置并创建账号；不启动连接器、不登录 QQ、
+  `auto_connect=false`。
+- 向导每步补齐状态、时间、尝试次数、错误码、可重试与 `next_action`；“已安装 Shell”
+  不再被算作连接器准备完成。
+- 账号页以向导自动接入为主路径，手动填写地址/端口降级为高级模式。
+- 自动化实测：后端 **459 passed**、mypy 134 源文件通过、前端 **76 passed**、桌面
+  **39 passed**。本机 0.2.2 安装包构建成功（`git_dirty=true`，基础提交 `da5f5dd`；
+  155,842,669 bytes，SHA-256 `35f7fb67…6f3546`），隔离发布冒烟通过（冻结后端
+  `packaged`、版本 0.2.2、Alembic `f4a7b2c9d801`、6 张截图、13.7s）。真实 QQ、真实
+  模型、干净机安装/卸载与签名仍未验收。详细见
+  [implementation/TEST_MATRIX.md](implementation/TEST_MATRIX.md)、
+  [audit/V0.2.2_IMPLEMENTATION_AUDIT.md](audit/V0.2.2_IMPLEMENTATION_AUDIT.md) 与
+  [testing/V0.2.2_REAL_ENV_ACCEPTANCE.md](testing/V0.2.2_REAL_ENV_ACCEPTANCE.md)。
+
 ### 0.2.1 — 最终审计与发布可复现性（2026-11-01）
 
 - 完成阶段 0–8 只读审计后的本机修复：冒烟脚本完全隔离真实 `.env`；发布构建拒绝 dirty

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -25,6 +26,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,8 +56,12 @@ MAX_ZIP_ENTRIES = 200
 MAX_ZIP_TOTAL_BYTES = 50 * 1024 * 1024
 MAX_ZIP_FILE_BYTES = 50 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
+DEFAULT_DOWNLOAD_RETRIES = 2
+STALE_STAGING_SECONDS = 24 * 60 * 60
 TAG_PATTERN = re.compile(r"^v\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?$")
 DIGEST_PATTERN = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
+SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 RESERVED_NAMES = {
     "CON",
     "PRN",
@@ -78,6 +84,16 @@ class ReleaseAsset:
     size: int
     digest: str
     download_url: str
+
+
+@dataclass(frozen=True)
+class ExistingTarget:
+    """已存在的版本目录状态；只有 reusable 可以跳过下载。"""
+
+    state: str  # reusable / repairable / unknown
+    reason: str
+    installer_relative_path: str | None = None
+    installer_sha256: str | None = None
 
 
 _LOG_STREAM: Any = None
@@ -326,9 +342,17 @@ def download_asset(
                     handle.write(chunk)
                     if on_progress is not None:
                         on_progress(written, asset.size)
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+    except (urllib.error.URLError, TimeoutError) as exc:
         target.unlink(missing_ok=True)
         raise InstallerError(f"下载资产失败：{exc}") from exc
+    except PermissionError as exc:
+        target.unlink(missing_ok=True)
+        raise InstallerError("权限不足：无法写入下载临时文件；请检查连接器目录权限。") from exc
+    except OSError as exc:
+        target.unlink(missing_ok=True)
+        if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+            raise InstallerError("磁盘空间不足：无法写入下载临时文件，请清理磁盘后重试。") from exc
+        raise InstallerError(f"下载内容写入临时文件失败：{exc}") from exc
     except InstallerError:
         target.unlink(missing_ok=True)
         raise
@@ -341,6 +365,51 @@ def download_asset(
         target.unlink(missing_ok=True)
         raise InstallerError("SHA-256 校验失败，已删除下载文件。")
     return actual, written
+
+
+def download_asset_with_retry(
+    asset: ReleaseAsset,
+    target: Path,
+    *,
+    opener: Any,
+    timeout: float = 60.0,
+    retries: int = DEFAULT_DOWNLOAD_RETRIES,
+    retry_delay: float = 1.0,
+    sleep_func: Callable[[float], None] = time.sleep,
+    on_progress: Callable[[int, int], None] | None = None,
+    event_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[str, int]:
+    """有限次重试；每次失败都删除临时文件，成功前绝不留下“缓存即成功”。"""
+    attempts = max(0, min(int(retries), 5)) + 1
+    last_error: InstallerError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return download_asset(
+                asset,
+                target,
+                opener=opener,
+                timeout=timeout,
+                on_progress=on_progress,
+            )
+        except InstallerError as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            if attempt >= attempts:
+                break
+            delay = max(0.0, float(retry_delay)) * attempt
+            emit_event(
+                event_sink,
+                "retry",
+                message=f"下载第 {attempt} 次失败，将重试：{exc}",
+                attempt=attempt,
+                max_attempts=attempts,
+                retry_in_seconds=delay,
+            )
+            log(f"下载失败（第 {attempt}/{attempts} 次）：{exc}；{delay:.1f} 秒后重试")
+            if delay:
+                sleep_func(delay)
+    assert last_error is not None
+    raise InstallerError(f"下载重试 {attempts} 次仍失败：{last_error}") from last_error
 
 
 # ---------------------------------------------------------------- 安全解压
@@ -370,19 +439,23 @@ def _validate_zip_name(name: str) -> tuple[str, ...]:
 
 
 def safe_extract_zip(zip_path: Path, destination: Path) -> Path:
-    """校验并解压；返回解压出的 NapCatInstaller.exe 路径。"""
+    """校验并解压；返回解压出的 NapCatInstaller.exe 路径。
+
+    先只读中央目录做安全校验与完整性探测，再写入磁盘；任何失败都只留下调用方创建的
+    staging，由调用方统一清理。
+    """
     destination.mkdir(parents=True, exist_ok=True)
     seen: set[str] = set()
-    entries = 0
     declared_total = 0
     installer: Path | None = None
     try:
         with zipfile.ZipFile(zip_path) as archive:
             infos = archive.infolist()
+            if not infos:
+                raise InstallerError("压缩包为空。")
             if len(infos) > MAX_ZIP_ENTRIES:
                 raise InstallerError(f"压缩包条目过多：{len(infos)} > {MAX_ZIP_ENTRIES}。")
             for info in infos:
-                entries += 1
                 parts = _validate_zip_name(info.filename)
                 key = "/".join(parts).casefold()
                 if key in seen:
@@ -400,15 +473,29 @@ def safe_extract_zip(zip_path: Path, destination: Path) -> Path:
                         raise InstallerError(f"压缩包包含特殊文件：{info.filename!r}")
                 if info.file_size < 0 or info.file_size > MAX_ZIP_FILE_BYTES:
                     raise InstallerError(f"压缩包单文件过大：{info.filename!r}")
+                if info.compress_size < 0:
+                    raise InstallerError(f"压缩包条目压缩大小无效：{info.filename!r}")
+                if info.file_size > 1024 and info.compress_size == 0:
+                    raise InstallerError(f"压缩包条目压缩比异常：{info.filename!r}")
+                if info.compress_size > 0 and info.file_size / info.compress_size > MAX_COMPRESSION_RATIO:
+                    raise InstallerError(f"压缩包条目压缩比过高（可能的压缩炸弹）：{info.filename!r}")
                 declared_total += info.file_size
                 if declared_total > MAX_ZIP_TOTAL_BYTES:
                     raise InstallerError("压缩包解压后总大小超过限制。")
-                relative = Path(*parts)
-                target = (destination / relative).resolve()
+                escaped = (destination / Path(*parts)).resolve()
                 try:
-                    target.relative_to(destination.resolve())
+                    escaped.relative_to(destination.resolve())
                 except ValueError as exc:
                     raise InstallerError(f"压缩包路径逃逸目标目录：{info.filename!r}") from exc
+
+            # testzip() 会读取并解压全部条目，提前发现截断包、CRC 错误和损坏中央目录。
+            bad_entry = archive.testzip()
+            if bad_entry is not None:
+                raise InstallerError(f"压缩包完整性校验失败（CRC 或截断）：{bad_entry!r}")
+
+            for info in infos:
+                parts = _validate_zip_name(info.filename)
+                target = (destination / Path(*parts)).resolve()
                 if info.is_dir():
                     target.mkdir(parents=True, exist_ok=True)
                     continue
@@ -428,9 +515,18 @@ def safe_extract_zip(zip_path: Path, destination: Path) -> Path:
                 if target.name.casefold() == "napcatinstaller.exe":
                     installer = target
     except zipfile.BadZipFile as exc:
-        raise InstallerError("下载的资产不是有效 ZIP 文件。") from exc
-    if entries == 0:
-        raise InstallerError("压缩包为空。")
+        raise InstallerError("下载的资产不是有效 ZIP 文件（可能为截断包或损坏的中央目录）。") from exc
+    except InstallerError:
+        # InstallerError 继承 RuntimeError，必须先原样抛出，避免被下面的解析错误掩盖。
+        raise
+    except (EOFError, RuntimeError, NotImplementedError, ValueError) as exc:
+        raise InstallerError(f"ZIP 解析失败（可能被截断、加密或损坏）：{exc}") from exc
+    except OSError as exc:
+        if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+            raise InstallerError("磁盘空间不足：无法写入解压目录，请清理磁盘后重试。") from exc
+        if isinstance(exc, PermissionError) or exc.errno in {errno.EACCES, errno.EPERM}:
+            raise InstallerError("权限不足：无法写入解压目录；请检查连接器目录权限。") from exc
+        raise InstallerError(f"解压时写入文件失败（文件可能被占用或路径无效）：{exc}") from exc
     if installer is None:
         raise InstallerError("压缩包内没有 NapCatInstaller.exe。")
     return installer
@@ -494,6 +590,136 @@ def default_destination() -> Path:
     return ROOT / "connectors" / "napcat"
 
 
+# ---------------------------------------------------------------- 已有目录与残留
+
+
+def _inside(path: Path, base: Path) -> bool:
+    try:
+        path.resolve().relative_to(base.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def inspect_existing_target(target: Path, expected_version: str) -> ExistingTarget:
+    """只根据受管 manifest 判断已有目录，绝不凭目录名猜测为用户安装。"""
+    if target.is_symlink() or not target.is_dir():
+        return ExistingTarget("unknown", "目标路径不是普通目录或属于符号链接。")
+    manifest_path = target / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        return ExistingTarget("unknown", "目标目录没有受管安装清单，拒绝覆盖。")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ExistingTarget("unknown", "目标目录的安装清单无法解析，拒绝覆盖。")
+    if not isinstance(manifest, dict) or manifest.get("installer") != "ai-group-friend-napcat-installer":
+        return ExistingTarget("unknown", "目标目录不是本平台创建的受管安装，拒绝覆盖。")
+    if manifest.get("version") != expected_version:
+        return ExistingTarget(
+            "repairable",
+            f"受管目录版本为 {manifest.get('version')!r}，与请求的 {expected_version} 不一致。",
+        )
+    relative = manifest.get("installer_relative_path")
+    digest = manifest.get("installer_sha256")
+    if not isinstance(relative, str) or not isinstance(digest, str) or not SHA256_PATTERN.match(digest):
+        return ExistingTarget("repairable", "受管清单缺少安装器路径或 SHA-256。")
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts or "\\" in relative:
+        return ExistingTarget("repairable", "受管清单的安装器路径不安全。")
+    installer = target / relative_path
+    if not _inside(installer, target) or installer.is_symlink() or not installer.is_file():
+        return ExistingTarget("repairable", "受管清单指向的安装器不存在或路径不安全。")
+    try:
+        actual = hashlib.sha256(installer.read_bytes()).hexdigest()
+    except OSError as exc:
+        return ExistingTarget("repairable", f"无法读取已有安装器进行校验：{exc}")
+    if not hmac.compare_digest(actual.lower(), digest.lower()):
+        return ExistingTarget("repairable", "已有安装器的 SHA-256 与受管清单不一致。")
+    return ExistingTarget(
+        "reusable",
+        "已有同版本受管安装且安装器校验通过。",
+        installer_relative_path=relative_path.as_posix(),
+        installer_sha256=actual,
+    )
+
+
+def _rename_with_retry(source: Path, destination: Path) -> None:
+    """Windows 上杀毒/索引服务可能短暂锁定目录；有限重试后给出可操作错误。"""
+    last_error: OSError | None = None
+    for attempt in range(3):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.2 * (attempt + 1))
+    if isinstance(last_error, PermissionError):
+        raise InstallerError(
+            f"权限不足：无法移动目录 {source.name}；"
+            "请检查连接器目录与受控文件夹权限后重试。"
+            f"系统错误：{last_error}"
+        )
+    raise InstallerError(
+        f"无法移动目录（文件可能被占用或路径过长）：{source.name}；"
+        "请关闭 NapCat、资源管理器预览和占用扫描后重试。"
+        f"系统错误：{last_error}"
+    )
+
+
+def quarantine_existing_target(target: Path, dest: Path, *, reason: str) -> Path:
+    """把受管损坏目录移入同盘隔离区，保留数据，绝不直接删除。"""
+    if target.is_symlink() or not target.is_dir():
+        raise InstallerError("拒绝隔离非普通目录或符号链接。")
+    if not _inside(target, dest) or target.parent.resolve() != dest.resolve():
+        raise InstallerError("拒绝隔离受管目录之外的路径。")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    for index in range(20):
+        suffix = "" if index == 0 else f"-{index}"
+        candidate = dest / f".quarantine-{target.name}-{stamp}{suffix}"
+        if candidate.exists() or candidate.is_symlink():
+            continue
+        _rename_with_retry(target, candidate)
+        log(f"已隔离损坏的受管目录：{candidate.name}（{reason}）")
+        return candidate
+    raise InstallerError("无法为损坏目录分配隔离名称，请清理 connectors 目录后重试。")
+
+
+def cleanup_stale_staging(
+    dest: Path,
+    *,
+    max_age_seconds: float = STALE_STAGING_SECONDS,
+    now: float | None = None,
+) -> list[str]:
+    """只清理本平台直接创建且已过期的 ``.staging-*`` 目录。"""
+    if not dest.is_dir() or dest.is_symlink():
+        return []
+    current = time.time() if now is None else now
+    removed: list[str] = []
+    try:
+        children = list(dest.iterdir())
+    except OSError:
+        return []
+    for child in children:
+        if not child.name.startswith(".staging-"):
+            continue
+        try:
+            info = child.lstat()
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            continue
+        if current - info.st_mtime < max_age_seconds:
+            continue
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            log(f"警告：无法清理过期暂存目录 {child.name}，请稍后手动处理。")
+            continue
+        removed.append(child.name)
+    return removed
+
+
 # ---------------------------------------------------------------- 安装流程
 
 
@@ -510,6 +736,9 @@ def install(
     runner: Callable[..., Any] = subprocess.run,
     event_sink: Callable[[dict[str, Any]], None] | None = None,
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
+    download_retries: int = DEFAULT_DOWNLOAD_RETRIES,
+    retry_delay: float = 1.0,
+    sleep_func: Callable[[float], None] = time.sleep,
 ) -> int:
     emit_event(event_sink, "resolving", message="正在解析版本与资产", progress=5)
     opener = opener or build_opener()
@@ -528,8 +757,33 @@ def install(
         log(f"目标目录：{target}")
         return 0
 
-    if target.exists():
-        raise InstallerError(f"目标目录已存在，拒绝覆盖：{target}")
+    existing: ExistingTarget | None = None
+    if target.exists() or target.is_symlink():
+        existing = inspect_existing_target(target, asset.tag)
+        if existing.state == "unknown":
+            raise InstallerError(f"目标目录已存在但无法安全复用：{target}；{existing.reason}")
+        if existing.state == "reusable":
+            log(f"已有完整同版本安装，校验通过，直接复用：{target}")
+            emit_event(
+                event_sink,
+                "installed",
+                action="reused",
+                message="已有完整同版本受管安装，安装器校验通过，无需重复下载。",
+                version=asset.tag,
+                target=str(target),
+                installer_relative_path=existing.installer_relative_path,
+                installer_sha256=existing.installer_sha256,
+                progress=100,
+            )
+            return 0
+        log(f"检测到受管但需要修复的目录：{existing.reason}")
+        emit_event(
+            event_sink,
+            "repair_needed",
+            message=f"检测到受管目录需要修复：{existing.reason}",
+            version=asset.tag,
+            progress=6,
+        )
 
     required = asset.size * 3 + MIN_FREE_DISK_MARGIN
     free = check_disk_space(dest, required, disk_usage=disk_usage)
@@ -543,8 +797,19 @@ def install(
     )
 
     dest.mkdir(parents=True, exist_ok=True)
+    removed_staging = cleanup_stale_staging(dest)
+    if removed_staging:
+        log(f"已清理过期暂存目录 {len(removed_staging)} 个。")
+        emit_event(
+            event_sink,
+            "maintenance",
+            message=f"已清理过期暂存目录 {len(removed_staging)} 个",
+            removed=removed_staging,
+            progress=9,
+        )
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=dest))
     emit_event(event_sink, "progress", stage="staging", staging_path=str(staging), progress=9)
+    download_started = time.monotonic()
     succeeded = False
     try:
         archive_path = staging / ASSET_NAME
@@ -553,6 +818,8 @@ def install(
 
         def _progress(written: int, total: int) -> None:
             percent = 10 + int(45 * written / total) if total else 10
+            elapsed = time.monotonic() - download_started
+            speed = int(written / elapsed) if elapsed >= 0.2 and written else None
             emit_event(
                 event_sink,
                 "progress",
@@ -560,15 +827,20 @@ def install(
                 message=f"已下载 {written}/{total} 字节",
                 downloaded_bytes=written,
                 total_bytes=total,
+                bytes_per_second=speed,
                 progress=min(percent, 55),
             )
 
-        actual_digest, actual_size = download_asset(
+        actual_digest, actual_size = download_asset_with_retry(
             asset,
             archive_path,
             opener=opener,
             timeout=timeout,
+            retries=download_retries,
+            retry_delay=retry_delay,
+            sleep_func=sleep_func,
             on_progress=_progress,
+            event_sink=event_sink,
         )
         log(f"校验通过：{actual_size} 字节，sha256:{actual_digest}")
         emit_event(
@@ -615,19 +887,57 @@ def install(
             "install_dir": str(target),
             "installer_relative_path": installer_relative,
             "installer_sha256": installer_hash,
+            "replaced_install": None,
             "next_steps": [
                 "运行 NapCatInstaller.exe（本脚本不会自动登录 QQ）。",
                 "在 NapCat 中登录你本人授权的专用 QQ 账号。",
-                "启用正向 WebSocket 与 HTTP API，并设置独立 Token。",
-                "回到控制台填写地址与 Token，先执行「测试并诊断」。",
+                "回到控制台使用「自动准备连接」生成本地端口与 Token 并写入配置。",
+                "启动连接器、测试并诊断；真实收发仍需在测试群验收。",
             ],
             "real_qq_verified": False,
         }
-        (extracted / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        manifest_path = extracted / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        if target.exists():
-            raise InstallerError(f"目标目录在安装期间被创建，拒绝覆盖：{target}")
-        os.replace(extracted, target)
+        quarantined: Path | None = None
+        action = "installed"
+        if target.exists() or target.is_symlink():
+            current = inspect_existing_target(target, asset.tag)
+            if current.state == "reusable":
+                log(f"下载期间检测到可复用的完整同版本安装，放弃本次暂存：{target}")
+                emit_event(
+                    event_sink,
+                    "installed",
+                    action="reused",
+                    message="已有完整同版本受管安装，安装器校验通过，无需重复下载。",
+                    version=asset.tag,
+                    target=str(target),
+                    installer_relative_path=current.installer_relative_path,
+                    installer_sha256=current.installer_sha256,
+                    progress=100,
+                )
+                return 0
+            if current.state == "unknown":
+                raise InstallerError(f"目标目录在安装期间变为不可安全复用的目录，拒绝覆盖：{target}；{current.reason}")
+            quarantined = quarantine_existing_target(target, dest, reason=current.reason)
+            action = "repaired"
+            manifest["replaced_install"] = {
+                "quarantined_as": quarantined.name,
+                "reason": current.reason,
+                "quarantined_at": datetime.now(UTC).isoformat(),
+            }
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            emit_event(
+                event_sink,
+                "repair",
+                message=f"已隔离损坏目录 {quarantined.name}，准备原子切换到新版本",
+                quarantined_as=quarantined.name,
+                progress=97,
+            )
+
+        if target.exists() or target.is_symlink():
+            raise InstallerError("目标目录在原子切换前再次出现，已中止且未覆盖该目录。")
+        _rename_with_retry(extracted, target)
         succeeded = True
         log(f"安装完成：{target}")
         log(f"安装器：{target / installer_relative}")
@@ -635,11 +945,17 @@ def install(
         emit_event(
             event_sink,
             "installed",
-            message="下载、校验与解压完成；安装器尚未运行",
+            action=action,
+            message=(
+                "已隔离损坏目录并完成原子安装；安装器尚未运行。"
+                if action == "repaired"
+                else "下载、校验与解压完成；安装器尚未运行"
+            ),
             version=asset.tag,
             target=str(target),
             installer_relative_path=installer_relative,
             installer_sha256=installer_hash,
+            quarantined_as=quarantined.name if quarantined is not None else None,
             progress=100,
         )
     finally:
@@ -719,12 +1035,18 @@ def _error_code(exc: InstallerError) -> str:
     message = str(exc)
     if "INSUFFICIENT_DISK" in message:
         return "CONNECTOR_INSUFFICIENT_DISK"
-    if "目标目录已存在" in message:
-        return "CONNECTOR_TARGET_EXISTS"
     if "SHA-256" in message:
         return "CONNECTOR_DIGEST_MISMATCH"
+    if "权限不足" in message:
+        return "CONNECTOR_PERMISSION_DENIED"
+    if "目标目录已存在" in message or "拒绝覆盖" in message or "无法安全复用" in message:
+        return "CONNECTOR_TARGET_EXISTS"
+    if "无法移动目录" in message or "占用" in message:
+        return "CONNECTOR_TARGET_BUSY"
     if "磁盘" in message:
         return "CONNECTOR_INSUFFICIENT_DISK"
+    if "ZIP" in message or "压缩包" in message:
+        return "CONNECTOR_ZIP_INVALID"
     if "下载" in message or "GitHub" in message:
         return "CONNECTOR_DOWNLOAD_FAILED"
     return "CONNECTOR_INSTALL_FAILED"

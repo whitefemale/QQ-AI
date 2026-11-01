@@ -159,7 +159,12 @@
 - **确认词**：安装 `INSTALL`、取消 `CANCEL`、运行安装器 `RUN INSTALLER`、启动
   `START NAPCAT`、停止 `STOP NAPCAT`、写配置 `WRITE CONFIG`、恢复快照
   `RESTORE CONFIG`、切换版本 `SWITCH VERSION`、导入 `IMPORT CONFIG`、确认身份
-  `CONFIRM IDENTITY`。缺失或大小写不匹配返回 `CONNECTOR_CONFIRMATION_REQUIRED`。
+  `CONFIRM IDENTITY`、向导自动配置 `AUTO CONFIG`。缺失或大小写不匹配返回
+  `CONNECTOR_CONFIRMATION_REQUIRED`。
+- **向导自动配置**：与 `/api/connectors/*` 共用同一本机回环守卫，即使开启远程管理也不能
+  远程调用。只接受唯一可用且无活动任务的受管 Shell；自动分配回环端口、生成随机 Token、
+  写配置并创建 `auto_connect=false` 的受管账号。不会启动连接器、不会登录 QQ、不会发
+  消息；多候选时拒绝并引导用户到连接器页选择。
 - **固定执行边界**：只允许后端脚本、受管 `NapCatInstaller.exe`、受管 `napcat.bat`
   （经绝对 `cmd.exe /d /s /c`）与绝对 `taskkill.exe`。固定参数、`shell=False`、无提权；
   不提供任意命令、参数、URL 或路径接口。

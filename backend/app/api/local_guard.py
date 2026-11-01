@@ -1,8 +1,8 @@
 """连接器 API 的本机回环守卫。
 
-即使开启 ``ALLOW_REMOTE_ADMIN``，``/api/connectors`` 也只接受本机回环客户端、
-回环 ``Host`` 与（若浏览器发送）回环 ``Origin``。连接器端点能启动固化的本机
-程序并写本机配置，不能暴露给远程管理或 DNS rebinding/CSRF。
+即使开启 ``ALLOW_REMOTE_ADMIN``，``/api/connectors`` 与向导的受管连接器自动配置
+动作也只接受本机回环客户端、回环 ``Host`` 与（若浏览器发送）回环 ``Origin``。
+这些端点能启动固化的本机程序或写本机配置，不能暴露给远程管理或 DNS rebinding/CSRF。
 """
 
 from __future__ import annotations
@@ -55,11 +55,15 @@ def _origin_allowed(origin: str | None) -> bool:
 class ConnectorLocalGuard(BaseHTTPMiddleware):
     def __init__(self, app: ASGIApp, *, prefix: str = "/api") -> None:
         super().__init__(app)
-        self.prefix = f"{prefix.rstrip('/')}/connectors"
+        base = prefix.rstrip("/")
+        self.prefix = f"{base}/connectors"
+        # 向导自动配置同样会写受管连接器配置与加密凭证，必须保持本机限定。
+        self.auto_config_path = f"{base}/onboarding/actions/auto-configure-connector"
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         path = request.url.path
-        if not (path == self.prefix or path.startswith(f"{self.prefix}/")):
+        protected = path == self.auto_config_path or path == self.prefix or path.startswith(f"{self.prefix}/")
+        if not protected:
             return await call_next(request)
         client_host = request.client.host if request.client is not None else None
         host = _host_only(request.headers.get("host"))

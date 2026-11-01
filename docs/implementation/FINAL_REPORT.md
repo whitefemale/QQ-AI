@@ -1,12 +1,92 @@
-# 最终总结报告：阶段 0–8 与 0.2.1 收口
+# 最终总结报告：阶段 0–8、0.2.1 收口与 0.2.2 连接器可恢复接入
 
 日期：2026-11-01
 分支：`v1.3-phase1`
-版本：`0.2.1`
+版本：`0.2.2`
 
 > **结论先行：本仓库的本地功能、自动化测试、Mock 端到端、源码进程冒烟、冻结后端与
-> 安装版桌面冒烟均已完成并实际通过；但真实 QQ 收发、真实模型 Key、独立干净机 NSIS
-> 安装/升级/回滚/卸载、代码签名与 SmartScreen 均未验证。不得宣称生产就绪。**
+> 安装版桌面冒烟均已完成并实际通过；0.2.2 额外完成受管 NapCat 安装复用/修复/重试与
+> 普通用户一键自动配置。但真实 NapCat 安装器、真实 QQ 收发、真实模型 Key、独立干净机
+> NSIS 安装/升级/回滚/卸载、代码签名与 SmartScreen 均未验证。不得宣称生产就绪。**
+
+## 0. 0.2.2 本轮交付摘要
+
+### 修复的问题
+
+1. 同版本受管目录已存在时，安装直接失败，无法重复安装或从失败中恢复。
+2. 受管目录残缺或未知目录与用户目录无法区分；错误清理可能触碰用户文件。
+3. 截断/损坏 ZIP 的异常分类不稳定，用户看不到可操作错误。
+4. 下载没有重试，网络抖动即导致失败并可能留下临时文件。
+5. 普通用户仍被要求手填 WebSocket/HTTP 地址、端口与 Token。
+6. 接入向导只读，步骤缺少状态、尝试次数、错误码、可重试与下一步动作；“已安装 Shell”
+   曾被误判为连接器准备完成。
+7. 连接测试失败时，页面缺少稳定错误码与安全错误文案。
+
+### 新增的真实功能（本地实现，均有测试）
+
+- 受管 NapCat 安装：同版本完整目录校验后复用；受管损坏目录隔离到 `.quarantine-*` 后
+  原子修复；未知目录拒绝且不触碰；陈旧 staging 清理；有界下载重试；ZIP 完整性、路径、
+  重复项、符号链接、大小与压缩比校验；Windows 占用/权限错误映射。
+- 安装任务成功事件区分 `installed/reused/repaired`，并明确“安装器尚未运行”。
+- `POST /api/onboarding/actions/auto-configure-connector`：对唯一可用受管 Shell 自动
+  分配本机端口、生成加密 Token、写配置、创建受管 `onebot11` 账号；必须输入
+  `AUTO CONFIG`；与 `/api/connectors/*` 共用本机回环守卫，远程管理不可调用；不启动
+  连接器、不登录 QQ、`auto_connect=false`。
+- 接入向导每步返回 `status/started_at/completed_at/attempt_count/last_error_code/
+  last_error_message/can_retry/next_action`，顶层返回 `counts` 与唯一 `next_action`。
+- 前端向导支持“一键自动配置”并如实展示错误与重试；账号页把手动填写地址降级为高级模式；
+  连接器页增加自动配置入口。
+
+### 仍然属于 Mock / 未验证
+
+- 真实 NapCat 安装器执行、NapCat 登录、真实 QQ 入站/出站：**未执行**。
+- 真实 OpenAI-compatible / Anthropic Key 调用：**未执行**。
+- 干净机 NSIS 安装/升级/回滚/卸载、代码签名、自动更新：**未执行/未实现**。
+- 所有连接器自动化测试使用临时目录、假进程与假 I/O；Mock 状态不会因自动化测试变成
+  “真实 QQ 已验证”。
+
+### 0.2.2 实际检查结果
+
+| 检查 | 实际结果 |
+| --- | --- |
+| 后端 `ruff format --check app tests` / `ruff check app tests` | 通过 |
+| 后端 `mypy app` | Success: no issues found in 134 source files |
+| 后端 `pytest -q` | **459 passed**，1 warning（Starlette TestClient/httpx 弃用提示） |
+| 前端 `npm run type-check` | 通过 |
+| 前端 `npm run test` | 9 files / **76 tests passed** |
+| 前端 `npm run build` | 通过；既有主 chunk 体积警告 |
+| 桌面 `npm test` | **39 passed / 0 failed** |
+| `scripts/smoke_test.py` | 全部通过；末行「冒烟测试全部通过。未接触真实 QQ 或真实模型。」 |
+| 安装包与发布冒烟 | 见第 6 节 0.2.2 记录 |
+
+### 需要用户在本机或干净机完成
+
+- 真实 NapCat 安装器交互、NapCat 登录、身份确认。
+- 七个验收节点（安装器启动、已安装、进程启动、WS、身份、真实入站、真实出站）分别记录，
+  见 [../testing/V0.2.2_REAL_ENV_ACCEPTANCE.md](../testing/V0.2.2_REAL_ENV_ACCEPTANCE.md)。
+- 真实模型 Key 的连通性、生成、计费、预算与清空 Key 验收。
+- 干净 Windows 安装/升级/回滚/卸载与 SmartScreen 行为。
+
+### 0.2.2 主要变更文件
+
+- `scripts/install_napcat.py`、`backend/app/core/errors.py`
+- `backend/app/api/onboarding.py`、`backend/app/api/local_guard.py`、
+  `backend/app/services/onboarding_service.py`
+- `backend/app/services/system_evidence.py`、`backend/app/services/account_service.py`
+- `frontend/src/api/types.ts`、`frontend/src/api/connectors.ts`
+- `frontend/src/views/OnboardingView.vue`、`AccountsView.vue`、`ConnectorsView.vue`
+- 对应后端/前端测试、版本文件、发布文档与
+  `docs/testing/V0.2.2_REAL_ENV_ACCEPTANCE.md`
+
+> 本地已验证：上述代码变更完成后的第二次构建包含本机回环守卫修复，安装包与隔离发布
+> 冒烟均基于该构建。
+
+### 剩余风险
+
+- 真实 Windows 文件占用、杀软拦截、NapCat 安装器行为与官方包差异只做了静态/假 I/O 验证。
+- 自动配置固定写入 `v4.18.42` 的已知 OneBot 配置结构；其他版本仍不自动写配置。
+- 自动配置后仍需用户启动 NapCat 并登录 QQ；任何“已配置”都不等于“可收发”。
+- 真实 QQ 风控、NapCat 许可证与合规评估仍需用户/法务完成。
 
 ## 1. 已完成且有测试证据的功能
 
@@ -90,7 +170,9 @@
 | 真实计费与预算对账 | 真实用量与单价 | 本地账本、费用完整性测试 | 未对账 |
 | 真实暂停/断线/重连/发送失败恢复 | 真实连接器 | 假服务器与进程测试 | 未演练 |
 
-验收步骤见 [ROADMAP.md](../ROADMAP.md) 的“人工验收（需用户环境）”与
+验收步骤见
+[V0.2.2_REAL_ENV_ACCEPTANCE.md](../testing/V0.2.2_REAL_ENV_ACCEPTANCE.md)、
+[ROADMAP.md](../ROADMAP.md) 的“人工验收（需用户环境）”与
 [CONNECTOR.md](../CONNECTOR.md)。真实安装器、QQ 与模型操作必须由账号所有者本人完成。
 
 ## 4. 未完成或受平台、许可证、环境限制的功能
@@ -134,7 +216,7 @@ start-desktop.cmd
 
 ### 安装版
 
-1. 校验 `release/AI-Group-Friend-Setup-0.2.1-x64.exe` 的 SHA-256 与
+1. 校验 `release/AI-Group-Friend-Setup-0.2.2-x64.exe` 的 SHA-256 与
    `release/BUILD_INFO.json` 一致后再运行。
 2. NSIS 为 per-user 安装，可选择安装目录；安装包未签名，SmartScreen 可能提示未知发布者。
 3. 首次启动进入 `/onboarding`；安装版在 `userData/.env` 生成独立随机密钥，不读取仓库
@@ -159,7 +241,24 @@ start-desktop.cmd
   - 模型测试失败：区分认证、网络、模型、额度、超时；真实失败不会回退成 Mock 成功。
   - 备份恢复被拒：检查 Schema 版本、校验和与数据库完整性；损坏备份不会触碰当前库。
 
-## 6. 0.2.1 发布记录
+## 6. 0.2.2 与 0.2.1 发布记录
+
+### 0.2.2 本机构建（2026-11-01）
+
+| 项目 | 结果 |
+| --- | --- |
+| `scripts/build_release.py --allow-dirty` | 退出码 0；版本 0.2.2；基础提交 `da5f5dd`；**`git_dirty=true`**（记录 status/diff 指纹）；四处版本一致；Electron 45.0.0 |
+| 安装包 | `release/AI-Group-Friend-Setup-0.2.2-x64.exe`，155,842,669 bytes，SHA-256 `35f7fb67ae00b116b105cd1ab04850446f60cb2b67d291fc21bd80237b6f3546`；未签名 |
+| `win-unpacked/AI 群友.exe` | 249,797,632 bytes，SHA-256 `e17c2e4185c16341cb63336c180e6dd5c08194be8eb375efb6386eabe8842e20` |
+| `BUILD_INFO.json` | `version=0.2.2`、`git_dirty=true`、`signed=false`、`auto_update=false`、`real_qq_verified=false`、`real_model_verified=false`、`installer_executed_on_clean_machine=false` |
+| `scripts/release_smoke.py` | 退出码 0；布局/哈希通过；冻结后端 `packaged`、版本 0.2.2、Alembic `f4a7b2c9d801`、内置前端、隔离数据目录；安装版 Electron 0.2.2、6 张截图、13.7s；`status=ok`、`real_qq_verified=false`、`real_model_verified=false` |
+| 干净机 NSIS 安装/升级/回滚/卸载 | **未执行** |
+| 真实 QQ / 真实模型 | **未执行** |
+
+> 该安装包构建于未提交工作树，只用于本机验证 0.2.2 代码；**不是已提交的正式发行
+> 构建**。正式分发前必须在干净提交上重新构建并复核 SHA-256。
+
+### 0.2.1 发布记录（历史）
 
 以下结果来自提交 A `1aa8e9f` 后的实际构建与发布冒烟；`release/` 不进入 Git。
 
@@ -193,7 +292,13 @@ start-desktop.cmd
 - [ ] 干净 Windows 10/11 x64 校验哈希并执行 NSIS 安装
 - [ ] 覆盖升级、旧 `userData` 回滚、卸载与数据保留/彻底删除演练
 - [ ] 配置代码签名并验证 SmartScreen
-- [ ] 真实 NapCat 安装器、登录、身份确认、真实入站/出站与 `traffic_verified`
-- [ ] 真实 OpenAI-compatible Key 与 Anthropic Key 的连通性、生成、预算与错误场景
+- [ ] 节点 1：官方安装器实际启动
+- [ ] 节点 2：NapCat 实际安装
+- [ ] 节点 3：受管进程实际启动
+- [ ] 节点 4：WebSocket 实际连接
+- [ ] 节点 5：QQ 身份实际确认
+- [ ] 节点 6：真实群消息实际入站
+- [ ] 节点 7：真实群消息实际出站，并核对 `traffic_verified`
 - [ ] 真实暂停、断线、重连、发送失败与恢复演练
+- [ ] 真实 OpenAI-compatible Key 与 Anthropic Key 的连通性、生成、预算与错误场景
 - [ ] NapCat 许可证法律审查与隐私/合规评估

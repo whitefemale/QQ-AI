@@ -15,6 +15,15 @@
     </PageHeader>
 
     <el-alert
+      type="info"
+      show-icon
+      :closable="false"
+      title="首次接入建议使用自动配置：无需手动填写 WebSocket/HTTP 地址或端口"
+      description="接入向导会为受管、版本兼容的 NapCat 自动分配本机回环端口、生成随机 Token 并创建受管账号；随后仍需你自行完成 QQ 登录与身份确认。"
+    >
+      <el-button size="small" @click="router.push('/onboarding')">打开接入向导</el-button>
+    </el-alert>
+    <el-alert
       type="warning"
       show-icon
       :closable="false"

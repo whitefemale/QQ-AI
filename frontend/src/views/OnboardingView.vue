@@ -2,7 +2,7 @@
   <div class="page">
     <PageHeader
       title="接入向导"
-      description="按步骤完成真实 QQ 与模型接入。所有状态都从后端实时读取；向导不会自动登录 QQ、自动测试模型、自动导入群或自动开启回复。"
+      description="按步骤完成真实 QQ 与模型接入。状态只读聚合；仅受管连接器自动配置需要输入确认词，向导不会自动登录 QQ、自动测试模型、自动导入群或自动开启回复。"
     >
       <template #actions>
         <el-button :loading="loading" @click="load">刷新状态</el-button>
@@ -43,10 +43,19 @@
           <el-button
             v-if="payload.next_action"
             type="primary"
-            @click="router.push(payload.next_action.route)"
+            :loading="actionLoading"
+            :disabled="!payload.next_action.enabled"
+            @click="executeAction(payload.next_action)"
           >
-            下一步：{{ payload.next_action.label }}
+            {{ payload.next_action.kind === 'auto_configure_connector' ? payload.next_action.label : `下一步：${payload.next_action.step_title}` }}
           </el-button>
+        </div>
+        <div class="counts-line">
+          <span>真实实例 <strong>{{ payload.counts.real_instances }}</strong></span>
+          <span>真实安装 <strong>{{ payload.counts.real_installations }}</strong></span>
+          <span>真实 Provider <strong>{{ payload.counts.real_providers }}</strong></span>
+          <span>真实群 <strong>{{ payload.counts.real_groups }}</strong></span>
+          <span class="muted">Mock 实例 {{ payload.counts.mock_instances }} · Mock Provider {{ payload.counts.mock_providers }} · Mock 群 {{ payload.counts.mock_groups }}</span>
         </div>
         <div class="progress-line">
           <el-progress :percentage="progressPercent" :status="progressStatus" :stroke-width="10" />
@@ -120,8 +129,23 @@
               <span class="mono">{{ row.value }}</span>
             </span>
           </div>
-          <el-button size="small" plain class="step-action" @click="router.push(stepRoute(step))">
-            前往「{{ step.title }}」相关页面
+          <div v-if="step.attempt_count || step.started_at || step.last_error_code" class="step-meta">
+            <span v-if="step.attempt_count">尝试 {{ step.attempt_count }} 次</span>
+            <span v-if="step.started_at">开始 {{ formatTime(step.started_at) }}</span>
+            <span v-if="step.completed_at">完成 {{ formatTime(step.completed_at) }}</span>
+            <span v-if="step.last_error_code" class="mono">{{ step.last_error_code }}</span>
+            <span v-if="step.last_error_message">{{ step.last_error_message }}</span>
+            <span v-if="step.can_retry" class="muted">可重试</span>
+          </div>
+          <el-button
+            size="small"
+            plain
+            class="step-action"
+            :loading="actionLoading"
+            :disabled="!step.next_action.enabled"
+            @click="executeAction(step.next_action)"
+          >
+            {{ step.next_action.label }}
           </el-button>
         </div>
       </div>
@@ -144,9 +168,13 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { api, errorMessage } from '@/api/client'
+import {
+  autoConfigureManagedConnector,
+  CONNECTOR_CONFIRMATIONS,
+} from '@/api/connectors'
 import { desktopErrorMessage, getDesktopInfo, isDesktop, subscribeDesktopState } from '@/api/desktop'
 import type { DesktopInfo, DesktopSetupStep } from '@/api/desktop'
-import type { OnboardingPayload } from '@/api/types'
+import type { OnboardingNextAction, OnboardingPayload } from '@/api/types'
 import PageHeader from '@/components/PageHeader.vue'
 import StateTag from '@/components/StateTag.vue'
 import { formatTime } from '@/utils/format'
@@ -157,16 +185,16 @@ import {
   nextTodoStep,
   overallBanner,
   progressText,
-  stepRoute,
   stepStateLabel,
   stepStateTag,
 } from '@/utils/onboarding'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 
 const router = useRouter()
 const payload = ref<OnboardingPayload | null>(null)
 const loading = ref(false)
+const actionLoading = ref(false)
 const error = ref<string | null>(null)
 
 const desktopMode = isDesktop()
@@ -229,6 +257,40 @@ async function load(): Promise<void> {
   }
 }
 
+async function executeAction(action: OnboardingNextAction): Promise<void> {
+  if (!action.enabled) {
+    ElMessage.warning(action.disabled_reason || '当前动作不可执行，请先处理上一步。')
+    return
+  }
+  if (action.kind !== 'auto_configure_connector') {
+    void router.push(action.route)
+    return
+  }
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '平台将分配本机回环端口与随机 Token，写入受管 NapCat 配置并创建受管账号；不会启动连接器、不会登录 QQ。请输入确认词 AUTO CONFIG。',
+      '自动配置受管连接器',
+      {
+        confirmButtonText: '自动配置',
+        cancelButtonText: '取消',
+        inputPlaceholder: CONNECTOR_CONFIRMATIONS.autoConfigure,
+        inputValidator: (input: string) =>
+          input.trim() === CONNECTOR_CONFIRMATIONS.autoConfigure || '请输入 AUTO CONFIG',
+      },
+    )
+    actionLoading.value = true
+    await autoConfigureManagedConnector(action.installation_id ?? null, value.trim())
+    ElMessage.success('已写入受管配置并创建账号；请在 NapCat 完成 QQ 登录后显式启动并确认身份。')
+    await load()
+  } catch (err) {
+    if (err !== 'cancel' && err !== 'close') {
+      ElMessage.error(errorMessage(err))
+    }
+  } finally {
+    actionLoading.value = false
+  }
+}
+
 async function loadDesktop(): Promise<void> {
   if (!desktopMode) return
   try {
@@ -281,6 +343,28 @@ onBeforeUnmount(() => {
   gap: 8px;
   flex-wrap: wrap;
   font-size: 13px;
+}
+
+.counts-line {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  font-size: 12px;
+}
+
+.counts-line strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.step-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--app-muted);
 }
 
 .progress-line {

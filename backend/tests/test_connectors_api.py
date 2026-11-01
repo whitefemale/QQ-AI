@@ -142,6 +142,79 @@ def test_start_and_config_apply_require_confirmation(client: TestClient) -> None
     assert before != (shell / "config" / "onebot11.json").read_text(encoding="utf-8")
 
 
+def test_onboarding_auto_configure_requires_confirmation_and_creates_managed_account(
+    client: TestClient,
+) -> None:
+    error = _error(client.post("/api/onboarding/actions/auto-configure-connector", json={}), 400)
+    assert error["code"] == "CONNECTOR_CONFIRMATION_REQUIRED"
+
+    before = _data(client.get("/api/onboarding"))
+    connector = next(step for step in before["steps"] if step["key"] == "connector")
+    assert connector["next_action"]["kind"] == "auto_configure_connector"
+    assert connector["next_action"]["enabled"] is True
+    assert connector["next_action"]["installation_id"]
+
+    applied = _data(
+        client.post(
+            "/api/onboarding/actions/auto-configure-connector",
+            json={"confirm_text": "AUTO CONFIG"},
+        )
+    )
+    assert applied["applied"] is True
+    assert applied["auto_connect"] is False
+    assert applied["token_masked"]
+    assert applied["installation_id"] == connector["next_action"]["installation_id"]
+    assert applied["ports"]["http"] and applied["ports"]["websocket"]
+
+    after = _data(client.get("/api/onboarding"))
+    assert after["counts"]["real_instances"] == 1
+    assert after["counts"]["mock_instances"] == 0
+    connector_after = next(step for step in after["steps"] if step["key"] == "connector")
+    assert connector_after["status"] == connector_after["state"]
+    assert connector_after["attempt_count"] >= 0
+    assert connector_after["started_at"]
+    for step in after["steps"]:
+        for key in (
+            "status",
+            "started_at",
+            "completed_at",
+            "attempt_count",
+            "last_error_code",
+            "last_error_message",
+            "can_retry",
+            "next_action",
+        ):
+            assert key in step
+
+    # 自动配置只写配置与加密 Token，不会启动连接器或自动连接。
+    instance = _data(client.get("/api/accounts"))["items"][0]["instances"][0]
+    assert instance["connection_mode"] == "onebot11"
+    assert instance["auto_connect"] is False
+    assert instance["status"] != "online"
+
+
+def test_onboarding_auto_config_is_local_only(client: TestClient, remote_client: TestClient) -> None:
+    body = {"confirm_text": "AUTO CONFIG"}
+    remote = _error(
+        remote_client.post("/api/onboarding/actions/auto-configure-connector", json=body),
+        403,
+    )
+    assert remote["code"] == "CONNECTOR_LOCAL_ONLY"
+
+    cross_origin = _error(
+        client.post(
+            "/api/onboarding/actions/auto-configure-connector",
+            json=body,
+            headers={"Origin": "https://evil.example"},
+        ),
+        403,
+    )
+    assert cross_origin["code"] == "CONNECTOR_LOCAL_ONLY"
+
+    # 被拒绝的请求不得写配置或创建账号。
+    assert _data(client.get("/api/onboarding"))["counts"]["real_instances"] == 0
+
+
 def test_global_pause_blocks_start_and_config_write(client: TestClient) -> None:
     item = _data(client.get("/api/connectors/installations"))["items"][0]
     _data(client.post("/api/system/pause-all", json={"reason": "连接器 API 测试"}))

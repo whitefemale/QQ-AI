@@ -127,6 +127,8 @@ async def latest_connection_test(
         "group_list_verified": False,
         "real_inbound_verified": False,
         "real_outbound_verified": False,
+        "error_code": None,
+        "error_message": None,
     }
     if instance.connection_mode != "onebot11":
         return empty
@@ -150,6 +152,7 @@ async def latest_connection_test(
         return {**empty, "invalidated": True}
 
     details = evidence.details_json if isinstance(evidence.details_json, dict) else {}
+    error_message = details.get("error_message")
     source = details.get("source")
     if source not in CONNECTION_TEST_SOURCES:
         source = "saved_instance_test" if evidence.action == "account.instance.test" else "live_adapter"
@@ -170,6 +173,8 @@ async def latest_connection_test(
         "group_list_verified": details.get("group_list_verified") is True,
         "real_inbound_verified": details.get("real_inbound_verified") is True,
         "real_outbound_verified": details.get("real_outbound_verified") is True,
+        "error_code": details.get("error_code") if isinstance(details.get("error_code"), str) else None,
+        "error_message": error_message[:300] if isinstance(error_message, str) else None,
     }
 
 

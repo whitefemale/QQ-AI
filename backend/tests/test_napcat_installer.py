@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import stat
 import sys
 import urllib.request
@@ -204,6 +205,72 @@ def test_download_checks_declared_size(tmp_path: Path) -> None:
         installer.download_asset(asset, tmp_path / "download.zip", opener=FakeOpener({asset.download_url: payload}))
 
 
+def test_download_retry_recovers_from_bad_payload(tmp_path: Path) -> None:
+    payload = b"good-payload"
+    bad = b"bad!-payload"
+    assert len(bad) == len(payload)
+
+    class FlakyOpener(FakeOpener):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.calls = 0
+
+        def open(self, request: urllib.request.Request, timeout: float = 30.0) -> FakeResponse:
+            del timeout
+            self.calls += 1
+            body = bad if self.calls < 3 else payload
+            return FakeResponse(body, headers={"Content-Length": str(len(body))})
+
+    asset = installer.ReleaseAsset(
+        tag="v4.18.42",
+        name=installer.ASSET_NAME,
+        size=len(payload),
+        digest=hashlib.sha256(payload).hexdigest(),
+        download_url="https://github.com/download.zip",
+    )
+    opener = FlakyOpener()
+    events: list[dict[str, Any]] = []
+    sleeps: list[float] = []
+    digest, size = installer.download_asset_with_retry(
+        asset,
+        tmp_path / "download.zip",
+        opener=opener,
+        retries=2,
+        retry_delay=0,
+        sleep_func=sleeps.append,
+        event_sink=events.append,
+    )
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert size == len(payload)
+    assert opener.calls == 3
+    assert [event["event"] for event in events] == ["retry", "retry"]
+    assert not sleeps
+    assert (tmp_path / "download.zip").read_bytes() == payload
+
+
+def test_download_retry_exhaustion_removes_target(tmp_path: Path) -> None:
+    payload = b"expected"
+    asset = installer.ReleaseAsset(
+        tag="v4.18.42",
+        name=installer.ASSET_NAME,
+        size=len(payload),
+        digest=hashlib.sha256(payload).hexdigest(),
+        download_url="https://github.com/download.zip",
+    )
+    target = tmp_path / "download.zip"
+    target.write_bytes(b"stale")
+    with pytest.raises(InstallerError, match="重试"):
+        installer.download_asset_with_retry(
+            asset,
+            target,
+            opener=FakeOpener({asset.download_url: b"wrong!!!"}),
+            retries=1,
+            retry_delay=0,
+            sleep_func=lambda _: None,
+        )
+    assert not target.exists()
+
+
 # ---------------------------------------------------------------- 解压安全
 
 
@@ -265,6 +332,24 @@ def test_requires_installer_executable(tmp_path: Path) -> None:
         installer.safe_extract_zip(archive, tmp_path / "out")
 
 
+def test_truncated_zip_reports_integrity_error(tmp_path: Path) -> None:
+    full = _zip_bytes({"NapCatInstaller.exe": b"installer" * 200})
+    archive = tmp_path / "truncated.zip"
+    archive.write_bytes(full[: len(full) // 2])
+    with pytest.raises(InstallerError, match="ZIP|压缩包|有效"):
+        installer.safe_extract_zip(archive, tmp_path / "out")
+
+
+def test_rejects_suspicious_compression_ratio(tmp_path: Path) -> None:
+    archive = tmp_path / "bomb.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as handle:
+        handle.writestr("NapCatInstaller.exe", b"installer")
+        handle.writestr("bomb.bin", b"\0" * (2 * 1024 * 1024))
+    with pytest.raises(InstallerError, match="压缩比"):
+        installer.safe_extract_zip(archive, tmp_path / "out")
+    assert not (tmp_path / "out" / "NapCatInstaller.exe").exists()
+
+
 def test_extracts_installer_safely(tmp_path: Path) -> None:
     archive = _write_zip(
         tmp_path / "good.zip",
@@ -279,7 +364,7 @@ def test_extracts_installer_safely(tmp_path: Path) -> None:
 # ---------------------------------------------------------------- 完整流程
 
 
-def test_install_writes_manifest_license_and_never_overwrites(tmp_path: Path) -> None:
+def test_install_writes_manifest_license_and_reuses_existing(tmp_path: Path) -> None:
     asset_bytes = _zip_bytes(
         {
             "NapCatInstaller.exe": b"fake-installer",
@@ -302,8 +387,115 @@ def test_install_writes_manifest_license_and_never_overwrites(tmp_path: Path) ->
     assert manifest["installer_sha256"] == hashlib.sha256(b"fake-installer").hexdigest()
     assert not list(dest.glob(".staging-*"))
 
-    with pytest.raises(InstallerError, match="拒绝覆盖"):
+    download_url = release["assets"][0]["browser_download_url"]
+    downloaded_before = opener.requests.count(download_url)
+    events: list[dict[str, Any]] = []
+    assert (
+        installer.install(
+            version=None,
+            dest=dest,
+            dry_run=False,
+            launch=False,
+            opener=opener,
+            event_sink=events.append,
+        )
+        == 0
+    )
+    assert opener.requests.count(download_url) == downloaded_before
+    assert events[-1]["event"] == "installed"
+    assert events[-1]["action"] == "reused"
+    assert (target / "README.txt").read_bytes() == b"official package"
+    assert not list(dest.glob(".staging-*"))
+
+
+def _build_managed_target(dest: Path, *, corrupt_installer: bool = False) -> Path:
+    target = dest / "v4.18.42"
+    target.mkdir(parents=True)
+    installer_file = target / "NapCatInstaller.exe"
+    installer_file.write_bytes(b"damaged" if corrupt_installer else b"fake-installer")
+    manifest = {
+        "installer": "ai-group-friend-napcat-installer",
+        "version": "v4.18.42",
+        "installer_relative_path": "NapCatInstaller.exe",
+        "installer_sha256": hashlib.sha256(b"fake-installer").hexdigest(),
+    }
+    (target / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (target / "user-config.json").write_text('{"keep": true}', encoding="utf-8")
+    return target
+
+
+def test_repairs_managed_damaged_target_by_quarantine(tmp_path: Path) -> None:
+    asset_bytes = _zip_bytes({"NapCatInstaller.exe": b"fake-installer", "README.txt": b"new"})
+    release = _release(asset_bytes)
+    opener = FakeOpener(_full_responses(asset_bytes, release))
+    dest = tmp_path / "connectors" / "napcat"
+    target = _build_managed_target(dest, corrupt_installer=True)
+    events: list[dict[str, Any]] = []
+
+    assert (
+        installer.install(
+            version=None,
+            dest=dest,
+            dry_run=False,
+            launch=False,
+            opener=opener,
+            event_sink=events.append,
+        )
+        == 0
+    )
+
+    assert (target / "README.txt").read_bytes() == b"new"
+    manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["replaced_install"]["quarantined_as"].startswith(".quarantine-v4.18.42-")
+    quarantines = list(dest.glob(".quarantine-v4.18.42-*"))
+    assert len(quarantines) == 1
+    # 旧目录只被隔离，用户数据仍保留在隔离区，不直接删除。
+    assert (quarantines[0] / "user-config.json").read_text(encoding="utf-8") == '{"keep": true}'
+    assert [event["event"] for event in events][-1] == "installed"
+    assert events[-1]["action"] == "repaired"
+    assert not list(dest.glob(".staging-*"))
+
+
+def test_refuses_unknown_existing_directory_without_touching_it(tmp_path: Path) -> None:
+    asset_bytes = _zip_bytes({"NapCatInstaller.exe": b"fake-installer"})
+    release = _release(asset_bytes)
+    opener = FakeOpener(_full_responses(asset_bytes, release))
+    dest = tmp_path / "connectors" / "napcat"
+    target = dest / "v4.18.42"
+    target.mkdir(parents=True)
+    (target / "user-file.txt").write_text("do not delete", encoding="utf-8")
+
+    with pytest.raises(InstallerError, match="无法安全复用"):
         installer.install(version=None, dest=dest, dry_run=False, launch=False, opener=opener)
+
+    assert (target / "user-file.txt").read_text(encoding="utf-8") == "do not delete"
+    assert not list(dest.glob(".quarantine-*"))
+    assert not list(dest.glob(".staging-*"))
+
+
+def test_cleanup_stale_staging_only_removes_old_directories(tmp_path: Path) -> None:
+    dest = tmp_path / "napcat"
+    dest.mkdir()
+    old = dest / ".staging-old"
+    old.mkdir()
+    (old / "partial.bin").write_bytes(b"x")
+    fresh = dest / ".staging-fresh"
+    fresh.mkdir()
+    unrelated = dest / "keep"
+    unrelated.mkdir()
+    now = 10_000.0
+    stale_time = now - installer.STALE_STAGING_SECONDS - 1
+    fresh_time = now - 10
+    os.utime(old, (stale_time, stale_time))
+    os.utime(fresh, (fresh_time, fresh_time))
+    os.utime(unrelated, (stale_time, stale_time))
+
+    removed = installer.cleanup_stale_staging(dest, now=now)
+
+    assert removed == [".staging-old"]
+    assert not old.exists()
+    assert fresh.exists()
+    assert unrelated.exists()
 
 
 def test_launch_without_tty_does_not_execute_installer(tmp_path: Path) -> None:
@@ -334,3 +526,39 @@ def test_dry_run_does_not_create_destination(tmp_path: Path) -> None:
 
     assert installer.install(version=None, dest=dest, dry_run=True, launch=False, opener=opener) == 0
     assert not dest.exists()
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("磁盘空间不足：无法写入解压目录", "CONNECTOR_INSUFFICIENT_DISK"),
+        ("权限不足：无法写入解压目录", "CONNECTOR_PERMISSION_DENIED"),
+        ("无法安全复用：目标目录没有受管安装清单", "CONNECTOR_TARGET_EXISTS"),
+        ("无法移动目录（文件可能被占用或路径过长）", "CONNECTOR_TARGET_BUSY"),
+        ("压缩包包含特殊文件", "CONNECTOR_ZIP_INVALID"),
+        ("下载重试 3 次仍失败", "CONNECTOR_DOWNLOAD_FAILED"),
+    ],
+)
+def test_error_code_classifies_windows_failures(message: str, expected: str) -> None:
+    assert installer._error_code(InstallerError(message)) == expected
+
+
+def test_permission_error_while_moving_target_is_not_reported_as_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dest = tmp_path / "napcat"
+    target = dest / "v4.18.42"
+    target.mkdir(parents=True)
+
+    def deny(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(installer.os, "replace", deny)
+    monkeypatch.setattr(installer.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(InstallerError) as raised:
+        installer.quarantine_existing_target(target, dest, reason="test")
+
+    assert installer._error_code(raised.value) == "CONNECTOR_PERMISSION_DENIED"
+    assert target.exists()
