@@ -457,7 +457,7 @@ backend\.venv\Scripts\python.exe scripts\release_smoke.py
 | 真实 QQ / 真实模型 | **未执行** |
 
 过程中的一次 `I001` 导入排序失败已修复并复检通过；前端仅有 chunk 体积警告。完整记录见
-[implementation/TEST_MATRIX.md](implementation/TEST_MATRIX.md#3-本轮实测记录)。
+[implementation/TEST_MATRIX.md](implementation/TEST_MATRIX.md)。
 
 ### 0.2.1 最终审计实测记录（2026-11-01）
 
